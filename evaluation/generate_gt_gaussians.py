@@ -30,16 +30,34 @@ def generate_gt_gaussians(gaussian_path, gt_mesh_path, output_path, target_class
     print(f"Total gaussians: {len(gs_locations)}")
     
     # For each Gaussian, find the nearest GT vertex and its label
-    distances, indices = gt_tree.query(gs_locations, k=1, workers=-1)
+    distances, indices = gt_tree.query(gs_locations, k=1, workers=-1, distance_upper_bound=distance_threshold)
     
-    # Retrieve the label of the nearest vertex for each Gaussian
-    nearest_labels = gt_labels[indices]
+    # Handling invalid indices for points outside threshold (indices == len(gt_tree.data))
+    valid_mask = distances <= distance_threshold
     
-    # Filtering
-    is_close = (distances <= distance_threshold) # Distance matches threshold
-    is_target = (nearest_labels == target_class_id) # The surface it touches is the target class
+    # Pre-allocate boolean target mask (False everywhere)
+    is_target = np.zeros(len(gs_locations), dtype=bool)
     
-    is_gt_positive = is_close & is_target
+    # Parse target class ID(s)
+    
+    # Only access labels for valid indices to avoid out-of-bounds error
+    valid_labels = gt_labels[indices[valid_mask]]
+    
+    try:
+        if "," in str(target_class_id):
+            target_ids = [int(x) for x in str(target_class_id).split(",")]
+            # Check if label is in list
+            is_target_mask = np.isin(valid_labels, target_ids)
+        else:
+            target_ids = [int(target_class_id)]
+            is_target_mask = (valid_labels == target_ids[0])
+    except ValueError:
+        print(f"Error parsing target class ID: {target_class_id}")
+        return
+
+    is_target[valid_mask] = is_target_mask
+    
+    is_gt_positive = valid_mask & is_target
     
     count = np.sum(is_gt_positive)
     print(f"Identified {count} ground truth gaussians for class {target_class_id}.")
@@ -66,7 +84,7 @@ if __name__ == "__main__":
     parser.add_argument("--gaussian_ply", required=True, help="Input full 3DGS model")
     parser.add_argument("--gt_mesh", required=True, help="Ground truth labeled mesh")
     parser.add_argument("--output_ply", required=True, help="Output filtered PLY")
-    parser.add_argument("--class_id", type=int, required=True, help="Target class ID to extract")
+    parser.add_argument("--class_id", type=str, required=True, help="Target class ID to extract")
     parser.add_argument("--threshold", type=float, default=0.05)
     args = parser.parse_args()
     

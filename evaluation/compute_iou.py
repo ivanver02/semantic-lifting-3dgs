@@ -6,16 +6,18 @@ import os
 import json
 from plyfile import PlyData
 
-def compute_iou(gt_mesh_path, pred_ply_path, beta, target_class_id, distance_threshold=0.05):
+def compute_iou(gt_mesh_path, pred_ply_path, beta, target_class_id, distance_threshold=0.05, gt_iou_max=0.0):
     """
     Computes IoU for a single class by mapping predictions to ground truth mesh vertices
     
     Args:
-        gt_mesh_path: Path to the ground truth PLY mesh with 'label' property
-        pred_ply_path: Path to the predicted PLY (contains only points of the target class)
-        beta: Beta value used to suffix the output filename
-        target_class_id: The integer ID of the target class
-        distance_threshold: Distance in meters to consider a prediction "covering" a GT vertex
+        gt_mesh_path: path to the ground truth PLY mesh
+        pred_ply_path: path to the predicted PLY, which contains only points of the target class
+        beta: value used to suffix the output filename
+        target_class_id: the integer ID of the target class, or comma-separated string for union
+        distance_threshold: distance in meters to consider that a prediction covers a ground truth vertex
+        gt_iou_max: the theoretical maximum IoU achievable with ground truth gaussians
+        ...
     """
     
     # Extract vertices and labels from raw data
@@ -31,7 +33,13 @@ def compute_iou(gt_mesh_path, pred_ply_path, beta, target_class_id, distance_thr
     gt_labels = gt_labels.astype(int)
     
     # Boolean mask identifying which vertices belong to the class we are testing
-    gt_is_target = (gt_labels == target_class_id)
+    if "," in str(target_class_id):
+        target_ids = [int(x) for x in str(target_class_id).split(",")]
+        gt_is_target = np.isin(gt_labels, target_ids)
+        print(f"Computing IoU for union of classes: {target_ids}")
+    else:
+        gt_is_target = (gt_labels == int(target_class_id))
+
     num_gt_positives = np.sum(gt_is_target)
     print(f"Number of GT vertices for class {target_class_id}: {num_gt_positives}")
     
@@ -54,7 +62,7 @@ def compute_iou(gt_mesh_path, pred_ply_path, beta, target_class_id, distance_thr
     tree = cKDTree(pred_points)
     
     print(f"Querying nearest neighbors with radius={distance_threshold}")
-    distances, _ = tree.query(gt_vertices, k=1, workers=-1)
+    distances, _ = tree.query(gt_vertices, k=1, workers=-1, distance_upper_bound=distance_threshold)
     
     # Determine which GT vertices are predicted as target
     pred_mask = (distances <= distance_threshold)
@@ -75,6 +83,11 @@ def compute_iou(gt_mesh_path, pred_ply_path, beta, target_class_id, distance_thr
     fn = np.sum(gt_is_target & (~pred_mask)) # GT but not predicted
     
     print(f"\nIoU for class {target_class_id}: {iou:.4f}")
+    
+    relative_iou = 0.0
+    if gt_iou_max > 0:
+        relative_iou = iou / gt_iou_max
+        print(f"Relative IoU (against the ground truth limit {gt_iou_max:.4f}): {relative_iou:.4f}")
 
     # Save results to JSON for later mIoU calculation
     output_dir = os.path.dirname(pred_ply_path)
@@ -84,8 +97,14 @@ def compute_iou(gt_mesh_path, pred_ply_path, beta, target_class_id, distance_thr
         
     result_path = os.path.join(output_dir, result_filename)
     
+    # Handle composite ID for JSON serialization
+    try:
+        serializable_id = int(target_class_id)
+    except ValueError:
+        serializable_id = str(target_class_id)
+
     results = {
-        "class_id": int(target_class_id),
+        "class_id": serializable_id,
         "iou": float(iou),
         "tp": int(tp),
         "fp": int(fp),
@@ -93,7 +112,9 @@ def compute_iou(gt_mesh_path, pred_ply_path, beta, target_class_id, distance_thr
         "union": int(union),
         "threshold": float(distance_threshold),
         "gt_count": int(num_gt_positives),
-        "pred_count": int(len(pred_points))
+        "pred_count": int(len(pred_points)),
+        "gt_iou_max": float(gt_iou_max),
+        "relative_iou": float(relative_iou)
     }
     
     with open(result_path, 'w') as f:
@@ -106,10 +127,11 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Compute IoU for a 3D class")
     parser.add_argument("--gt_mesh", type=str, required=True, help="Path to GT labeled mesh")
     parser.add_argument("--pred_ply", type=str, required=True, help="Path to predicted PLY")
-    parser.add_argument("--class_id", type=int, required=True, help="Class ID")
-    parser.add_argument("--beta", type=float, required=True, help="Beta value for filename suffix")
+    parser.add_argument("--class_id", type=str, required=True, help="Class ID")
+    parser.add_argument("--beta", type=str, required=True, help="Beta value for filename suffix")
     parser.add_argument("--threshold", type=float, default=0.05, help="Distance threshold")
+    parser.add_argument("--gt_iou", type=float, default=0.0, help="Pre-computed IoU of GT gaussians")
     
     args = parser.parse_args()
     
-    compute_iou(args.gt_mesh, args.pred_ply, args.beta, args.class_id, args.threshold)
+    compute_iou(args.gt_mesh, args.pred_ply, args.beta, args.class_id, args.threshold, args.gt_iou)
