@@ -1,5 +1,4 @@
 import torch
-import math
 from scene.cameras import Camera
 from utils.graphics_utils import fov2focal, geom_transform_points
 
@@ -25,30 +24,28 @@ class GaussianProjector:
         
         # Extract R part (top-left 3x3) used in the W matrix for covariance rotation
         self.W = self.view_matrix[:3, :3] 
-        self.camera_center = camera.camera_center
-
     def project(self, means3D: torch.Tensor, cov3D: torch.Tensor):
         """
         Project 3D Gaussians to 2D
+        The center of a Gaussian distribution is the mean, that is why the 3D coordinates of the center of the Gaussian are passed as means3D. 
+        The covariance matrix of the Gaussian is passed as cov3D.
         """
-        N = means3D.shape[0]
-        
         # Transform points to camera space
         means3D_cam = geom_transform_points(means3D, self.view_matrix)
         
         # Extract x, y, z from those points
         x, y, z = means3D_cam[:, 0], means3D_cam[:, 1], means3D_cam[:, 2]
         
-        # Culling
+        # Remove Gaussians whose centers are behind the camera near plane.
         znear = self.camera.znear
         mask_z = z > znear
         
         # Applying the mask
-        indices = torch.nonzero(mask_z).squeeze()
+        # Keep a one-dimensional index tensor for zero, one, or many visible Gaussians.
+        indices = torch.nonzero(mask_z, as_tuple=True)[0]
         x = x[indices]
         y = y[indices]
         z = z[indices]
-        means3D_cam = means3D_cam[indices]
         cov3D = cov3D[indices]
         
         '''
@@ -83,8 +80,10 @@ class GaussianProjector:
         
         # Compute projected means to 2D:
         # Perspective projection used to center the 2D splat: https://docs.opencv.org/4.x/d9/d0c/group__calib3d.html
-        cx = self.width / 2.0
-        cy = self.height / 2.0
+        # Replica falls back to centered intrinsics
+        # COLMAP cameras can provide a principal point different from the image centre
+        cx = getattr(self.camera, "cx", self.width / 2.0)
+        cy = getattr(self.camera, "cy", self.height / 2.0)
         
         means2D = torch.stack([
             (x * self.focal_x * inv_z) + cx,
@@ -95,5 +94,5 @@ class GaussianProjector:
             'means2D': means2D,
             'cov2D': cov2D,
             'depths': z,
-            'indices': indices
+            'indices': indices # Original Gaussian-row IDs for the subset satisfying z > znear.
         }
