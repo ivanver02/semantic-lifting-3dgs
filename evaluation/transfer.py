@@ -1,4 +1,4 @@
-# Radius-vote transfers between mesh vertices and Gaussians
+# Transfer labels between mesh vertices and Gaussians using radius votes
 
 import numpy as np
 from scipy.spatial import cKDTree
@@ -22,7 +22,6 @@ def load_gaussian_ply(path):
     The return value contains one array of 3D centers and one array of opacity values in the same Gaussian order
     """
 
-    # Keep the original Gaussian order because the labels use local IDs aligned with the original Gaussian rows.
     vertex = PlyData.read(str(path))["vertex"]
     xyz = np.vstack([vertex["x"], vertex["y"], vertex["z"]]).T.astype(np.float64)
     names = vertex.data.dtype.names or ()
@@ -41,6 +40,7 @@ def map_subset_indices(full_xyz, subset_xyz):
     """ Map a subset of Gaussian centers, the predicted ones, back to their positions in the full Gaussian representation """
 
     # Labeled PLY files contain a subset of the full model in a new order
+    # Match each labeled center to the full model
     distance, indices = cKDTree(full_xyz).query(subset_xyz, k=1)
     if float(distance.max()) > 1e-6:
         raise ValueError("labeled Gaussian PLY does not match the full model")
@@ -113,7 +113,7 @@ def load_neighbors(path):
     return data["indptr"], data["indices"], data["dist"]
 
 
-def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes, min_share, background_labels_compete):
+def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes, min_fraction, background_labels_compete):
     """
     Assign local labels to a vertex with a weighted radius vote from Gaussians and optional abstention
 
@@ -126,12 +126,12 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
     n_query is the number of query points
     csr contains one neighborhood row per query point 
     Reference labels and weights use the order of the referenced points
-    background_labels_compete decides whether non-target labels, -1, contribute to the vote denominator.
+    background_labels_compete decides whether non-target labels, including -1, contribute to the vote denominator
     """
 
     # Expand the CSR structure
     indptr, indices, distances = csr
-    if len(indices) == 0: # If there are no neighbors, return an array of invalid labels for all query points
+    if len(indices) == 0:
         return np.full(n_query, -1, dtype=np.int64)
 
     '''
@@ -155,12 +155,11 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
         Query 0 → 3 neighbors
         Query 1 → 2 neighbors
 
-    And np.repeat produces [0, 0, 0, 1, 1], which is the query index for each edge.
+    And np.repeat produces [0, 0, 0, 1, 1], which is the query index for each edge
 
     '''
 
-     # Imagine one query vertex. There is then one edge per neighbor, which has its own label and weight. The query index is repeated for every edge of that query vertex.
-    # These three arrays have the length of indices
+    # Expand edges into one row per neighboring reference point
     edge_query = np.repeat(np.arange(n_query, dtype=np.int64), np.diff(indptr))
     edge_labels = reference_labels[indices]
     edge_weights = (reference_weights[indices].astype(np.float64) / (distances.astype(np.float64) ** 2 + EPS)) # Closer neighbors have more influence
@@ -180,7 +179,7 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
     And repeats for every query vertex
     '''
 
-    # The denominator either includes or excludes background labels
+    # Compute the competing evidence denominator
     if background_labels_compete:
         total = np.bincount(edge_query, weights=edge_weights, minlength=n_query) # Weighted sum per binning query vertex
     else:
@@ -190,17 +189,18 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
     For query 0: (one cell in the bincount)
         The score for label 0 is 100 + 25 = 125
         The score for label 1 is 6.25
-        The share for label 0 is 125 / 131.25 = 0.952
-        The share for label 1 is 6.25 / 131.25 = 0.048
-        If min_share = 0.5, then label 0 is accepted and label 1 is rejected. The query vertex receives label 0
-        If min_share = 0.99, then both labels are rejected and the query vertex receives -1
+        The fraction for label 0 is 125 / 131.25 = 0.952
+        The fraction for label 1 is 6.25 / 131.25 = 0.048
+        If min_fraction = 0.5, then label 0 is accepted and label 1 is rejected. The query vertex receives label 0
+        If min_fraction = 0.99, then both labels are rejected and the query vertex receives -1
+
+    # Finish the vote example
     '''
 
-    # Start with no local class selected
-    best_score = np.zeros(n_query, dtype=np.float64) # There is one competition for each query vertex
+    # Select the strongest class score for each query
+    best_score = np.zeros(n_query, dtype=np.float64)
     best_label = np.full(n_query, -1, dtype=np.int64)
 
-    # We initially consider the background label as the best score, so that target labels must beat it to be accepted
     if background_labels_compete:
         best_score = np.bincount(
             edge_query,
@@ -208,7 +208,6 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
             minlength=n_query,
         )
 
-    # Compare the weighted score of every target main-local class for every query point.
     for label in classes:
         score = np.bincount(
             edge_query,
@@ -217,11 +216,13 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
         )
         better = score > best_score
         best_score[better] = score[better]
+
+    # Store the winning class label
         best_label[better] = label
 
-    # Abstain when the winning class does not reach the required vote share
-    share = np.divide(best_score, total, out=np.zeros_like(best_score), where=total > 0)
-    accepted = ((total > 0) & (best_score > 0) & (share >= min_share))
+    # Reject scores below the required fraction
+    fraction = np.divide(best_score, total, out=np.zeros_like(best_score), where=total > 0)
+    accepted = ((total > 0) & (best_score > 0) & (fraction >= min_fraction))
     output = np.full(n_query, -1, dtype=np.int64)
     output[accepted] = best_label[accepted]
     return output
@@ -233,7 +234,7 @@ def nearest_neighbor_label(n_query, csr, reference_labels, tau):
     indptr, indices, distances = csr
     output = np.full(n_query, -1, dtype=np.int64)
 
-    # For every query point, find the nearest reference point and assign its label if it is within the radius tau
+    # Assign the nearest valid reference label to each query
     for query_index in range(n_query):
         start, end = int(indptr[query_index]), int(indptr[query_index + 1])
 
@@ -246,7 +247,7 @@ def nearest_neighbor_label(n_query, csr, reference_labels, tau):
     return output
 
 
-def predict_vertex_labels(mesh_xyz, mesh_gaussian_csr, gaussian_labels, gaussian_opacity, tau, min_share,
+def predict_vertex_labels(mesh_xyz, mesh_gaussian_csr, gaussian_labels, gaussian_opacity, tau, min_fraction,
                           opacity_weighted, min_opacity, gaussian_to_mesh_background_competes,
                           gaussian_to_mesh_transfer):
     """
@@ -254,7 +255,7 @@ def predict_vertex_labels(mesh_xyz, mesh_gaussian_csr, gaussian_labels, gaussian
 
     opacity_weighted decides whether Gaussian opacity affects the vote weights
     gaussian_to_mesh_background_competes decides whether background neighbors compete with target labels
-    gaussian_to_mesh_transfer selects radius voting or nearest-neighbor assignment
+    gaussian_to_mesh_transfer selects radius voting or assignment to the nearest point
     Vertices without an accepted label receive the invalid label value
     """
 
@@ -262,11 +263,11 @@ def predict_vertex_labels(mesh_xyz, mesh_gaussian_csr, gaussian_labels, gaussian
         return nearest_neighbor_label(len(mesh_xyz), mesh_gaussian_csr, gaussian_labels, tau)
 
     # Select opacity weight or uniform weights before running the vote
-    if opacity_weighted: # As we compute the score for several classes, we use as weight the opacity of the Gaussian, which does not depend on the class
+    if opacity_weighted:
         weights = np.clip(gaussian_opacity, min_opacity, 1.0)
     else:
         weights = np.ones(len(gaussian_labels), dtype=np.float64)
 
     # Only valid local labels can participate as target classes
     classes = np.unique(gaussian_labels[gaussian_labels >= 0])
-    return radius_label_vote(len(mesh_xyz), mesh_gaussian_csr, gaussian_labels, weights, classes, min_share, gaussian_to_mesh_background_competes)
+    return radius_label_vote(len(mesh_xyz), mesh_gaussian_csr, gaussian_labels, weights, classes, min_fraction, gaussian_to_mesh_background_competes)

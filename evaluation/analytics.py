@@ -23,7 +23,7 @@ SCHEMA = {
         "size_measure", "hysteresis_gamma", "hysteresis_radius",
         "background_mode", "background_confidence", "background_view_policy",
         "betas",
-        "tau", "min_share", "mesh_to_gaussian_transfer",
+        "tau", "min_fraction", "mesh_to_gaussian_transfer",
         "gaussian_to_mesh_transfer", "min_opacity",
         "gaussian_to_mesh_background_competes", "mesh_to_gaussian_background_competes",
         "opacity_weighting", "sigma", "size_penalty",

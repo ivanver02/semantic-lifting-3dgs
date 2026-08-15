@@ -81,7 +81,7 @@ def _parser():
 
     # Configure transfer methods, background competition and predicted-label weighting
     parser.add_argument("--tau", type=float, default=0.05)
-    parser.add_argument("--min-share", type=float, default=0.5)
+    parser.add_argument("--min-fraction", type=float, default=0.5)
     parser.add_argument(
         "--mesh-to-gaussian-transfer",
         choices=["radius_vote", "nearest_neighbor_label"],
@@ -139,7 +139,7 @@ def _make_scene(args, data_root, support_dir):
     if args.dataset == "replica":
         return ReplicaScene(
             data_root, args.scene, args.sequence_name, args.frame_step, seed=3,
-            vertex_label_min_share=0.6, visibility_slop=0.05,
+            vertex_label_min_fraction=0.6, visibility_slop=0.05,
         )
     elif args.dataset == "scannetpp":
         return ScannetScene(data_root, args.scene, support_dir)
@@ -245,7 +245,7 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
                 "--scene", scene.scene,
                 "--sequence_name", scene.sequence.name,
                 "--frame_step", str(scene.frame_step),
-                "--vertex_label_min_share", str(scene.vertex_label_min_share),
+                "--vertex_label_min_fraction", str(scene.vertex_label_min_fraction),
                 "--visibility_slop", str(scene.visibility_slop),
                 "--output_dir", str(output_dir),
             ] + (["--force"] if args.force else []),
@@ -406,7 +406,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         base = metrics.evaluate_class(
             scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
             full_opacity, spec, None,
-            args.tau, args.min_share, not args.no_opacity_weighting,
+            args.tau, args.min_fraction, not args.no_opacity_weighting,
             args.min_opacity, args.gaussian_to_mesh_background_competes,
             args.gaussian_to_mesh_transfer,
         )
@@ -442,7 +442,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             result = metrics.evaluate_class(
                 scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
                 full_opacity, spec,
-                predicted_xyz, args.tau, args.min_share,
+                predicted_xyz, args.tau, args.min_fraction,
                 not args.no_opacity_weighting, args.min_opacity,
                 args.gaussian_to_mesh_background_competes,
                 args.gaussian_to_mesh_transfer, ground_truth_transfer_metrics,
@@ -501,7 +501,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             "sigma": args.sigma,
             "size_penalty": args.size_penalty,
             "tau": args.tau,
-            "min_share": args.min_share,
+            "min_fraction": args.min_fraction,
             "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
             "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
             "opacity_weighted": not args.no_opacity_weighting,
@@ -530,8 +530,8 @@ def main():
         raise ValueError("--frame-step must be greater than zero")
     if args.tau <= 0:
         raise ValueError("--tau must be greater than zero")
-    if not 0.0 <= args.min_share <= 1.0:
-        raise ValueError("--min-share must be in [0, 1]")
+    if not 0.0 <= args.min_fraction <= 1.0:
+        raise ValueError("--min-fraction must be in [0, 1]")
     if args.hysteresis_gamma < 0.0:
         raise ValueError("--hysteresis-gamma must be non-negative")
     if args.hysteresis_radius <= 0.0:
@@ -633,7 +633,7 @@ def main():
 
     # Build or reuse the mesh and Gaussian neighborhoods and GT labels.
     gaussians_near_a_vertex, gaussian_labels = ground_truth.build(
-        scene, model_ply, gt_dir, args.tau, args.min_share,
+        scene, model_ply, gt_dir, args.tau, args.min_fraction,
         args.mesh_to_gaussian_background_competes,
         args.mesh_to_gaussian_transfer, args.force,
     )

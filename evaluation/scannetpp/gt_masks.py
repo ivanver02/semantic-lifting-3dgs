@@ -1,4 +1,4 @@
-# CLI entry point for Scannet++ GT masks and visible-vertex support to be used inside the lifting container
+# CLI entry point for Scannet++ reference masks and visible vertex support in the lifting container
 
 import argparse
 import importlib.util
@@ -162,8 +162,8 @@ def _load_mesh(scene_root, metadata_path):
     # Convert every supported Scannet++ spelling into the local target class index
     # Several raw labels can represent one evaluated class, for example office chair and armchair both map to the local class chair
     label_to_local_id = {
-        name.lower(): canonical_id
-        for canonical_id, item in enumerate(CLASSES)
+        name.lower(): main_id
+        for main_id, item in enumerate(CLASSES)
         for name in DATASET_LABELS[item.name]
     }
     object_to_local_id = {}
@@ -216,33 +216,32 @@ def _load_mesh(scene_root, metadata_path):
     '''
     Important decision:
     The official helper get_vtx_prop_on_2d() assigns a face property using the first vertex of each face. 
-    Keeping this rule makes the output comparable with the official Scannet++ 2D annotations.
+    Keeping this rule makes the output comparable with the official Scannet++ 2D annotations
 
-    This differs from the Replica GT mask generation, which uses the majority vertex label of each face.
-    As Replica does not have official 2D annotations, the majority rule is a reasonable choice for that dataset.
+    Replica uses the majority vertex label of each face because it has no official 2D annotations
     '''
 
-    tri_canonical = vertex_local_ids[faces[:, 0]]
+    tri_main = vertex_local_ids[faces[:, 0]]
 
-    # Rasterization uses one stored detector-mask ID per triangle, preserving the global YOLO+1 vocabulary
+    # Rasterization uses one stored detector ID per triangle in the global vocabulary
     # Zero remains background and ignored objects are not confused with any target class
     tri_stored = np.zeros(len(faces), dtype=np.uint8)
     for index, item in enumerate(CLASSES):
-        tri_stored[tri_canonical == index] = item.detector_stored_id
+        tri_stored[tri_main == index] = item.detector_stored_id
     return vertices, faces, tri_stored
 
 
 def generate(scene_root, repo_root, metadata_path, output_dir, bands=4, viz=0,
              force=False):
     """
-    Render GT masks and save visible-vertex support data
+    Render reference masks and save visible vertex support data
 
     - bands: number of horizontal bands used to limit GPU memory
     - viz: number of optional overlay images to generate
     - force: ignore existing masks and support data when enabled
 
-    Each output semantic PNG contains detector stored IDs, not local class IDs.
-    This is required because the global evaluator consumes the same mask format for YOLO predictions and dataset ground truth.
+    Each output semantic PNG contains detector stored IDs, not local class IDs
+    The global evaluator consumes this format for detector predictions and dataset reference masks
     """
     if bands < 1:
         raise ValueError("bands must be at least 1")
@@ -427,11 +426,11 @@ def generate(scene_root, repo_root, metadata_path, output_dir, bands=4, viz=0,
 
 def main():
     """
-    Generate Scannet++ GT masks from the command-line arguments
+    Generate Scannet++ reference masks from command arguments
 
     The CLI is called by run.py inside the lifting container, which can use CUDA
     The metadata path is retained as an explicit input because it validates that
-    segment annotation labels belong to the released Scannet++ taxonomy.
+    segment annotation labels belong to the released Scannet++ taxonomy
     """
     parser = argparse.ArgumentParser()
 

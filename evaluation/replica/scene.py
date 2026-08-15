@@ -59,7 +59,7 @@ class ReplicaScene:
     """ Load Replica data and convert it to the common evaluation format """
 
     def __init__(self, data_root, scene, sequence_name, frame_step, seed,
-                 vertex_label_min_share, visibility_slop):
+                 vertex_label_min_fraction, visibility_slop):
         """ 
         Store the scene paths and thresholds used by Replica processing 
         
@@ -68,7 +68,7 @@ class ReplicaScene:
         - sequence_name: the name of the sequence to process
         - frame_step: the step size for selecting frames from the sequence
         - seed: the random seed for sampling points
-        - vertex_label_min_share: the minimum share of face labels required for a vertex to be annotated
+        - vertex_label_min_fraction: the minimum fraction of face labels required for a vertex to be annotated
         - visibility_slop: the maximum allowed depth difference for a vertex to be considered visible
         """
         self.data_root = Path(data_root)
@@ -77,7 +77,7 @@ class ReplicaScene:
         self.sequence = self.scene_root / scene / sequence_name
         self.frame_step = frame_step
         self.seed = seed
-        self.vertex_label_min_share = vertex_label_min_share
+        self.vertex_label_min_fraction = vertex_label_min_fraction
         self.visibility_slop = visibility_slop
 
     def selected_frames(self):
@@ -195,13 +195,13 @@ class ReplicaScene:
         
         # Uses face_dataset, Replica dataset IDs to identify vertices with a source annotation, independently of the main local labels
         vertex_dataset = self._vertex_majority(
-            len(vertices), faces, face_dataset, self.vertex_label_min_share,
+            len(vertices), faces, face_dataset, self.vertex_label_min_fraction,
         )
 
         # Convert main local face labels to main local vertex labels for metrics
         # Uses face_labels, which are already converted to main local IDs, to identify vertices with a main local label
         semantic = self._vertex_majority(
-            len(vertices), faces, face_labels, self.vertex_label_min_share,
+            len(vertices), faces, face_labels, self.vertex_label_min_fraction,
         )
 
         # Visibility is derived from the RGB-D semantic frames

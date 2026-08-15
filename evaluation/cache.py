@@ -85,7 +85,7 @@ def run_parameters(args, data_root):
         "background_view_policy": args.background_view_policy,
         "betas": list(args.betas),
         "tau": args.tau,
-        "min_share": args.min_share,
+        "min_fraction": args.min_fraction,
         "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
         "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
         "min_opacity": args.min_opacity,

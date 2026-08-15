@@ -9,7 +9,7 @@ from .common import ensure_dir
 from . import transfer
 
 
-def _metadata(scene, gaussian_ply, tau, min_share,
+def _metadata(scene, gaussian_ply, tau, min_fraction,
               mesh_to_gaussian_background_competes, mesh_to_gaussian_transfer):
     """ Build the metadata used to validate the GT cache """
 
@@ -25,7 +25,7 @@ def _metadata(scene, gaussian_ply, tau, min_share,
         "ply_size": int(stat.st_size),
         "ply_mtime_ns": int(stat.st_mtime_ns),
         "tau": float(tau),
-        "min_share": float(min_share),
+        "min_fraction": float(min_fraction),
         "mesh_to_gaussian_background_competes": bool(mesh_to_gaussian_background_competes),
         "mesh_to_gaussian_transfer": mesh_to_gaussian_transfer,
     }
@@ -44,7 +44,7 @@ def _needs_rebuild(meta_path, expected, force):
         return True
 
 
-def build(scene, gaussian_ply, gt_dir, tau, min_share, mesh_to_gaussian_background_competes,
+def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_background_competes,
           mesh_to_gaussian_transfer="radius_vote", force=False):
     """
     Build or reuse the neighborhoods and the Gaussians GT local semantic labels used for evaluation
@@ -60,7 +60,7 @@ def build(scene, gaussian_ply, gt_dir, tau, min_share, mesh_to_gaussian_backgrou
     # Create the cache directory before reading or writing any cache file
     ensure_dir(gt_dir)
     meta_path = gt_dir / "cache_meta.json"
-    expected = _metadata(scene, gaussian_ply, tau, min_share, mesh_to_gaussian_background_competes, mesh_to_gaussian_transfer)
+    expected = _metadata(scene, gaussian_ply, tau, min_fraction, mesh_to_gaussian_background_competes, mesh_to_gaussian_transfer)
     rebuild = _needs_rebuild(meta_path, expected, force)
 
     # Keep each cache component in a separate file so missing pieces can be rebuilt
@@ -107,7 +107,7 @@ def build(scene, gaussian_ply, gt_dir, tau, min_share, mesh_to_gaussian_backgrou
             gaussian_labels = transfer.radius_label_vote(
                 len(full_xyz), vertices_near_a_gaussian, reference_labels,
                 np.ones(len(reference_labels), dtype=np.float64), classes,
-                min_share, mesh_to_gaussian_background_competes,
+                min_fraction, mesh_to_gaussian_background_competes,
             )
         np.savez_compressed(gaussian_labels_path, labels=gaussian_labels)
 

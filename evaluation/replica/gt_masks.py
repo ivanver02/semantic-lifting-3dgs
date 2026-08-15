@@ -15,7 +15,7 @@ def main():
     parser.add_argument("--scene", required=True)
     parser.add_argument("--sequence_name", default="Sequence_2")
     parser.add_argument("--frame_step", type=int, default=5)
-    parser.add_argument("--vertex_label_min_share", type=float, required=True)
+    parser.add_argument("--vertex_label_min_fraction", type=float, required=True)
     parser.add_argument("--visibility_slop", type=float, required=True)
     parser.add_argument("--output_dir", required=True, type=Path)
 
@@ -27,7 +27,7 @@ def main():
     scene = ReplicaScene(
         args.data_root, args.scene, args.sequence_name, args.frame_step,
         seed=3,
-        vertex_label_min_share=args.vertex_label_min_share,
+        vertex_label_min_fraction=args.vertex_label_min_fraction,
         visibility_slop=args.visibility_slop,
     )
     
