@@ -1,5 +1,9 @@
 # Shared data structures that simplify metrics evaluation from both datasets
 
+import os
+import tempfile
+from pathlib import Path
+
 class TargetClassInfo:
     """
     Description of one target class in the main project vocabulary and its detector representation
@@ -86,6 +90,26 @@ def ensure_dir(path):
     """ Ensure the existence of a directory and return its path """
     path.mkdir(parents=True, exist_ok=True) # exist_ok allows cached stages to call this repeatedly.
     return path
+
+
+def atomic_write_text(path, text):
+    """ Replace a text artifact atomically """
+    path = Path(path)
+    ensure_dir(path.parent)
+    fd, name = tempfile.mkstemp(
+        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
+    )
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+
+    # Write and flush the temporary file
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
 
 
 def target_classes_by_detector(classes):

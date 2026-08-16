@@ -1,5 +1,6 @@
 import torch
 import os
+import tempfile
 import sys
 import cv2
 import json
@@ -482,11 +483,38 @@ def main(args):
             'target_score_p99_9': score_stats['p99_9'],
             'supported_fraction': float(supported.float().mean().item()),
         }
+
+    # Write statistics atomically
         os.makedirs(os.path.dirname(args.statistics_path), exist_ok=True)
-        with open(args.statistics_path, 'w') as handle:
-            json.dump(statistics, handle, indent=2)
+        fd, temporary_name = tempfile.mkstemp(
+            dir=os.path.dirname(args.statistics_path), suffix=".tmp",
+        )
+        try:
+            with os.fdopen(fd, 'w') as handle:
+                json.dump(statistics, handle, indent=2)
+                handle.write("\n")
+
+    # Flush the statistics file
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary_name, args.statistics_path)
+        finally:
+            if os.path.exists(temporary_name):
+                os.unlink(temporary_name)
     
-    torch.save(voting_data, voting_data_path)
+    # Persist the voting data atomically
+    fd, temporary_name = tempfile.mkstemp(
+        dir=class_output_dir, suffix=".pt.tmp",
+    )
+    os.close(fd)
+    try:
+        torch.save(voting_data, temporary_name)
+        os.replace(temporary_name, voting_data_path)
+    finally:
+
+    # Remove an incomplete vote file
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
     print(f"Saved voting weights to {voting_data_path}")
 
 

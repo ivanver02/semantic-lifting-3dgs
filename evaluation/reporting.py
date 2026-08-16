@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 from plyfile import PlyData
 
-from .common import ensure_dir
+from .common import atomic_write_text, ensure_dir
 
 
 def format_metric(value):
@@ -60,7 +60,7 @@ def write_result(results_dir, result):
     ensure_dir(results_dir)
     tag = result["mask_source"] # Either "yolo" or "gt2d"
     json_path = results_dir / f"results_{tag}.json"
-    json_path.write_text(json.dumps(result, indent=2, default=str))
+    atomic_write_text(json_path, json.dumps(result, indent=2, default=str) + "\n")
 
     lines = [
         f"# {result['dataset']} {result['scene']} ({tag})",

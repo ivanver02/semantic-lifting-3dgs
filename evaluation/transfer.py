@@ -1,5 +1,8 @@
 # Transfer labels between mesh vertices and Gaussians using radius votes
 
+import os
+import tempfile
+
 import numpy as np
 from scipy.spatial import cKDTree
 from plyfile import PlyData
@@ -102,7 +105,22 @@ def save_neighbors(path, csr):
 
     # Store the three CSR components for later reuse
     path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(path, indptr=csr[0], indices=csr[1], dist=csr[2])
+    fd, temporary_name = tempfile.mkstemp(dir=path.parent, suffix=".npz")
+
+    # Write the neighborhood archive atomically
+    try:
+        with os.fdopen(fd, "wb") as temporary:
+            np.savez_compressed(
+                temporary, indptr=csr[0], indices=csr[1], dist=csr[2],
+            )
+            temporary.flush()
+            os.fsync(temporary.fileno())
+        os.replace(temporary_name, path)
+
+    # Remove incomplete neighborhood archives
+    finally:
+        if os.path.exists(temporary_name):
+            os.unlink(temporary_name)
 
 
 def load_neighbors(path):
