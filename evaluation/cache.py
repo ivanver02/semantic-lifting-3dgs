@@ -8,9 +8,9 @@ from .common import ensure_dir
 
 VOTE_CACHE_KEYS = [
     "dataset", "scene", "data_root", "sequence_name", "frame_step",
-    "iterations", "resolution", "size_measure", "background_mode",
-    "background_confidence", "background_view_policy", "sigma",
-    "size_penalty", "raster_block_size", "vote_data_device",
+    "iterations", "resolution", "background_mode",
+    "background_confidence", "background_view_policy",
+    "raster_block_size", "vote_data_device",
 ]
 
 GT_MASK_CACHE_KEYS = [
@@ -77,7 +77,6 @@ def run_parameters(args, data_root):
         "resolution": args.resolution,
         "train_data_device": args.train_data_device,
         "yolo_conf": args.yolo_conf,
-        "size_measure": args.size_measure,
         "hysteresis_gamma": args.hysteresis_gamma,
         "hysteresis_radius": args.hysteresis_radius,
         "background_mode": args.background_mode,
@@ -92,8 +91,6 @@ def run_parameters(args, data_root):
         "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
         "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
         "opacity_weighting": not args.no_opacity_weighting,
-        "sigma": args.sigma,
-        "size_penalty": args.size_penalty,
         "raster_block_size": args.raster_block_size,
         "vote_data_device": args.vote_data_device,
     }

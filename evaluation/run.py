@@ -60,7 +60,6 @@ def _parser():
 
     # Configure mask generation, vote accumulation and threshold selection
     parser.add_argument("--yolo-conf", type=float, default=0.75)
-    parser.add_argument("--size-measure", choices=["max", "gmean", "l2"], default="max")
     parser.add_argument("--hysteresis-gamma", type=float, default=0.8)
     parser.add_argument("--hysteresis-radius", type=float, default=0.05)
     parser.add_argument(
@@ -117,8 +116,6 @@ def _parser():
         help="Do not use background votes when assigning GT labels to Gaussians",
     )
     parser.add_argument("--no-opacity-weighting", action="store_true")
-    parser.add_argument("--sigma", type=float, default=1.5)
-    parser.add_argument("--size-penalty", type=float, default=100.0)
     parser.add_argument("--raster-block-size", type=int, default=16)
 
     # Rebuild cached data instead of reusing files from an earlier run
@@ -322,9 +319,6 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
             "--target_class", spec.name_by_detector,
             "--loaded_iter", str(args.iterations),
             "--raster_block_size", str(args.raster_block_size),
-                "--sigma", str(args.sigma),
-            "--size_penalty", str(args.size_penalty),
-            "--size_measure", str(args.size_measure),
             "--source_path", str(dataset_dir),
             "--data_device", str(args.vote_data_device),
         ]
@@ -491,15 +485,12 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             "vertices_evaluated": int(scene.evaluation_mask.sum()),
         },
         "parameters": {
-            "size_measure": args.size_measure,
             "hysteresis_gamma": args.hysteresis_gamma,
             "hysteresis_radius": args.hysteresis_radius,
             "background_mode": args.background_mode,
             "background_confidence": args.background_confidence,
             "background_view_policy": args.background_view_policy,
             "betas": betas,
-            "sigma": args.sigma,
-            "size_penalty": args.size_penalty,
             "tau": args.tau,
             "min_fraction": args.min_fraction,
             "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
@@ -536,10 +527,6 @@ def main():
         raise ValueError("--hysteresis-gamma must be non-negative")
     if args.hysteresis_radius <= 0.0:
         raise ValueError("--hysteresis-radius must be greater than zero")
-    if args.sigma < 0.0:
-        raise ValueError("--sigma must be non-negative")
-    if args.size_penalty <= 0.0:
-        raise ValueError("--size-penalty must be greater than zero")
     if args.raster_block_size <= 0:
         raise ValueError("--raster-block-size must be greater than zero")
 

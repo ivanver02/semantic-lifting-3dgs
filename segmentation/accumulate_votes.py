@@ -90,31 +90,6 @@ def main(args):
     ply_path = os.path.join(args.model_path, "point_cloud", f"iteration_{args.loaded_iter}", "point_cloud.ply")
     gaussians.load_ply(ply_path)
     
-    # Calculate the size of all gaussians
-    scales = gaussians.get_scaling # tensor of shape (N, 3) containing the three scaling values for every Gaussian.
-    # Size measure used by the vote penalty. max punishes flat
-    # panel gaussians, like tv/table surfaces, like isotropic blobs, gmean
-    # ,characteristic length (s1*s2*s3)^(1/3), relieves panels, l2, sqrt of
-    # sum of squares, punishes them even more.
-    if args.size_measure == "gmean":
-        scalar_sizes = torch.exp(scales.log().mean(dim=1))
-    elif args.size_measure == "l2":
-        scalar_sizes = scales.norm(dim=1)
-    else:
-        scalar_sizes = scales.max(dim=1).values
-
-    '''
-    Analysis of gaussian sizes to select the default size penalty
-
-    print(f"Gaussian sizes, max scale: Min={scalar_sizes.min().item():.5f}, Max={scalar_sizes.max().item():.5f}")
-
-    # Statistical analysis of scales: deciles
-    deciles = torch.quantile(scalar_sizes, torch.linspace(0.1, 0.9, 9, device=args.device))
-    print("\n--- Gaussian Scale Distribution (Deciles) ---")
-    for i, decile_val in enumerate(deciles):
-        print(f"{(i+1)*10}th percentile: {decile_val.item():.5f}")
-    '''
-
     cov3D = get_covariance_3d(gaussians) # shape (N, 3, 3), as there is one 3D covariance matrix per Gaussian. This will be used to project the 3D Gaussians into 2D for each camera view.
     # Vote accumulation only needs camera geometry and masks. Keep full-resolution source images on CPU, then release them after Scene has built the cameras.
     load_images_on_cpu = getattr(args, "data_device", "cuda") == "cpu"
@@ -219,7 +194,6 @@ def main(args):
 
 
         opacities = gaussians.get_opacity[indices] # (M,)
-        view_sizes = scalar_sizes[indices] # (M,)
         '''
         Equation 4 but projected in 2D
         To make the rasterization loop fast, we don't want to calculate the inverse matrix for every pixel. We calculate it once per Gaussian and store it.
@@ -260,7 +234,6 @@ def main(args):
         # Now we save how the original indexes of the Gaussians are ordered after sorting by depth
         # With sort_indices we get the order of the Gaussians once culled and sorted by depth. Indices is the original index of the Gaussians in the global model
         sorted_original_indices = indices[sort_indices] # Save the original indexes by ordering now that we have sorted the Gaussians by depth. While we work with tiles, we will accumulate votes in a temporary depth-sorted tensor specifically for this view, and then we will add those votes to the global weights tensor using these original indices when all the tiles have been processed.
-        view_sizes = view_sizes[sort_indices]
 
         # Frustum culling: filter out gaussians that don't overlap with the image
         # The projection only checks z > znear, so we need to filter the x and y bounds to match the view
@@ -274,7 +247,6 @@ def main(args):
         conic = conic[in_frustum]
         opacities = opacities[in_frustum]
         sorted_original_indices = sorted_original_indices[in_frustum]
-        view_sizes = view_sizes[in_frustum]
 
         # Initialize tensors to store the accumulated weights for each visible Gaussian
         num_visible = means2D.shape[0]
@@ -316,7 +288,6 @@ def main(args):
                 tile_means = means2D[gaussians_in_tile]
                 tile_conics = conic[gaussians_in_tile]
                 tile_opacities = opacities[gaussians_in_tile]
-                tile_sizes = view_sizes[gaussians_in_tile]
                 
                 # Obtain the boundaries of the current tile in pixel coordinates
                 pix_min_x = column_tile * BLOCK_SIZE
@@ -419,30 +390,10 @@ def main(args):
                 background_pixel_mask = background_mask[flat_y, flat_x] # Not the same as tile_detector_labels != target_id, because the background mask can be defined differently depending on the background_mode argument (in default, confidence_weighted, detected non-target classes retain their detector confidence)
                 background_confidences = background_confidence[flat_y, flat_x]
 
-                '''
-                The Gaussian contribution is also weighted by the inverse of its size. This
-                penalizes large Gaussians so that they contribute less to the accumulated votes:
-
-                size_penalty_val = (tile_sizes * args.size_penalty) ** args.sigma
-
-                size_penalty_val has shape (N_gaussians_in_tile,). It is reshaped into a
-                column vector with shape (K, 1), allowing it to broadcast across all pixels
-                of each Gaussian:
-
-                Shape (K, P) / Shape (K, 1) -> Shape (K, P)
-
-                The resulting weighted_contribution is used to calculate target and background votes separately. 
-                Target pixels are multiplied by target_confidences, while background pixels are multiplied by background_confidences.
-                '''
-
-                size_penalty_val = (tile_sizes * args.size_penalty) ** args.sigma
-                weighted_contribution = (weights / size_penalty_val.view(-1, 1))
-
-
                 # Vote Calculation: alpha * T * pixel_confidence
                 # Sum all the pixel contributions for the target class and background to get the total vote for each Gaussian in this tile
-                target_votes = (weighted_contribution[:, target_pixel_mask] * target_confidences[target_pixel_mask]).sum(dim=1)
-                background_votes = (weighted_contribution[:, background_pixel_mask] * background_confidences[background_pixel_mask]).sum(dim=1)
+                target_votes = (weights[:, target_pixel_mask] * target_confidences[target_pixel_mask]).sum(dim=1)
+                background_votes = (weights[:, background_pixel_mask] * background_confidences[background_pixel_mask]).sum(dim=1)
 
                 # Accumulate the votes for the Gaussians in this tile into the weights tensors of this view, where Gaussians are still sorted by depth. These are a temporary tensor that will be added to the global weights tensors after all tiles have been processed for this view.
                 view_target_weights_sorted[gaussians_in_tile] += target_votes
@@ -559,11 +510,6 @@ if __name__ == "__main__":
     parser.add_argument("--data_device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for source images; camera matrices remain on the GPU")
     parser.add_argument("--raster_block_size", type=int, default=16, help="Block size for rasterization. Larger blocks are faster but less precise.")
 
-    # Vote accumulation parameters
-    parser.add_argument("--sigma", type=float, default=1.5, help="Exponent for size punishment. Higher sigma penalizes larger Gaussians more.")
-    parser.add_argument("--size_penalty", type=float, default=100.0, help="Base multiplier for size punishment. Scales the Gaussian size before exponentiation.")
-    parser.add_argument("--size_measure", type=str, default="max", choices=["max", "gmean", "l2"], help="Gaussian size measure for the vote penalty")
-    
     # Background handling parameters
     parser.add_argument("--background_mode", type=str, default="confidence_weighted", choices=["all_non_target", "explicit_background", "confidence_weighted"],
         help="How to form the non-target evidence mask")
@@ -573,10 +519,6 @@ if __name__ == "__main__":
 
     args = get_combined_args(parser)
 
-    if args.sigma < 0.0:
-        raise ValueError("--sigma must be non-negative")
-    if args.size_penalty <= 0.0:
-        raise ValueError("--size_penalty must be greater than zero")
     if args.raster_block_size <= 0:
         raise ValueError("--raster_block_size must be greater than zero")
     if not 0.0 <= args.background_confidence <= 1.0:
