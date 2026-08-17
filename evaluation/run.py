@@ -37,10 +37,6 @@ def _parser():
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--model-root", type=Path, default=None, help="Gaussian model directory to reuse, if exists")
-    parser.add_argument(
-        "--reuse-from", type=Path, default=None,
-        help="previous evaluation root from which GT2D masks and voting data are copied",
-    )
 
     # Select the source of the 2D masks and the container images that produce them
     parser.add_argument("--mask-source", choices=["yolo", "gt2d", "both"], default="yolo")
@@ -292,8 +288,7 @@ def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
 
 
 def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
-               segmentation_dir, classes, reuse_votes=False,
-               save_statistics=False):
+               segmentation_dir, classes, save_statistics=False):
     """
     Accumulate 2D votes for every target class present in the masks.
 
@@ -306,7 +301,7 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
         safe = safe_name(spec.name_by_detector)
         vote_path = segmentation_dir / safe / f"voting_data_{safe}.pt"
         statistics_path = segmentation_dir / safe / "vote_statistics.json"
-        if (vote_path.exists() and (not args.force or reuse_votes) and
+        if (vote_path.exists() and not args.force and
                 (not save_statistics or statistics_path.exists())):
             continue
 
@@ -594,17 +589,13 @@ def main():
     # Create a scene instance for the selected dataset.
     scene_instance = _make_scene(args, data_root, masks_gt)
 
-    # Prepare metadata and optionally import reusable scene caches.
+    # Prepare metadata and reuse caches within this output root
     cache.prepare_run_metadata(output_root, parameters, args.force, pending_sources)
-    reused_gt_masks, reused_vote_sources = cache.copy_reusable_data(
-        args, output_root, parameters,
-    )
     dataset_dir = _prepare_scene(args, scene_instance, runtime, dataset_dir)
     model_dir = cache.resolve_model_dir(args, data_root, output_root)
 
-    # Generate ground-truth masks.
-    if not reused_gt_masks:
-        _generate_gt_masks(args, scene_instance, runtime, masks_gt)
+    # Generate reference masks
+    _generate_gt_masks(args, scene_instance, runtime, masks_gt)
     if args.mask_source in {"yolo", "both"}:
         _generate_yolo_masks(args, runtime, dataset_dir, masks_yolo)
 
@@ -675,7 +666,6 @@ def main():
         # Accumulate votes
         _run_votes(
             args, runtime, dataset_dir, model_dir, mask_dir, source_dir, vote_classes,
-            source in reused_vote_sources,
             analytics_store is not None,
         )
 
