@@ -116,9 +116,21 @@ def _parser():
 
     # Rebuild cached data instead of reusing files from an earlier run
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--force-masks", action="store_true", help="Rebuild only the requested mask artifacts")
+    parser.add_argument("--force-votes", action="store_true", help="Rebuild only the matching vote artifact")
+    parser.add_argument("--force-thresholds", action="store_true", help="Rebuild only the matching threshold artifacts")
+    parser.add_argument("--force-transfer", action="store_true", help="Rebuild only the ground-truth transfer artifact")
     parser.add_argument("--save_results_to_csv", action="store_true", default=False,
         help="Append validation results and summaries to dataTFGIvanVerdugo/analytics")
     return parser
+
+
+def _force_any(args):
+    """ Whether this invocation intentionally invalidates a stage cache """
+    return any(getattr(args, name, False) for name in (
+        "force", "force_masks", "force_votes", "force_thresholds",
+        "force_transfer",
+    ))
 
 
 def _make_scene(args, data_root, support_dir):
@@ -230,6 +242,7 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
     """
 
     # Replica can generate its actual GT masks directly from the semantic image sequence
+    force = args.force or args.force_masks
     if args.dataset == "replica":
         runtime.run_lifting_module(
             "evaluation.replica.gt_masks",
@@ -241,18 +254,18 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
                 "--vertex_label_min_fraction", str(scene.vertex_label_min_fraction),
                 "--visibility_slop", str(scene.visibility_slop),
                 "--output_dir", str(output_dir),
-            ] + (["--force"] if args.force else []),
+            ] + (["--force"] if force else []),
         )
 
             # Scannet++ renders its masks from the mesh through the lifting container, they will be considered our "GT"
     elif args.dataset == "scannetpp":
-        scene.generate_gt_masks(runtime, output_dir, bands=4, force=args.force)
+        scene.generate_gt_masks(runtime, output_dir, bands=4, force=force)
 
 
 def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
     """ Generate or reuse YOLO masks for the prepared dataset images """
     # The classes file says whether the mask directory exists
-    if (output_dir / "classes.json").exists() and not args.force:
+    if (output_dir / "classes.json").exists() and not (args.force or args.force_masks):
         return
 
     # Run the detector inside the lifting container.
@@ -301,7 +314,8 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
         safe = safe_name(spec.name_by_detector)
         vote_path = segmentation_dir / safe / f"voting_data_{safe}.pt"
         statistics_path = segmentation_dir / safe / "vote_statistics.json"
-        if (vote_path.exists() and not args.force and
+        if (vote_path.exists() and
+                not (args.force or args.force_votes) and
                 (not save_statistics or statistics_path.exists())):
             continue
 
@@ -350,7 +364,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes):
             output = segmentation_dir / safe / (
                 f"labeled_gaussians_{safe}_beta{str(beta).replace('.', '_')}.ply"
             )
-            if output.exists() and not args.force:
+            if output.exists() and not (args.force or args.force_thresholds):
                 continue
 
             command = [
@@ -568,7 +582,7 @@ def main():
     parameters = cache.run_parameters(args, data_root)
 
     # Do not initialize scenes, containers or caches when the requested report exists.
-    pending_sources = _pending_sources(output_root, args.mask_source, args.force)
+    pending_sources = _pending_sources(output_root, args.mask_source, _force_any(args))
     if not pending_sources:
         cache.prepare_run_metadata(
             output_root, parameters, False, _source_names(args.mask_source),
@@ -590,7 +604,10 @@ def main():
     scene_instance = _make_scene(args, data_root, masks_gt)
 
     # Prepare metadata and reuse caches within this output root
-    cache.prepare_run_metadata(output_root, parameters, args.force, pending_sources)
+    cache.prepare_run_metadata(
+        output_root, parameters, _force_any(args), pending_sources,
+        force_delete=args.force,
+    )
     dataset_dir = _prepare_scene(args, scene_instance, runtime, dataset_dir)
     model_dir = cache.resolve_model_dir(args, data_root, output_root)
 
@@ -613,7 +630,7 @@ def main():
     gaussians_near_a_vertex, gaussian_labels = ground_truth.build(
         scene, model_ply, gt_dir, args.tau, args.min_fraction,
         args.mesh_to_gaussian_background_competes,
-        args.mesh_to_gaussian_transfer, args.force,
+        args.mesh_to_gaussian_transfer, args.force or args.force_transfer,
         evaluation_scope_version=parameters["evaluation_scope_version"],
     )
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)

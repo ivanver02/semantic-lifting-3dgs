@@ -172,13 +172,8 @@ def _write_scope_metadata(path, metadata):
             os.unlink(temporary_name)
 
 
-def prepare_run_metadata(output_root, parameters, force, sources):
-    """
-    Prepare the output directory and write run parameters to JSON files
-
-    force is boolean. When enabled, only artifacts owned by the requested
-    mask sources are removed before the new run starts.
-    """
+def prepare_run_metadata(output_root, parameters, force, sources, force_delete=False):
+    """ Prepare the output directory and write run parameters """
     common_metadata_path = output_root / "run_parameters.json"
     common_previous = None
     if common_metadata_path.exists():
@@ -213,8 +208,7 @@ def prepare_run_metadata(output_root, parameters, force, sources):
             )
 
     for source in sources:
-        if force:
-            # Only remove artifacts owned by the requested detector.
+        if force_delete:
             mask_dir = output_root / ("masks_gt2d" if source == "gt2d" else "masks_yolo")
             shutil.rmtree(mask_dir, ignore_errors=True)
             shutil.rmtree(output_root / "segmentation" / source, ignore_errors=True)
@@ -223,11 +217,9 @@ def prepare_run_metadata(output_root, parameters, force, sources):
                     missing_ok=True,
                 )
 
-    if (force and common_previous is not None and not other_sources_have_results and
+    if (force_delete and common_previous is not None and not other_sources_have_results and
             (common_previous.get("iterations") != parameters["iterations"] or
              common_previous.get("resolution") != parameters["resolution"])):
-        
-        # These caches are shared, so retain them while another detector result exists
         shutil.rmtree(output_root / "model", ignore_errors=True)
         shutil.rmtree(output_root / "dataset", ignore_errors=True)
 
