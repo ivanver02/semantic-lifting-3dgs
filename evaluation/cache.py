@@ -32,6 +32,12 @@ YOLO_MASK_METADATA_KEYS = [
     "resolution", "yolo_conf",
 ]
 
+GT_METADATA_KEYS = [
+    "evaluation_scope_version",
+    "tau", "min_fraction", "mesh_to_gaussian_background_competes",
+    "mesh_to_gaussian_transfer",
+]
+
 
 def _has_model(model_dir, iterations):
     """ Check whether the Gaussian model exists """
@@ -185,6 +191,7 @@ def prepare_run_metadata(output_root, parameters, force, sources):
     scopes = [
         ("meta_dataset.json", DATASET_METADATA_KEYS, "dataset/model"),
         ("meta_masks_gt2d.json", GT_MASK_CACHE_KEYS, "GT2D masks"),
+        ("meta_gt.json", GT_METADATA_KEYS, "ground-truth transfer"),
     ]
     if "yolo" in sources:
         scopes.append(("meta_masks_yolo.json", YOLO_MASK_METADATA_KEYS, "YOLO masks"))

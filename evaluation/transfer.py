@@ -8,6 +8,7 @@ from scipy.spatial import cKDTree
 from plyfile import PlyData
 
 EPS = 1e-10
+RADIUS_NEIGHBOR_CHUNK_SIZE = 100000
 
 
 def sigmoid(values):
@@ -50,7 +51,8 @@ def map_subset_indices(full_xyz, subset_xyz):
     return indices
 
 
-def build_radius_neighbors(query_points, reference_tree, radius, chunk_size=100000):
+def build_radius_neighbors(query_points, reference_tree, radius,
+                           chunk_size=RADIUS_NEIGHBOR_CHUNK_SIZE):
     """
     Build radius neighborhoods (points from reference_tree in a radius) for every query point
 
@@ -63,16 +65,16 @@ def build_radius_neighbors(query_points, reference_tree, radius, chunk_size=1000
     distance_chunks = []
     count_chunks = []
 
-    # Query the reference KD-tree in chunks
+    # Query the reference KD tree in chunks
     for start in range(0, len(query_points), chunk_size):
         end = min(start + chunk_size, len(query_points))
 
-        # Query all points in this chunk against the reference KD-tree
+        # Query points in this chunk against the reference KD tree
         lists = reference_tree.query_ball_point(query_points[start:end], r=radius)
 
         # CSR row counts allow the variable length neighbor lists to be flattened
         counts = np.fromiter((len(item) for item in lists), dtype=np.int64, count=len(lists))
-        count_chunks.append(counts) # Counts the length of each neighbor list in this query vertex chunk
+        count_chunks.append(counts)
         chunk_indices = np.empty(int(counts.sum()), dtype=np.int32)
         chunk_distances = np.empty(int(counts.sum()), dtype=np.float32)
         position = 0

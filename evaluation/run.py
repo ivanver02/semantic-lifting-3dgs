@@ -614,6 +614,7 @@ def main():
         scene, model_ply, gt_dir, args.tau, args.min_fraction,
         args.mesh_to_gaussian_background_competes,
         args.mesh_to_gaussian_transfer, args.force,
+        evaluation_scope_version=parameters["evaluation_scope_version"],
     )
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
 
