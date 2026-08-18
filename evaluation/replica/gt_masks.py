@@ -17,6 +17,7 @@ def main():
     parser.add_argument("--frame_step", type=int, default=5)
     parser.add_argument("--vertex_label_min_fraction", type=float, required=True)
     parser.add_argument("--visibility_slop", type=float, required=True)
+    parser.add_argument("--resolution", type=int, required=True)
     parser.add_argument("--output_dir", required=True, type=Path)
 
     # Recreate masks even when the output directory already contains metadata
@@ -32,7 +33,9 @@ def main():
     )
     
     # Generate the semantic and confidence masks for the selected frames
-    scene.generate_gt_masks(args.output_dir, force=args.force)
+    scene.generate_gt_masks(
+        args.output_dir, force=args.force, resolution=args.resolution,
+    )
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ def _needs_rebuild(meta_path, expected, force):
 
 def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_background_competes,
           mesh_to_gaussian_transfer="radius_vote", force=False,
-          neighborhood_chunk_size=None, evaluation_scope_version=4):
+          neighborhood_chunk_size=None, evaluation_scope_version=5):
     """
     Build or reuse the neighborhoods and the Gaussians GT local semantic labels used for evaluation
 

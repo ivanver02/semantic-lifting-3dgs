@@ -9,13 +9,11 @@ import numpy as np
 from PIL import Image
 from plyfile import PlyData
 
-from ..common import SceneData, TargetClassInfo, ensure_dir
+from ..common import SceneData, TargetClassInfo, atomic_write_text, ensure_dir
 
 
-# Future possible improvement: use embeddings to match detector names with the corresponding Replica dataset names.
 
 CLASSES = [
-    # Fields are: main project name, detector name, and stored detector-mask ID. The stored ID is the detector model ID plus one.
     TargetClassInfo("chair", "chair", 57),
     TargetClassInfo("sofa", "couch", 58),
     TargetClassInfo("table", "dining table", 61),
@@ -24,8 +22,8 @@ CLASSES = [
     TargetClassInfo("clock", "clock", 75),
 ]
 
+# Map main names to Replica names
 REPLICA_CLASS_NAMES = {
-    # Map each main project name to the class name used by the Replica dataset in info_semantic.json
     "chair": "chair",
     "sofa": "sofa",
     "table": "table",
@@ -34,7 +32,7 @@ REPLICA_CLASS_NAMES = {
     "clock": "clock",
 }
 
-# State the reference for this function, as it is a standard conversion from rotation matrix to quaternion
+# Convert a rotation matrix to a quaternion
 def _rotmat_to_qvec(rotation):
     """ 
     Converts a rotation matrix to COLMAP's quaternion convention using a symmetric matrix, 
@@ -45,6 +43,8 @@ def _rotmat_to_qvec(rotation):
     matrix = np.array([
         [rxx - ryy - rzz, 0, 0, 0],
         [ryx + rxy, ryy - rxx - rzz, 0, 0],
+
+    # Complete the quaternion matrix
         [rzx + rxz, rzy + ryz, rzz - rxx - ryy, 0],
         [ryz - rzy, rzx - rxz, rxy - ryx, rxx + ryy + rzz],
     ]) / 3.0
@@ -54,6 +54,8 @@ def _rotmat_to_qvec(rotation):
         qvec *= -1
     return qvec
 
+    # Return the quaternion
+
 
 class ReplicaScene:
     """ Load Replica data and convert it to the common evaluation format """
@@ -61,7 +63,7 @@ class ReplicaScene:
     def __init__(self, data_root, scene, sequence_name, frame_step, seed,
                  vertex_label_min_fraction, visibility_slop):
         """ 
-        Store the scene paths and thresholds used by Replica processing 
+        Store the scene paths and thresholds used by Replica processing
         
         - data_root: the root directory of the Replica dataset
         - scene: the name of the scene to process
@@ -69,8 +71,10 @@ class ReplicaScene:
         - frame_step: the step size for selecting frames from the sequence
         - seed: the random seed for sampling points
         - vertex_label_min_fraction: the minimum fraction of face labels required for a vertex to be annotated
-        - visibility_slop: the maximum allowed depth difference for a vertex to be considered visible
+        - visibility_slop: the maximum allowed depth difference for a visible vertex
         """
+
+    # Store the scene configuration
         self.data_root = Path(data_root)
         self.scene = scene
         self.scene_root = self.data_root / scene
@@ -80,10 +84,12 @@ class ReplicaScene:
         self.vertex_label_min_fraction = vertex_label_min_fraction
         self.visibility_slop = visibility_slop
 
+    # Complete the metadata example
+
     def selected_frames(self):
         """ Return the frame indices selected using the configured step """
-        count = sum(1 for _ in open(self.sequence / "traj_w_c.txt")) # traj_w_c.txt contains one line per frame, so counting lines gives the total number of frames.
-        return list(range(0, count, self.frame_step)) # Creates a list of frame indices from 0 to count with the given step size.
+        count = sum(1 for _ in open(self.sequence / "traj_w_c.txt"))
+        return list(range(0, count, self.frame_step))
 
     def _load_mesh(self):
         """ Load vertices, faces and Replica dataset object IDs """
@@ -121,8 +127,10 @@ class ReplicaScene:
                         "name": "base-cabinet",
                         "parents": []
                         }],
-            ...
+            omitted fields
         }
+
+    # Add visibility and class fields
 
         """
         # This file can give a map from Replica dataset semantic IDs to Replica dataset names
@@ -131,9 +139,9 @@ class ReplicaScene:
     def _dataset_ids_to_local_ids(self, info):
         """ Map Replica dataset semantic IDs to SceneData local IDs """
         # Map Replica names to Replica IDs
-        name_to_id = {item["name"]: int(item["id"]) for item in info["classes"]} # Info is something like the example from above
+        name_to_id = {item["name"]: int(item["id"]) for item in info["classes"]}
 
-        # Map main name to their corresponding Replica dataset IDs. -1 means that the dataset does not contain that main class
+        # Map main names to Replica dataset IDs
         # Uses the REPLICA_CLASS_NAMES dictionary that maps main class names to Replica dataset names
         dataset_names = {name: name_to_id.get(dataset_name, -1)
                      for name, dataset_name in REPLICA_CLASS_NAMES.items()}
@@ -145,7 +153,7 @@ class ReplicaScene:
     @staticmethod
     def _vertex_majority(n_vertices, faces, face_labels, minimum):
         """ Assign each vertex its most common face label when it reaches the threshold """
-        # Face labels are converted to vertex labels because metrics operate on vertices. The segmentation IDs are the dataset ones
+        # Convert face labels to vertex labels
         votes = {}
 
         # Count the number of votes for each label at each vertex, based on the labels of the faces that include that vertex
@@ -164,14 +172,14 @@ class ReplicaScene:
         return labels
 
     @staticmethod
-    def _world_to_camera(pose): # Get the reference for this function, as it is a standard conversion from camera-to-world to world-to-camera (this repo has to already use it)
-        """ Invert a camera-to-world pose for world-to-camera projection """
+    def _world_to_camera(pose):
+        """Invert a pose from camera coordinates to world coordinates"""
         rotation = pose[:3, :3]
         output = np.eye(4)
         output[:3, :3] = rotation.T
 
-        # Gets the last column of the pose, which is the translation vector, and applies the inverted rotation to it. This is because when inverting a transformation, the translation needs to be transformed by the inverse of the rotation.
-        output[:3, 3] = -rotation.T @ pose[:3, 3] # The translation is inverted and rotated to match the camera-space convention expected by the depth images
+        # Rotate and negate the translation for camera coordinates
+        output[:3, 3] = -rotation.T @ pose[:3, 3]
         return output
 
     def load_data(self):
@@ -186,11 +194,11 @@ class ReplicaScene:
 
         # Map Replica face instance IDs to Replica face dataset semantic IDs
         face_dataset = np.where((face_instances_ids >= 0) & (face_instances_ids < len(id_to_label)),
-                            id_to_label[np.clip(face_instances_ids, 0, len(id_to_label) - 1)], # Clip sets lower and upper bounds
+                            id_to_label[np.clip(face_instances_ids, 0, len(id_to_label) - 1)],
                             -1)
 
         # Convert Replica face dataset IDs to main local IDs for voting
-        face_labels = np.asarray([dataset_ids_to_local_ids.get(int(value), -1) # If it is not in the mapping, it returns -1
+        face_labels = np.asarray([dataset_ids_to_local_ids.get(int(value), -1)
                                   for value in face_dataset], dtype=np.int64)
         
         # Uses face_dataset, Replica dataset IDs to identify vertices with a source annotation, independently of the main local labels
@@ -204,16 +212,18 @@ class ReplicaScene:
             len(vertices), faces, face_labels, self.vertex_label_min_fraction,
         )
 
-        # Visibility is derived from the RGB-D semantic frames
+        # Visibility is derived from RGB and depth semantic frames
         visible = self._visibility(vertices)
         selected_frames = self.selected_frames()
         return SceneData(
             dataset="replica",
             scene=self.scene,
             vertices=vertices,
-            semantic_labels=semantic, # Answers which category is the vertex
+            semantic_labels=semantic,
             annotated=(vertex_dataset >= 0),
-            visible=visible, # Answers which vertices are visible in the selected frames
+
+    # Complete the scene record
+            visible=visible,
             classes=CLASSES,
             num_images=len(selected_frames),
             camera_intrinsics=[
@@ -225,8 +235,7 @@ class ReplicaScene:
 
     def _load_trajectory(self):
         """ Load the sequence camera poses in world coordinates """
-        # Each row contains one flattened 4x4 camera-to-world transform.
-        return np.loadtxt(self.sequence / "traj_w_c.txt", dtype=np.float64).reshape(-1, 4, 4) # Converts the flat array into a 3D array where each slice along the first axis is a 4x4 matrix representing a camera pose.
+        return np.loadtxt(self.sequence / "traj_w_c.txt", dtype=np.float64).reshape(-1, 4, 4)
 
     def _load_depth(self, index):
         """ Load one depth image and convert its values to meters """
@@ -254,9 +263,9 @@ class ReplicaScene:
         """
 
         # Load the camera trajectory and initialize a visibility mask for all vertices
-        trajectory = self._load_trajectory() # Load the camera poses for the sequence, size (num_frames, 4, 4)
+        trajectory = self._load_trajectory()
         visible = np.zeros(len(vertices), dtype=bool)
-        frame_indices = self.selected_frames() # Get the indices of the selected frames, as not all are used always
+        frame_indices = self.selected_frames()
 
         # Intrinsics of Replica's pinhole camera
         height, width = 480, 640
@@ -266,12 +275,12 @@ class ReplicaScene:
         for index in frame_indices:
 
             # Represent mesh vertices in camera coordinates for the current frame
-            pose = self._world_to_camera(trajectory[index]) # trajectory[index] is a 4x4 camera-to-world matrix, and _world_to_camera converts it to a world-to-camera matrix
-            camera_points = (pose[:3, :3] @ vertices.T).T + pose[:3, 3] # vertices is (N, 3) so we rotate its transpose and transpose back: (N, 3) and translate it so that they get to the camera coordinate system
-            z = camera_points[:, 2] # Depth values of the projected points in camera space. z > 0 is in front of the camera
+            pose = self._world_to_camera(trajectory[index])
+            camera_points = (pose[:3, :3] @ vertices.T).T + pose[:3, 3]
+            z = camera_points[:, 2]
 
-            # Project the 3D camera coordinates to 2D pixel coordinates using the pinhole camera model. The projection equations are u = fx * x / z + cx and v = fy * y / z + cy, where (x, y, z) are the camera coordinates of the vertex, and (u, v) are the pixel coordinates in the image plane
-            # The np.errstate context manager is used to ignore division by zero and invalid value warnings that may occur when z is zero or negative
+            # Project camera points with the pinhole model
+            # Ignore invalid depth divisions
             with np.errstate(divide="ignore", invalid="ignore"):
                 u = fx * camera_points[:, 0] / z + cx
                 v = fy * camera_points[:, 1] / z + cy
@@ -282,13 +291,13 @@ class ReplicaScene:
 
             # Determine which vertices are projected inside the image boundaries and in front of the camera
             inside = ((z > 0) & (ui >= 0) & (ui < width) & (vi >= 0) & (vi < height))
-            candidates = np.where(inside)[0] # Indices of the vertices that are projected inside the image and in front of the camera
+            candidates = np.where(inside)[0]
             if len(candidates) == 0:
                 continue
 
             # Compare projected depth with the observed depth to reject occluded vertices
             depth = self._load_depth(index)
-            image_depth = depth[vi[candidates], ui[candidates]] # (v, u) because the image is indexed by (height, width) and the pixel coordinates are (u, v)
+            image_depth = depth[vi[candidates], ui[candidates]]
 
             # Compare the projected depth with the observed depth, allowing for a small tolerance defined by visibility_slop
             hit = ((image_depth > 0) & (np.abs(z[candidates] - image_depth) <= self.visibility_slop))
@@ -321,24 +330,26 @@ class ReplicaScene:
 
         # Link or copy the selected RGB frames into the training directory
         trajectory = self._load_trajectory()
-        frames = self.selected_frames() # Index of the selected frames to be used for training, based on the frame_step parameter
+        frames = self.selected_frames()
         for index in frames:
             source = self.sequence / "rgb" / f"rgb_{index}.png"
             target = images_dir / f"rgb_{index}.png"
             if not target.exists():
                 try:
-                    os.symlink(os.path.relpath(source, target.parent), target) # Computes the relative path from the target's parent directory to the source file and creates a symbolic link at the target location pointing to the source file
+                    os.symlink(os.path.relpath(source, target.parent), target)
+
+    # Finish the point cloud output
                 except OSError:
                     target.write_bytes(source.read_bytes())
 
-        # cameras.txt: Write the fixed Replica camera intrinsics used by the sequence
+        # Write the fixed Replica camera intrinsics
         (sparse_dir / "cameras.txt").write_text("# Camera list\n1 PINHOLE 640 480 320.0 320.0 320.0 240.0\n")
 
-        # images.txt: Convert each selected camera pose into the COLMAP text format
+        # Write selected camera poses in COLMAP format
         image_lines = ["# Image list\n"]
-        for image_id, index in enumerate(frames, start=1): # In COLMAP, image IDs start from 1
-            pose = self._world_to_camera(trajectory[index]) # Replica has camera-to-world poses, but COLMAP expects world-to-camera poses, so we convert them
-            qvec = _rotmat_to_qvec(pose[:3, :3]) # Convert the rotation matrix to a quaternion representation, which is the format expected by COLMAP for camera orientations
+        for image_id, index in enumerate(frames, start=1):
+            pose = self._world_to_camera(trajectory[index])
+            qvec = _rotmat_to_qvec(pose[:3, :3])
             translation = pose[:3, 3]
 
             # Write the image line
@@ -350,7 +361,7 @@ class ReplicaScene:
         (sparse_dir / "images.txt").write_text("".join(image_lines))
 
         # COLMAP needs an initial sparse point cloud to start the reconstruction
-        # points3D.txt: As we know the extrinsics, intrinsics and depth, we can sample a point cloud from the RGB-D images and save it in COLMAP's format
+        # Sample a point cloud from RGB and depth images for COLMAP
         rng = np.random.default_rng(self.seed)
         points, colors = [], []
 
@@ -374,7 +385,7 @@ class ReplicaScene:
             # Convert the camera coordinates to world coordinates using the camera pose
             world_points = (trajectory[index][:3, :3] @ camera_points.T).T + trajectory[index][:3, 3]
 
-            # Save the sampled world-space points and their RGB colors for COLMAP. We only keep the valid points that are within the specified depth range
+            # Save valid sampled points in world coordinates with their RGB colors
             colors.append(rgb[ys.reshape(-1)[valid], xs.reshape(-1)[valid]])
             points.append(world_points)
 
@@ -385,7 +396,7 @@ class ReplicaScene:
             selected = rng.choice(len(points), max_points, replace=False)
             points, colors = points[selected], colors[selected]
 
-        # points3D.txt: Save the sampled world-space points and their RGB colors for COLMAP
+        # Save sampled points in world coordinates with their RGB colors for COLMAP
         with open(sparse_dir / "points3D.txt", "w") as output:
             output.write("# Point list\n")
             for point_id, (point, color) in enumerate(zip(points, colors), start=1):
@@ -395,24 +406,41 @@ class ReplicaScene:
                 )
         return output_dir
 
-    def generate_gt_masks(self, output_dir, force=False):
+    # Resolve mask metadata paths
+
+    def generate_gt_masks(self, output_dir, force=False, resolution=None):
         """
         Generate or reuse binary 2D GT masks from Replica semantic images
 
         force regenerates the masks when enabled
         """
 
-        # The classes file marks whether it already exists, so we can skip the generation if it is present and force is not enabled
-        if (output_dir / "classes.json").exists() and not force:
+        metadata = {
+            "version": 1,
+            "sequence_name": self.sequence.name,
+            "frame_step": self.frame_step,
+            "vertex_label_min_fraction": self.vertex_label_min_fraction,
+            "visibility_slop": self.visibility_slop,
+            "resolution": resolution,
+        }
+
+    # Prepare mask output directories
+        metadata_path = output_dir / "mask_metadata.json"
+        previous = None
+        if metadata_path.exists():
+            previous = json.loads(metadata_path.read_text())
+        if (output_dir / "classes.json").exists() and previous == metadata and not force:
             return output_dir
         ensure_dir(output_dir / "semantic")
         ensure_dir(output_dir / "confidence")
 
-        # Convert Replica dataset semantic IDs into the stored detector-mask IDs expected by the mask pipeline
+    # Complete mask metadata
+
+        # Convert Replica semantic IDs into the stored detector IDs used by the mask pipeline
         info = self._load_info()
         dataset_ids_to_local_ids = self._dataset_ids_to_local_ids(info)
 
-        # Convert SceneData local IDs to stored detector-mask IDs
+        # Convert local IDs to stored detector IDs
         local_to_detector_stored = {index: item.detector_stored_id for index, item in enumerate(CLASSES)}
         dataset_semantic_to_detector_stored = {dataset_id: local_to_detector_stored[local_id] for dataset_id, local_id in dataset_ids_to_local_ids.items()}
         
@@ -423,15 +451,15 @@ class ReplicaScene:
             dataset = self._load_semantic_image(frame)
             mapped = np.zeros(dataset.shape, dtype=np.uint8)
 
-            # dataset_id is the Replica dataset ID. Stored_id is the detector mask ID written to the PNG (detector model ID + 1). The mapping is done so that the masks are compatible with the detector's expected IDs
+            # Map Replica IDs to stored detector IDs
             for dataset_id, stored_id in dataset_semantic_to_detector_stored.items():
-                mapped[dataset == dataset_id] = stored_id # Just replace the pixels in the semantic image that match the dataset_id with the corresponding stored_id, effectively creating a new image where each pixel's value corresponds to the detector's expected mask ID for that class
+                mapped[dataset == dataset_id] = stored_id
             name = f"rgb_{frame}"
             cv2.imwrite(str(output_dir / "semantic" / f"{name}.png"), mapped)
             cv2.imwrite(str(output_dir / "confidence" / f"{name}.png"),
                         (mapped > 0).astype(np.uint8) * 255)
             
-        # Store detector names keyed by stored detector-mask IDs so run.py can select the main classes present in the masks.
         classes = {str(item.detector_stored_id): item.name_by_detector for item in CLASSES}
         (output_dir / "classes.json").write_text(json.dumps(classes, indent=2))
+        atomic_write_text(metadata_path, json.dumps(metadata, indent=2) + "\n")
         return output_dir

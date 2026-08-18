@@ -11,7 +11,6 @@ from ..common import SceneData, TargetClassInfo
 
 
 CLASSES = [
-    # Fields are: main project name, detector name, and stored detector-mask ID. The stored ID is the detector model ID plus one, because 0 is reserved for the background class in the mask images.
     TargetClassInfo("bench", "bench", 14),
     TargetClassInfo("chair", "chair", 57),
     TargetClassInfo("table", "dining table", 61),
@@ -22,7 +21,6 @@ CLASSES = [
 ]
 
 DATASET_LABELS = {
-    # Map each main project name to all Scannet++ datasetcname spellings that represent it.
     "bench": {"bench", "experiment bench", "laboratory bench", "work bench",
                "window bench", "wood bench"},
     "chair": {
@@ -38,7 +36,7 @@ DATASET_LABELS = {
     "clock": {"clock", "wall clock", "table clock", "alarm clock"},
 }
 
-# Increment when the mesh-to-mask conversion or output contract changes
+# Increment when the mesh to mask conversion or output contract changes
 MASKS_CACHE_VERSION = 3
 
 
@@ -57,6 +55,8 @@ class ScannetScene:
         self.scene = scene
         self.scene_root = self.data_root / "validation_data" / scene
         self.scans = self.scene_root / "scans"
+
+    # Store the generated support directory
         self.support_dir = Path(support_dir)
 
     @property
@@ -107,7 +107,7 @@ class ScannetScene:
         dataset_names = [line.strip().lower() for line in self.metadata_path.read_text().splitlines()]
         dataset_ids_to_local_ids = self._dataset_ids_to_local_ids(dataset_names)
 
-        # Unknown Scannet++ dataset IDs remain -1
+        # Keep unknown dataset IDs invalid
         semantic = np.asarray([dataset_ids_to_local_ids.get(int(label), -1) for label in dataset_labels], dtype=np.int64)
 
         # The GT mask stage records the vertices observed by the rendered camera views
@@ -151,9 +151,11 @@ class ScannetScene:
             scene=self.scene,
             vertices=vertices,
             semantic_labels=semantic,
-            annotated=((dataset_labels >= 0) & (dataset_labels < len(dataset_names))), # A vertex is annotated when its dataset label points to a valid metadata entry, even if it is not an evaluated class
-            visible=visible, # Answers which vertices are visible in the selected rendered views
+            annotated=((dataset_labels >= 0) & (dataset_labels < len(dataset_names))),
+            visible=visible,
             classes=CLASSES,
+
+    # Add camera metadata
             num_images=len(camera_intrinsics),
             camera_intrinsics=camera_intrinsics,
         )
@@ -196,7 +198,8 @@ class ScannetScene:
         return output
 
     def generate_gt_masks(self, runtime, output_dir, bands=4, viz=0,
-                          force=False):
+                          force=False, resolution=None,
+                          mask_version=MASKS_CACHE_VERSION):
         """
         Generate or reuse rasterized Scannet++ GT masks and visibility support
 
@@ -214,7 +217,9 @@ class ScannetScene:
 
         if ((output_dir / "classes.json").exists() and (output_dir / "support.npz").exists() and
                 (output_dir / "camera_intrinsics.json").exists() and cache_info is not None and
-                cache_info.get("version") == MASKS_CACHE_VERSION and not force):
+                cache_info.get("version") == mask_version and
+                cache_info.get("bands") == bands and
+                cache_info.get("resolution") == resolution and not force):
             return output_dir
         
         # Rasterize the mesh inside the lifting container because nvdiffrast requires CUDA
@@ -226,6 +231,10 @@ class ScannetScene:
                 "--metadata", str(self.metadata_path),
                 "--output_dir", str(output_dir),
                 "--bands", str(bands),
+
+    # Add mask rendering options
+                "--mask_version", str(mask_version),
+                "--resolution", str(resolution),
                 "--viz", str(viz),
             ] + (["--force"] if force else []),
         )

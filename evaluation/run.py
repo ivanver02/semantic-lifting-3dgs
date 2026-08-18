@@ -15,10 +15,13 @@ from .common import safe_name, target_classes_by_detector
 from .runtime import Runtime
 
 from .replica.scene import ReplicaScene
-from .scannetpp.scene import ScannetScene
+from .scannetpp.scene import MASKS_CACHE_VERSION, ScannetScene
 
 
 DEFAULT_DATA_ROOT = Path("/mnt/hddb/dataTFGIvanVerdugo")
+REPLICA_VERTEX_LABEL_MIN_FRACTION = 0.6
+REPLICA_VISIBILITY_SLOP = 0.05
+SCANNETPP_MASK_BANDS = 4
 
 def _progress(message):
     """Print a progress message immediately, even when stdout is buffered."""
@@ -48,6 +51,14 @@ def _parser():
     # Configure dataset preparation and Gaussian training
     parser.add_argument("--sequence-name", default="Sequence_2")
     parser.add_argument("--frame-step", type=int, default=5)
+    parser.add_argument("--replica-vertex-label-min-fraction", type=float,
+                        default=REPLICA_VERTEX_LABEL_MIN_FRACTION)
+    parser.add_argument("--replica-visibility-slop", type=float,
+                        default=REPLICA_VISIBILITY_SLOP)
+    parser.add_argument("--scannetpp-mask-version", type=int,
+                        default=MASKS_CACHE_VERSION)
+    parser.add_argument("--scannetpp-mask-bands", type=int,
+                        default=SCANNETPP_MASK_BANDS)
     parser.add_argument("--iterations", type=int, default=30000)
     parser.add_argument("--resolution", type=int, default=None,
         help="training image scale: 1 is original, 2 is half width and height")
@@ -144,7 +155,8 @@ def _make_scene(args, data_root, support_dir):
     if args.dataset == "replica":
         return ReplicaScene(
             data_root, args.scene, args.sequence_name, args.frame_step, seed=3,
-            vertex_label_min_fraction=0.6, visibility_slop=0.05,
+            vertex_label_min_fraction=args.replica_vertex_label_min_fraction,
+            visibility_slop=args.replica_visibility_slop,
         )
     elif args.dataset == "scannetpp":
         return ScannetScene(data_root, args.scene, support_dir)
@@ -250,16 +262,22 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
                 "--data_root", str(scene.data_root),
                 "--scene", scene.scene,
                 "--sequence_name", scene.sequence.name,
+
+    # Add the source dataset arguments
                 "--frame_step", str(scene.frame_step),
                 "--vertex_label_min_fraction", str(scene.vertex_label_min_fraction),
                 "--visibility_slop", str(scene.visibility_slop),
+                "--resolution", str(args.resolution),
                 "--output_dir", str(output_dir),
             ] + (["--force"] if force else []),
         )
 
             # Scannet++ renders its masks from the mesh through the lifting container, they will be considered our "GT"
     elif args.dataset == "scannetpp":
-        scene.generate_gt_masks(runtime, output_dir, bands=4, force=force)
+        scene.generate_gt_masks(
+            runtime, output_dir, bands=args.scannetpp_mask_bands, force=force,
+            resolution=args.resolution, mask_version=args.scannetpp_mask_version,
+        )
 
 
 def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):

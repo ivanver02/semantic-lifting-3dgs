@@ -17,7 +17,9 @@ VOTE_CACHE_KEYS = [
 
 GT_MASK_CACHE_KEYS = [
     "evaluation_scope_version", "dataset", "scene", "data_root",
-    "sequence_name", "frame_step",
+    "sequence_name", "frame_step", "resolution",
+    "replica_vertex_label_min_fraction", "replica_visibility_slop",
+    "scannetpp_mask_version", "scannetpp_mask_bands",
 ]
 
 DATASET_METADATA_KEYS = [
@@ -81,13 +83,19 @@ def resolve_model_dir(args, data_root, output_root):
 def run_parameters(args, data_root):
     """ Prepare parameters for cache validation """
     return {
-        "evaluation_scope_version": 4,
+        "evaluation_scope_version": 5,
         "dataset": args.dataset,
         "scene": args.scene,
         "split": args.split,
         "data_root": str(data_root),
         "sequence_name": args.sequence_name,
+
+    # Add frame sampling settings
         "frame_step": args.frame_step,
+        "replica_vertex_label_min_fraction": args.replica_vertex_label_min_fraction,
+        "replica_visibility_slop": args.replica_visibility_slop,
+        "scannetpp_mask_version": args.scannetpp_mask_version,
+        "scannetpp_mask_bands": args.scannetpp_mask_bands,
         "iterations": args.iterations,
         "resolution": args.resolution,
         "train_data_device": args.train_data_device,
