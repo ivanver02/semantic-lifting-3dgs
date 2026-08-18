@@ -5,7 +5,7 @@ import os
 import shutil
 import tempfile
 
-from .common import atomic_write_text, ensure_dir
+from .common import atomic_write_text, ensure_dir, vote_id
 
 
 VOTE_CACHE_KEYS = [
@@ -83,7 +83,7 @@ def resolve_model_dir(args, data_root, output_root):
 def run_parameters(args, data_root):
     """ Prepare parameters for cache validation """
     return {
-        "evaluation_scope_version": 5,
+        "evaluation_scope_version": 6,
         "dataset": args.dataset,
         "scene": args.scene,
         "split": args.split,
@@ -115,6 +115,8 @@ def run_parameters(args, data_root):
         "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
         "opacity_weighting": not args.no_opacity_weighting,
         "raster_block_size": args.raster_block_size,
+
+    # Add the vote device setting
         "vote_data_device": args.vote_data_device,
     }
 
@@ -199,10 +201,13 @@ def prepare_run_metadata(output_root, parameters, force, sources, force_delete=F
     if "yolo" in sources:
         scopes.append(("meta_masks_yolo.json", YOLO_MASK_METADATA_KEYS, "YOLO masks"))
     for source in sources:
+
+    # Add the source vote scope
+        identifier = vote_id(parameters)
         scopes.append((
-            f"meta_votes_{source}.json",
+            f"meta_votes_{source}_{identifier}.json",
             VOTE_CACHE_KEYS,
-            f"{source} votes",
+            f"{source} votes ({identifier})",
         ))
 
     for filename, keys, artifact in scopes:
@@ -219,7 +224,14 @@ def prepare_run_metadata(output_root, parameters, force, sources, force_delete=F
         if force_delete:
             mask_dir = output_root / ("masks_gt2d" if source == "gt2d" else "masks_yolo")
             shutil.rmtree(mask_dir, ignore_errors=True)
-            shutil.rmtree(output_root / "segmentation" / source, ignore_errors=True)
+            source_segmentation = output_root / "segmentation" / source
+            identifier = vote_id(parameters)
+            for class_dir in source_segmentation.iterdir() if source_segmentation.exists() else ():
+                vote_dir = class_dir / identifier
+
+    # Remove cached source artifacts
+                if vote_dir.exists():
+                    shutil.rmtree(vote_dir, ignore_errors=True)
             for suffix in ["json", "md"]:
                 (output_root / "results" / f"results_{source}.{suffix}").unlink(
                     missing_ok=True,

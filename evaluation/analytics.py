@@ -1,15 +1,15 @@
-# CSV tables that are only appended and used for the analysis of the validation scenes
+# Append only CSV tables for validation analysis
 
 import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import safe_name
+from .common import safe_name, vote_class_dir
 from .reporting import gaussian_statistics
 
 
-# Each relation is stored in its own CSV so individual analyses can be extended without rewriting the records produced by the other stages
+# Keep each relation in its own CSV
 SCHEMA = {
     "runs": [
         "run_id", "created_at", "status", "dataset", "scene_id",
@@ -17,7 +17,7 @@ SCHEMA = {
     ],
 
     "run_parameters": [
-        "run_id", "evaluation_scope_version", "dataset", "scene", "split",
+        "run_id", "vote_id", "evaluation_scope_version", "dataset", "scene", "split",
         "data_root", "iterations", "resolution", "train_data_device",
         "vote_data_device", "sequence_name", "frame_step", "yolo_conf",
         "hysteresis_gamma", "hysteresis_radius",
@@ -54,7 +54,7 @@ SCHEMA = {
 
     "run_betas": ["run_id", "source", "beta_id", "beta_order", "beta"],
     "vote_statistics": [
-        "run_id", "source", "class_id", "num_cameras", "num_class_views",
+        "run_id", "source", "vote_id", "class_id", "num_cameras", "num_class_views",
         "num_gaussians", "target_weight_sum", "background_weight_sum",
         "supported_gaussians", "target_score_mean", "target_score_std",
         "target_score_min", "target_score_p05", "target_score_p25",
@@ -65,13 +65,13 @@ SCHEMA = {
     ],
 
     "gaussian_statistics": [
-        "run_id", "source", "class_id", "beta_id", "set_type", "gaussian_count",
+        "run_id", "source", "vote_id", "class_id", "beta_id", "set_type", "gaussian_count",
         "size_min", "size_mean", "size_std", "size_max", "opacity_min",
         "opacity_mean", "opacity_std", "opacity_max", "file_path",
     ],
 
     "class_beta_metrics": [
-        "run_id", "source", "class_id", "beta_id", "beta", "tp", "fp", "fn",
+        "run_id", "source", "vote_id", "class_id", "beta_id", "beta", "tp", "fp", "fn",
         "gt_count", "pred_count", "precision", "recall", "iou",
         "ground_truth_transfer_tp", "ground_truth_transfer_fp",
         "ground_truth_transfer_fn", "ground_truth_transfer_gt_count",
@@ -94,12 +94,12 @@ SCHEMA = {
 
 
 def utc_now():
-    """ Return a UTC timestamp for CSV records """
+    """ Return a timestamp for CSV records """
     return datetime.now(timezone.utc).isoformat()
 
 
 def _summary(values):
-    """Return compact descriptive statistics for a numeric camera field."""
+    """ Return summary statistics for a numeric camera field """
     values = [float(value) for value in values]
     if not values:
         return {"min": None, "mean": None, "max": None}
@@ -111,10 +111,10 @@ def _summary(values):
 
 
 class AnalyticsStore:
-    """ Write one CSV file for only appends per analytical relation """
+    """ Write append rows for analytical relations """
 
     def __init__(self, root):
-        """ Create the analytics directory and initialize every table header once """
+        """ Create the analytics directory and table headers """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
@@ -126,7 +126,7 @@ class AnalyticsStore:
                     csv.DictWriter(handle, fieldnames=fields).writeheader()
 
     def append(self, table, row):
-        """ Append one row while preserving the table schema and previous rows """
+        """Append one row using the table schema"""
         fields = SCHEMA[table]
 
         # Ignore extra keys and fill missing fields with empty CSV values
@@ -135,7 +135,7 @@ class AnalyticsStore:
             csv.DictWriter(handle, fieldnames=fields).writerow(values)
 
     def append_unique(self, table, row, key_fields):
-        """ Append a catalog row only when its key is not already present """
+        """Append a row when its key is new"""
         path = self.root / f"{table}.csv"
 
         # Compare string representations because CSV values are read as strings
@@ -148,7 +148,7 @@ class AnalyticsStore:
 
 
 def record_scene_analytics(store, args, scene, scene_id):
-    """Record the scene and its class level ground truth support once."""
+    """ Record the scene and its class level ground truth support once """
     evaluation_mask = scene.evaluation_mask
     store.append_unique("scenes", {
         "scene_id": scene_id,
@@ -181,8 +181,6 @@ def record_scene_analytics(store, args, scene, scene_id):
             f"{field}_max": summary["max"],
         })
     store.append_unique("camera_statistics", camera_row, ["scene_id"])
-    # ``class_id`` is the SceneData local main ID, not a detector mask ID or
-    # a source dataset ID.
     for class_id, spec in enumerate(scene.classes):
         class_mask = scene.semantic_labels == class_id
         store.append_unique("classes", {
@@ -202,8 +200,8 @@ def record_scene_analytics(store, args, scene, scene_id):
 
 
 def record_source_analytics(store, run_id, source, scene, classes, betas,
-                            source_dir, result, model_ply):
-    """Record votes, Gaussian summaries and metrics for one mask source."""
+                            source_dir, result, vote_identifier, model_ply):
+    """ Record votes, Gaussian summaries and metrics for one mask source """
     store.append("gaussian_statistics", {
         "run_id": run_id,
         "source": source,
@@ -220,16 +218,20 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
         })
 
     for spec in classes:
-        class_id = scene.class_id(spec.name) # SceneData local main ID.
+        class_id = scene.class_id(spec.name)
         analytics_class_id = f"{scene.dataset}:{class_id}"
         safe = safe_name(spec.name_by_detector)
         class_dir = source_dir / safe
-        vote_stats_path = class_dir / "vote_statistics.json"
+        vote_dir = vote_class_dir(source_dir, spec, vote_identifier)
+        vote_stats_path = vote_dir / "vote_statistics.json"
         if vote_stats_path.exists():
+
+    # Complete vote statistics fields
             vote_stats = json.loads(vote_stats_path.read_text())
             vote_stats.update({
                 "run_id": run_id,
                 "source": source,
+                "vote_id": vote_identifier,
                 "class_id": analytics_class_id,
             })
             store.append("vote_statistics", vote_stats)
@@ -239,6 +241,7 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
         store.append("gaussian_statistics", {
             "run_id": run_id,
             "source": source,
+            "vote_id": vote_identifier,
             "class_id": analytics_class_id,
             "set_type": "ground_truth_transfer",
             **ground_truth_transfer_stats,
@@ -255,6 +258,7 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
             store.append("gaussian_statistics", {
                 "run_id": run_id,
                 "source": source,
+                "vote_id": vote_identifier,
                 "class_id": analytics_class_id,
                 "beta_id": beta_id,
                 "set_type": "predicted",
@@ -267,6 +271,7 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
             store.append("class_beta_metrics", {
                 "run_id": run_id,
                 "source": source,
+                "vote_id": vote_identifier,
                 "class_id": analytics_class_id,
                 "beta_id": beta_id,
                 "beta": beta,

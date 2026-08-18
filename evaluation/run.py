@@ -11,7 +11,7 @@ import numpy as np
 
 from . import cache, ground_truth, metrics, reporting, transfer
 from .analytics import AnalyticsStore, record_scene_analytics, record_source_analytics, utc_now
-from .common import safe_name, target_classes_by_detector
+from .common import safe_name, target_classes_by_detector, vote_class_dir, vote_id
 from .runtime import Runtime
 
 from .replica.scene import ReplicaScene
@@ -319,7 +319,8 @@ def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
 
 
 def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
-               segmentation_dir, classes, save_statistics=False):
+               segmentation_dir, classes, save_statistics=False,
+               vote_identifier=None):
     """
     Accumulate 2D votes for every target class present in the masks.
 
@@ -329,9 +330,11 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
     for spec in classes:
         # Each selected main class, identified here by its detector name
         # name, receives its own vote directory and cache file.
+        vote_identifier = vote_identifier or vote_id(vars(args))
+        class_dir = vote_class_dir(segmentation_dir, spec, vote_identifier)
         safe = safe_name(spec.name_by_detector)
-        vote_path = segmentation_dir / safe / f"voting_data_{safe}.pt"
-        statistics_path = segmentation_dir / safe / "vote_statistics.json"
+        vote_path = class_dir / f"voting_data_{safe}.pt"
+        statistics_path = class_dir / "vote_statistics.json"
         if (vote_path.exists() and
                 not (args.force or args.force_votes) and
                 (not save_statistics or statistics_path.exists())):
@@ -343,6 +346,7 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
             "--model_path", str(model_dir),
             "--mask_dir", str(mask_dir),
             "--output_dir", str(segmentation_dir),
+            "--vote_id", vote_identifier,
             "--target_class", spec.name_by_detector,
             "--loaded_iter", str(args.iterations),
             "--raster_block_size", str(args.raster_block_size),
@@ -363,7 +367,8 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
         )
 
 
-def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes):
+def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
+                    vote_identifier=None):
     """
     Create labeled Gaussian files for every class and beta value
 
@@ -374,8 +379,11 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes):
     betas = list(args.betas)
     for spec in classes:
         # Thresholding can only start after vote accumulation produced its file.
+        vote_identifier = vote_identifier or vote_id(vars(args))
         safe = safe_name(spec.name_by_detector)
-        vote_path = segmentation_dir / safe / f"voting_data_{safe}.pt"
+        vote_path = vote_class_dir(segmentation_dir, spec, vote_identifier) / (
+            f"voting_data_{safe}.pt"
+        )
         if not vote_path.exists():
             continue
         for beta in betas:
@@ -598,6 +606,7 @@ def main():
     if args.train_data_device is None:
         args.train_data_device = "cpu" if args.dataset == "scannetpp" else "cuda"
     parameters = cache.run_parameters(args, data_root)
+    vote_identifier = vote_id(parameters)
 
     # Do not initialize scenes, containers or caches when the requested report exists.
     pending_sources = _pending_sources(output_root, args.mask_source, _force_any(args))
@@ -669,6 +678,7 @@ def main():
         })
         analytics_store.append("run_parameters", {
             "run_id": run_id,
+            "vote_id": vote_identifier,
             **parameters,
             "mask_source": args.mask_source,
         })
@@ -703,10 +713,13 @@ def main():
         _run_votes(
             args, runtime, dataset_dir, model_dir, mask_dir, source_dir, vote_classes,
             analytics_store is not None,
+            vote_identifier=vote_identifier,
         )
 
         # Threshold the votes and produce labeled Gaussian files
-        betas = _run_thresholds(args, runtime, model_dir, source_dir, vote_classes)
+        betas = _run_thresholds(
+            args, runtime, model_dir, source_dir, vote_classes, vote_identifier,
+        )
 
         # Evaluate every requested beta for the selected mask source.
         scene_results[source] = _evaluate_scene(
@@ -717,7 +730,7 @@ def main():
         if analytics_store is not None:
             record_source_analytics(
                 analytics_store, run_id, source, scene, evaluation_classes, betas,
-                source_dir, scene_results[source], model_ply,
+                source_dir, scene_results[source], vote_identifier, model_ply,
             )
 
     # Update the source summary without dropping results from another detector.

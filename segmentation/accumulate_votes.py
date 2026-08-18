@@ -409,7 +409,9 @@ def main(args):
 
     # Save the global votes and weights for later use in thresholding
     safe_class_name = args.target_class.replace(" ", "_")
-    class_output_dir = os.path.join(args.output_dir, safe_class_name)
+    class_output_dir = os.path.join(
+        args.output_dir, safe_class_name, args.vote_id,
+    )
     os.makedirs(class_output_dir, exist_ok=True)
     voting_data_path = os.path.join(class_output_dir, f"voting_data_{safe_class_name}.pt")
     
@@ -421,6 +423,8 @@ def main(args):
         'target_id': target_id,
         'background_mode': args.background_mode,
         'background_confidence': args.background_confidence,
+
+    # Add background policy metadata
         'background_view_policy': args.background_view_policy,
     }
 
@@ -433,6 +437,7 @@ def main(args):
 
         def stats(values):
             values = values.detach().float().cpu()
+            # Prepare quantile levels and values
             quantile_levels = torch.tensor(
                 [0.05, 0.25, 0.50, 0.75, 0.90, 0.925, 0.95, 0.975, 0.99, 0.999],
                 dtype=values.dtype,
@@ -441,7 +446,10 @@ def main(args):
                 torch.quantile(values, quantile_levels)
                 if values.numel()
                 else torch.empty(10)
+
+    # Complete the quantile tensor
             )
+            # Return summary statistics
             return {
                 'min': float(values.min().item()) if values.numel() else None,
                 'mean': float(values.mean().item()) if values.numel() else None,
@@ -450,6 +458,8 @@ def main(args):
                 'p25': float(quantiles[1].item()) if values.numel() else None,
                 'median': float(quantiles[2].item()) if values.numel() else None,
                 'p75': float(quantiles[3].item()) if values.numel() else None,
+
+    # Add upper quantile fields
                 'p90': float(quantiles[4].item()) if values.numel() else None,
                 'p92_5': float(quantiles[5].item()) if values.numel() else None,
                 'p95': float(quantiles[6].item()) if values.numel() else None,
@@ -459,6 +469,7 @@ def main(args):
                 'max': float(values.max().item()) if values.numel() else None,
             }
 
+        # Summarize supported target scores
         score_stats = stats(scores[supported])
         statistics = {
             'num_cameras': len(masked_cameras),
@@ -467,6 +478,8 @@ def main(args):
             'target_weight_sum': float(global_target_weights.sum().item()),
             'background_weight_sum': float(global_background_weights.sum().item()),
             'supported_gaussians': int(supported.sum().item()),
+
+    # Add score summary fields
             'target_score_min': score_stats['min'],
             'target_score_mean': score_stats['mean'],
             'target_score_std': score_stats['std'],
@@ -475,6 +488,8 @@ def main(args):
             'target_score_p25': score_stats['p25'],
             'target_score_median': score_stats['median'],
             'target_score_p75': score_stats['p75'],
+
+    # Add final score percentiles
             'target_score_p90': score_stats['p90'],
             'target_score_p92_5': score_stats['p92_5'],
             'target_score_p95': score_stats['p95'],
@@ -526,6 +541,7 @@ if __name__ == "__main__":
     parser.add_argument("--sh_degree", type=int, default=3) # Spherical Harmonics degree for the Gaussian model
     parser.add_argument("--loaded_iter", type=int, default=30000, help="Iteration number to load from the model")
     parser.add_argument("--target_class", type=str, default="truck", help="Only one object at a time can be segmented. The name must match one of the classes in the YOLO model.")
+    parser.add_argument("--vote_id", type=str, default="default", help="Identity of the vote configuration")
 
     # Paths
     parser.add_argument("--statistics_path", type=str, default=None)

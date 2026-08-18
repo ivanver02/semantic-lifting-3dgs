@@ -1,5 +1,7 @@
-# Shared data structures that simplify metrics evaluation from both datasets
+# Data structures for metrics evaluation
 
+import hashlib
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -14,7 +16,7 @@ class TargetClassInfo:
     """
 
     def __init__(self, name, name_by_detector, detector_stored_id):
-        """ Store the main name, detector name and stored detector mask ID """
+        """Store class names and the detector mask ID"""
         self.name = name
         self.name_by_detector = name_by_detector
         self.detector_stored_id = detector_stored_id
@@ -51,16 +53,14 @@ class SceneData: # Created when loading data in the scene files
         self.annotated = annotated
         self.visible = visible
         self.classes = classes
+
+    # Store image and camera metadata
         self.num_images = int(num_images)
         self.camera_intrinsics = list(camera_intrinsics or [])
 
-    @property # Property: the method can be called as an attribute
+    @property
     def class_ids(self):
-        """ 
-        Return the main class name mapped to the local SceneData ID
-
-        This local ID is the index in this scene's classes list. It is neither the detector mask ID nor the source dataset ID
-        """
+        """ Map each main class name to its local scene ID """
         return {item.name: local_id for local_id, item in enumerate(self.classes)}
 
     @property
@@ -77,18 +77,47 @@ class SceneData: # Created when loading data in the scene files
         return self.annotated & self.visible
 
     def class_id(self, name):
-        """ Return the SceneData local ID assigned to a main class name """
+        """ Return the local ID for a main class name """
         return self.class_ids[name]
 
 
 def safe_name(name):
-    """ Make a detector name safe for a file or directory name """
+    """ Make a detector name safe for a path """
     return name.replace(" ", "_")
 
 
+def float_token(value):
+    """ Format a float for a path """
+    return str(value).replace(".", "_")
+
+
+def main_digest(values, length=12):
+    """ Return a digest for a configuration mapping """
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
+
+
+def vote_scope(parameters):
+    """ Return settings for a vote artifact """
+    keys = (
+        "background_mode", "background_confidence", "background_view_policy",
+        "raster_block_size", "vote_data_device",
+    )
+    return {key: parameters[key] for key in keys}
+
+
+def vote_id(parameters):
+    """ Return the id of a vote configuration """
+    return "v" + main_digest(vote_scope(parameters))
+
+
+def vote_class_dir(segmentation_dir, spec, identifier):
+    return Path(segmentation_dir) / safe_name(spec.name_by_detector) / identifier
+
+
 def ensure_dir(path):
-    """ Ensure the existence of a directory and return its path """
-    path.mkdir(parents=True, exist_ok=True) # exist_ok allows cached stages to call this repeatedly.
+    """ Create a directory and return its path """
+    path.mkdir(parents=True, exist_ok=True)
     return path
 
 
@@ -113,7 +142,5 @@ def atomic_write_text(path, text):
 
 
 def target_classes_by_detector(classes):
-    """
-    Map each detector name to its complete TargetClassInfo record.
-    """
+    """ Map detector names to class records """
     return {item.name_by_detector: item for item in classes}
