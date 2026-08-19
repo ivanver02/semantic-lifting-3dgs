@@ -5,7 +5,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import safe_name, vote_class_dir
+from .common import safe_name, threshold_path, vote_class_dir
 from .reporting import gaussian_statistics
 
 
@@ -65,7 +65,7 @@ SCHEMA = {
     ],
 
     "gaussian_statistics": [
-        "run_id", "source", "vote_id", "class_id", "beta_id", "set_type", "gaussian_count",
+        "run_id", "source", "vote_id", "class_id", "beta_id", "beta", "set_type", "gaussian_count",
         "size_min", "size_mean", "size_std", "size_max", "opacity_min",
         "opacity_mean", "opacity_std", "opacity_max", "file_path",
     ],
@@ -200,7 +200,8 @@ def record_scene_analytics(store, args, scene, scene_id):
 
 
 def record_source_analytics(store, run_id, source, scene, classes, betas,
-                            source_dir, result, vote_identifier, model_ply):
+                            source_dir, result, vote_identifier,
+                            hysteresis_gamma, hysteresis_radius, model_ply):
     """ Record votes, Gaussian summaries and metrics for one mask source """
     store.append("gaussian_statistics", {
         "run_id": run_id,
@@ -249,18 +250,24 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
         item = result["per_class"].get(spec.name, {})
         for beta_order, beta in enumerate(betas, start=1):
             beta_id = f"{run_id}:{source}:{beta_order}"
+
+    # Add predicted Gaussian metadata
             beta_key = str(beta)
             sweep = item.get("sweep", {}).get(beta_key)
-            predicted_path = class_dir / (
-                f"labeled_gaussians_{safe}_beta{str(beta).replace('.', '_')}.ply"
+            predicted_path = threshold_path(
+                source_dir, spec, vote_identifier,
+                hysteresis_gamma, hysteresis_radius, beta,
             )
             stats = gaussian_statistics(predicted_path)
             store.append("gaussian_statistics", {
+
+    # Complete predicted Gaussian fields
                 "run_id": run_id,
                 "source": source,
                 "vote_id": vote_identifier,
                 "class_id": analytics_class_id,
                 "beta_id": beta_id,
+                "beta": beta,
                 "set_type": "predicted",
                 **stats,
             })

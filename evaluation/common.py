@@ -115,6 +115,19 @@ def vote_class_dir(segmentation_dir, spec, identifier):
     return Path(segmentation_dir) / safe_name(spec.name_by_detector) / identifier
 
 
+def threshold_dir(segmentation_dir, spec, identifier, gamma, radius):
+    return vote_class_dir(segmentation_dir, spec, identifier) / (
+        f"g{float_token(gamma)}_r{float_token(radius)}"
+    )
+
+
+def threshold_path(segmentation_dir, spec, identifier, gamma, radius, beta):
+    safe = safe_name(spec.name_by_detector)
+    return threshold_dir(segmentation_dir, spec, identifier, gamma, radius) / (
+        f"labeled_gaussians_{safe}_beta{float_token(beta)}.ply"
+    )
+
+
 def ensure_dir(path):
     """ Create a directory and return its path """
     path.mkdir(parents=True, exist_ok=True)

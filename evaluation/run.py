@@ -11,7 +11,7 @@ import numpy as np
 
 from . import cache, ground_truth, metrics, reporting, transfer
 from .analytics import AnalyticsStore, record_scene_analytics, record_source_analytics, utc_now
-from .common import safe_name, target_classes_by_detector, vote_class_dir, vote_id
+from .common import safe_name, target_classes_by_detector, threshold_path, vote_class_dir, vote_id
 from .runtime import Runtime
 
 from .replica.scene import ReplicaScene
@@ -377,8 +377,9 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     """
 
     betas = list(args.betas)
+    pending = []
     for spec in classes:
-        # Thresholding can only start after vote accumulation produced its file.
+        # Start thresholding after vote accumulation
         vote_identifier = vote_identifier or vote_id(vars(args))
         safe = safe_name(spec.name_by_detector)
         vote_path = vote_class_dir(segmentation_dir, spec, vote_identifier) / (
@@ -386,25 +387,43 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
         )
         if not vote_path.exists():
             continue
-        for beta in betas:
-            output = segmentation_dir / safe / (
-                f"labeled_gaussians_{safe}_beta{str(beta).replace('.', '_')}.ply"
-            )
-            if output.exists() and not (args.force or args.force_thresholds):
-                continue
+        if any(not threshold_path(
 
-            command = [
-                "--voting_data_path", str(vote_path),
-                "--model_path", str(model_dir),
-                "--output_dir", str(segmentation_dir),
-                "--cache_dir", str(segmentation_dir),
-                "--target_class", spec.name_by_detector,
-                "--beta", str(beta),
-                "--loaded_iter", str(args.iterations),
-                "--hysteresis_gamma", str(args.hysteresis_gamma),
-                "--hysteresis_radius", str(args.hysteresis_radius),
-            ]
-            runtime.run_lifting("segmentation/threshold_labels.py", command)
+    # Resolve the threshold path
+                segmentation_dir, spec, vote_identifier,
+                args.hysteresis_gamma, args.hysteresis_radius, beta,
+        ).exists() for beta in betas) or args.force or args.force_thresholds:
+            pending.append((spec, vote_path))
+    if not pending:
+        return betas
+    command = [
+        "--model_path", str(model_dir),
+
+    # Store the relative score
+        "--output_dir", str(segmentation_dir),
+        "--cache_dir", str(segmentation_dir),
+        "--beta", *[str(beta) for beta in betas],
+        "--loaded_iter", str(args.iterations),
+        "--hysteresis_gamma", str(args.hysteresis_gamma),
+        "--hysteresis_radius", str(args.hysteresis_radius),
+    ]
+    for spec, vote_path in pending:
+        command += [
+
+    # Finish the beta progress message
+            "--class_spec", json.dumps({
+                "target_class": spec.name_by_detector,
+                "voting_data_path": str(vote_path),
+                "class_output_dir": str(
+                    vote_class_dir(segmentation_dir, spec, vote_identifier)
+                ),
+            }, separators=(",", ":")),
+        ]
+
+    # Add result parameters
+    if args.force or args.force_thresholds:
+        command.append("--force")
+    runtime.run_lifting("segmentation/threshold_labels.py", command)
     return betas
 
 
@@ -731,7 +750,8 @@ def main():
         if analytics_store is not None:
             record_source_analytics(
                 analytics_store, run_id, source, scene, evaluation_classes, betas,
-                source_dir, scene_results[source], vote_identifier, model_ply,
+                source_dir, scene_results[source], vote_identifier,
+                args.hysteresis_gamma, args.hysteresis_radius, model_ply,
             )
 
     # Update the source summary without dropping results from another detector.
