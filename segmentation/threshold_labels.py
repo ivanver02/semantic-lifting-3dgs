@@ -1,9 +1,12 @@
 import torch
 import os
+import tempfile
 import sys
 from argparse import ArgumentParser
 import numpy as np
 from scipy.spatial import cKDTree
+from scipy.sparse import csr_matrix, save_npz, load_npz
+from scipy.sparse.csgraph import connected_components
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -23,37 +26,64 @@ def _load_gaussians(args):
     return gaussians
 
 
-def _connected_components(xyz, radius): # Implemented using union-find with path compression
-    """
-    Group together points that are close enough to each other, directly or through a chain of nearby points
-    
-    Returns one component ID per point
-    """
+def _graph_path(args):
 
-    # Initialize union-find structure
-    n = len(xyz)
-    parent = np.arange(n, dtype=np.int64) # Each point is initially its own parent (root of its own tree)
+    # Store derived graph data outside the read-only model mount
+    token = str(float(args.hysteresis_radius)).replace(".", "_")
+    ply_path = os.path.join(
+        args.model_path, "point_cloud", f"iteration_{args.loaded_iter}",
+        "point_cloud.ply",
+    )
 
-    # Union-find "find" function with path compression
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]] # Path compression: make the parent of a point point to its grandparent, flattening the tree
-            a = parent[a]
-        return a
+    # Read the model fingerprint
+    stat = os.stat(ply_path)
+    cache_dir = getattr(args, "cache_dir", None) or args.output_dir
+    return os.path.join(
+        cache_dir,
+        f"hysteresis_graph_i{args.loaded_iter}_n{stat.st_size}_m{stat.st_mtime_ns}"
+        f"_r{token}.npz",
+    )
 
-    # Use cKDTree to find all pairs of points whose distance is as most radius
-    pairs = cKDTree(xyz).query_pairs(radius, output_type="ndarray")
 
-    # Union the pairs of points that are close enough
-    for a, b in pairs:
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[ra] = rb
+def _hysteresis_graph(args, xyz):
+    """ Load or cache the radius graph shared by a batch """
 
-    # After all unions, find the root of each point to determine its component label
-    roots = np.array([find(i) for i in range(n)], dtype=np.int64)
-    _, labels = np.unique(roots, return_inverse=True)
-    return labels
+    # Reuse a valid graph cache
+    path = _graph_path(args)
+    if os.path.exists(path):
+        graph = load_npz(path).tocsr()
+        if graph.shape == (len(xyz), len(xyz)):
+            return graph
+
+    # Build the radius graph when no valid cache exists
+    pairs = cKDTree(xyz).query_pairs(
+        args.hysteresis_radius, output_type="ndarray",
+    )
+
+    # Convert nearby pairs into a sparse adjacency matrix
+    if len(pairs):
+        rows = np.concatenate((pairs[:, 0], pairs[:, 1]))
+        cols = np.concatenate((pairs[:, 1], pairs[:, 0]))
+        graph = csr_matrix((np.ones(len(rows), dtype=np.uint8), (rows, cols)),
+                           shape=(len(xyz), len(xyz)))
+    else:
+        graph = csr_matrix((len(xyz), len(xyz)), dtype=np.uint8)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, temporary_name = tempfile.mkstemp(
+
+    # Create the temporary graph archive
+        dir=os.path.dirname(path), suffix=".tmp.npz",
+    )
+    os.close(fd)
+    try:
+        save_npz(temporary_name, graph)
+        os.replace(temporary_name, path)
+    finally:
+        if os.path.exists(temporary_name):
+
+    # Remove an incomplete graph archive
+            os.unlink(temporary_name)
+    return graph
 
 
 def apply_threshold(args, gaussians=None, voting_data=None):
@@ -88,7 +118,7 @@ def apply_threshold(args, gaussians=None, voting_data=None):
     # Keep supported Gaussians whose target evidence ratio reaches beta
     final_mask = supported & (score >= args.beta)
 
-    # Optionally expand high confidence seeds through nearby lower score Gaussians using Canny-style hysteresis on the radius graph
+    # Optionally expand high confidence seeds through nearby lower score Gaussians using hysteresis on the radius graph
     gamma = getattr(args, 'hysteresis_gamma', 0.0)
     if gamma > 0:
 
@@ -107,19 +137,26 @@ def apply_threshold(args, gaussians=None, voting_data=None):
         low_threshold_mask = supported.detach().cpu() & (score_cpu >= args.beta * gamma)
         seed_count = int(seed.sum().item())
 
-        # Hysteresis requires both a non-empty bridge set and at least one seed
+        # Hysteresis requires both a nonempty bridge set and at least one seed
         if low_threshold_mask.sum().item() > 0 and seed_count > 0:
 
-            # Group bridge Gaussians into spatially connected components
-            component_labels = _connected_components(xyz[low_threshold_mask.numpy()], args.hysteresis_radius) # CC of the low-threshold Gaussians only
+            # Load or cache the radius graph shared by this model
+            hysteresis_graph = _hysteresis_graph(args, xyz)
 
-            # Keep only components containing at least one high-threshold seed
+            # Group bridge Gaussians into spatially connected components
+            low_indices = np.flatnonzero(low_threshold_mask.numpy())
+            component_labels = connected_components(
+                hysteresis_graph[low_indices][:, low_indices],
+                directed=False, return_labels=True,
+            )[1]
+
+            # Keep only components containing at least one high threshold seed
             seed_in_low_threshold_mask = seed[low_threshold_mask].numpy()
             keep_component = np.zeros(component_labels.max() + 1, dtype=bool)
 
-            # Mark components that contain at least one seed.
+            # Mark components that contain a seed
             np.logical_or.at(keep_component, component_labels, seed_in_low_threshold_mask)
-            kept = keep_component[component_labels] # Expand the component decisions to every low-threshold Gaussian
+            kept = keep_component[component_labels]
 
             # Reconstruct the full Gaussian mask from the retained components
             new_mask = torch.zeros_like(seed)
@@ -136,7 +173,7 @@ def apply_threshold(args, gaussians=None, voting_data=None):
             final_mask = new_mask.to(final_mask.device)
         else:
             # Keep the beta mask when hysteresis has no valid seed or bridge set
-            print("hysteresis phase: degenerate set; keeping seed mask")
+            print("hysteresis phase: degenerate set, keeping seed mask")
 
     # Count the Gaussians selected after thresholding and optional hysteresis
     count = final_mask.sum().item()
@@ -184,6 +221,7 @@ if __name__ == "__main__":
     # Input and output paths
     parser.add_argument("--voting_data_path", type=str, required=True, help="Path to .pt file containing voting weights")
     parser.add_argument("--output_dir", required=True, help="Directory to save labeled PLY")
+    parser.add_argument("--cache_dir", default=None, help="Directory for derived hysteresis graph cache")
 
     # Target selection
     parser.add_argument("--beta", type=float, default=0.5, help="Minimum target evidence ratio in [0, 1]")
