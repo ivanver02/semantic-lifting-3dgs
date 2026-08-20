@@ -87,7 +87,7 @@ SCHEMA = {
         "ground_truth_transfer_macro_recall",
         "ground_truth_transfer_global_precision",
         "ground_truth_transfer_global_recall", "relative_mIoU",
-        "evaluated_classes", "relative_classes",
+        "evaluated_classes", "relative_classes", "zero_reference_class_count",
     ],
 
 }

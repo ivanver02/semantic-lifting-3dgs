@@ -106,28 +106,25 @@ def _mean(values):
 
 
 def aggregate(per_class):
-    """ Aggregate semantic metrics using macro and global or micro averages """
+    """ Aggregate semantic metrics """
 
-    # Classes with neither GT nor predictions do not contribute to the averages
-    evaluated = [
-        (name, item) for name, item in per_class.items()
-        if item["iou"]["gt_count"] > 0 or item["iou"]["pred_count"] > 0
-    ]
+    # Average over the mask-level evaluation universe for every mask source.
+    evaluated = list(per_class.items())
 
-    # Compute relative IoU only where the GT-transfer reference is non-zero.
-    relative = [
-        item["iou"]["iou"] / item["ground_truth_transfer_iou"]["iou"]
+    # Compute relative scores against transferred reference metrics
+    relative = []
+    relative_classes = []
+    for name, item in evaluated:
+        reference_iou = item["ground_truth_transfer_iou"]["iou"]
+        if reference_iou > 0:
+            relative.append(item["iou"]["iou"] / reference_iou)
+            relative_classes.append(name)
+    zero_reference_class_count = sum(
+        item["ground_truth_transfer_iou"]["iou"] == 0
         for _, item in evaluated
-        if item["ground_truth_transfer_iou"]["iou"] > 0
-    ]
+    )
 
-    # Classes with a non-zero GT-transfer IoU contribute to relative metrics.
-    relative_classes = [
-        name for name, item in evaluated
-        if item["ground_truth_transfer_iou"]["iou"] > 0
-    ]
-
-    # Summing confusion counts gives the global or micro metrics across classes
+    # Pool error counts for global metrics
     tp = sum(item["iou"]["tp"] for _, item in evaluated)
     fp = sum(item["iou"]["fp"] for _, item in evaluated)
     fn = sum(item["iou"]["fn"] for _, item in evaluated)
@@ -136,18 +133,19 @@ def aggregate(per_class):
         item["ground_truth_transfer_iou"]["tp"] for _, item in evaluated
     )
     ground_truth_transfer_fp = sum(
+
+    # Compute global transfer metrics
         item["ground_truth_transfer_iou"]["fp"] for _, item in evaluated
     )
     ground_truth_transfer_fn = sum(
         item["ground_truth_transfer_iou"]["fn"] for _, item in evaluated
     )
 
-    # Macro metrics average class level values, while global metrics use the accumulated confusion counts and therefore weight classes by their pixels
+    # Return aggregate metrics and class inventories
     return {
         "mIoU": _mean([item["iou"]["iou"] for _, item in evaluated]),
         "ground_truth_transfer_mIoU": _mean([
             item["ground_truth_transfer_iou"]["iou"] for _, item in evaluated
-            if item["ground_truth_transfer_iou"]["iou"] > 0
         ]),
 
         "relative_mIoU": _mean(relative),
@@ -184,4 +182,5 @@ def aggregate(per_class):
         
         "evaluated_classes": [name for name, _ in evaluated],
         "relative_classes": relative_classes,
+        "zero_reference_class_count": int(zero_reference_class_count),
     }

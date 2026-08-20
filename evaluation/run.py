@@ -300,7 +300,7 @@ def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
 
 def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
                          segmentation_dir, scene, classes):
-    """Export the ground-truth-transfer Gaussians into each source class directory."""
+    """ Export the reference transferred Gaussians into each source class directory """
     class_specs = [
         f"{safe_name(spec.name_by_detector)}:{scene.class_id(spec.name)}"
         for spec in classes
@@ -317,19 +317,23 @@ def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
         ] + sum((["--class_spec", item] for item in class_specs), []),
     )
 
+    # Return the number of launches
+
 
 def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
                segmentation_dir, classes, save_statistics=False,
                vote_identifier=None):
     """
-    Accumulate 2D votes for every target class present in the masks.
+    Accumulate 2D votes for every target class present in the source masks.
 
-    classes is the list TargetClassInfo selected from the mask
-    metadata. Existing vote files are reused unless args.force is true.
+    classes contains only classes that the source can represent in its mask
+    metadata. Classes absent from the source are handled as empty predictions
+    by the evaluation stage. Existing vote files are hit unless args.force
+    is true.
     """
     for spec in classes:
         # Each selected main class, identified here by its detector name
-        # name, receives its own vote directory and cache file.
+        # name receives its own vote directory and cache file
         vote_identifier = vote_identifier or vote_id(vars(args))
         class_dir = vote_class_dir(segmentation_dir, spec, vote_identifier)
         safe = safe_name(spec.name_by_detector)
@@ -338,10 +342,12 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
         if (vote_path.exists() and
                 not (args.force or args.force_votes) and
                 (not save_statistics or statistics_path.exists())):
+
+    # Add threshold command arguments
             continue
 
         # Accumulate votes for this main class using masks whose pixels contain
-        # stored detector-mask IDs.
+                        # stored detector IDs
         command = [
             "--model_path", str(model_dir),
             "--mask_dir", str(mask_dir),
@@ -350,6 +356,8 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
             "--target_class", spec.name_by_detector,
             "--loaded_iter", str(args.iterations),
             "--raster_block_size", str(args.raster_block_size),
+
+    # Add each class specification
             "--source_path", str(dataset_dir),
             "--data_device", str(args.vote_data_device),
         ]
@@ -358,6 +366,8 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
                 "--statistics_path",
                 str(statistics_path),
             ]
+
+    # Append the threshold force flag
         runtime.run_lifting(
             "segmentation/accumulate_votes.py", command + [
                 "--background_mode", str(args.background_mode),
@@ -373,7 +383,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     Create labeled Gaussian files for every class and beta value
 
     The returned list contains the beta values used
-    Existing labeled files are reused unless args.force is true.
+    Existing labeled files are hit unless args.force is true.
     """
 
     betas = list(args.betas)
@@ -428,9 +438,12 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
 
 
 def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
-                     full_xyz, full_opacity,
-                     classes,
-                     segmentation_dir, betas, results_dir, source):
+                      full_xyz, full_opacity,
+                      classes,
+                       available_classes,
+                       ground_truth_transfer_by_class,
+                       vote_identifier,
+                      segmentation_dir, betas, results_dir, source):
     """
     Evaluate one mask source and write its JSON and markdown results
 
@@ -444,6 +457,9 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         f"Evaluation {source}: {len(classes)} classes, "
         f"{len(betas)} beta value(s)"
     )
+    available_names = {spec.name for spec in available_classes}
+
+    # Add per class results
     for class_index, spec in enumerate(classes, start=1):
         class_started = time.perf_counter()
         _progress(
@@ -451,23 +467,13 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             f"'{spec.name}' - calculating GT transfer"
         )
 
-        # Calculate the GT-transfer reference before evaluating predictions.
-        base = metrics.evaluate_class(
-            scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
-            full_opacity, spec, None,
-            args.tau, args.min_fraction, not args.no_opacity_weighting,
-            args.min_opacity, args.gaussian_to_mesh_background_competes,
-            args.gaussian_to_mesh_transfer,
-        )
-
-        ground_truth_transfer_metrics = base["ground_truth_transfer_iou"]
+        ground_truth_transfer_metrics = ground_truth_transfer_by_class[spec.name]
         _progress(
             f"{source}: class '{spec.name}' GT transfer ready "
             f"({time.perf_counter() - class_started:.1f}s)"
         )
 
         sweep = {}
-        safe = safe_name(spec.name_by_detector) # Safe detector name for file names.
         for beta_index, beta in enumerate(betas, start=1):
             beta_started = time.perf_counter()
             _progress(
@@ -477,17 +483,18 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
 
             # A missing labeled file represents an empty prediction for this
             # class and beta, so its Ground Truth instances still contribute
-            # false negatives to the metrics.
-            path = segmentation_dir / safe / (
-                f"labeled_gaussians_{safe}_beta{str(beta).replace('.', '_')}.ply"
+            # Ground truth instances still contribute false negatives
+            path = threshold_path(
+                segmentation_dir, spec, vote_identifier,
+                args.hysteresis_gamma, args.hysteresis_radius, beta,
             )
 
-            if not path.exists():
+            if spec.name not in available_names or not path.exists():
                 predicted_xyz = np.empty((0, 3), dtype=np.float64)
             else:
                 predicted_xyz, _ = transfer.load_gaussian_ply(path)
 
-            # Evaluate the predicted Gaussian mesh, including an empty one.
+            # Evaluate the predicted Gaussian mesh including empty predictions
             result = metrics.evaluate_class(
                 scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
                 full_opacity, spec,
@@ -519,13 +526,13 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             f"({time.perf_counter() - class_started:.1f}s)"
         )
 
-        # Store the complete beta sweep for this target class.
+        # Store the complete beta sweep for this class
         per_class[spec.name] = {
             "name_by_detector": spec.name_by_detector,
             "sweep": sweep,
         }
 
-    # Aggregate independently for every requested beta.
+    # Aggregate each requested beta independently
     metrics_by_beta = {
         beta: metrics.aggregate(beta_classes)
         for beta, beta_classes in per_class_by_beta.items()
@@ -706,6 +713,22 @@ def main():
 
     # Evaluate each mask source (yolo or 2dgt) independently.
     scene_results = {}
+    ground_truth_transfer_by_class = {}
+    for spec in evaluation_classes:
+        reference = metrics.evaluate_class(
+            scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
+            full_opacity, spec, None,
+            args.tau, args.min_fraction, not args.no_opacity_weighting,
+            args.min_opacity, args.gaussian_to_mesh_background_competes,
+
+    # Add reserved memory field name
+            args.gaussian_to_mesh_transfer,
+        )
+        ground_truth_transfer_by_class[spec.name] = reference[
+            "ground_truth_transfer_iou"
+        ]
+
+    # Process each requested mask source
     for source in _source_names(args.mask_source):
         # Select the mask directory
         mask_dir = masks_yolo if source == "yolo" else masks_gt
@@ -721,12 +744,13 @@ def main():
                 "segmentation_directory": str(source_dir),
             })
 
-        # Select the target classes present in the mask directory
+        # Only source classes absent from its mask metadata are excluded from vote generation
         vote_classes = _mask_classes(mask_dir, evaluation_classes)
 
-        # Export the clean GT-transfer Gaussians into the prediction directories.
+        # Export the clean reference transferred Gaussians into prediction directories
         _export_gt_gaussians(
-            args, runtime, model_dir, gt_dir, source_dir, scene, vote_classes,
+            args, runtime, model_dir, gt_dir, source_dir, scene,
+            evaluation_classes,
         )
 
         # Accumulate votes
@@ -744,7 +768,8 @@ def main():
         # Evaluate every requested beta for the selected mask source.
         scene_results[source] = _evaluate_scene(
             args, scene, gaussians_near_a_vertex, gaussian_labels,
-            full_xyz, full_opacity, evaluation_classes,
+            full_xyz, full_opacity, evaluation_classes, vote_classes,
+            ground_truth_transfer_by_class, vote_identifier,
             source_dir, betas, results_dir, source,
         )
         if analytics_store is not None:
