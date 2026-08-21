@@ -27,6 +27,33 @@ def _progress(message):
     """Print a progress message immediately, even when stdout is buffered."""
     print(f"[progress] {message}", flush=True)
 
+
+    # Use empty memory values without a runtime
+def _measure_stage(stage_records, name, function, cache_mode="miss", runtime=None):
+    """ Run one stage and retain elapsed time plus container CUDA peak memory """
+    if runtime is not None:
+        runtime.begin_stage()
+    started = time.perf_counter()
+    try:
+        return function()
+    finally:
+        memory = runtime.end_stage() if runtime is not None else {
+
+    # Add measured memory fields
+            "allocated": None,
+            "reserved": None,
+        }
+        stage_records.append({
+            "stage": name,
+            "cache_mode": cache_mode,
+            "container_count": None,
+            "elapsed_seconds": time.perf_counter() - started,
+
+    # Set the experiment help text
+            "peak_cuda_memory_bytes": memory["allocated"],
+            "peak_cuda_memory_reserved_bytes": memory["reserved"],
+        })
+
 def _parser():
     """ Build the parser for the evaluation workflow """
     parser = argparse.ArgumentParser(description=__doc__)
@@ -321,8 +348,8 @@ def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
 
 
 def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
-               segmentation_dir, classes, save_statistics=False,
-               vote_identifier=None):
+               segmentation_dir, classes,
+               save_statistics=False, vote_identifier=None):
     """
     Accumulate 2D votes for every target class present in the source masks.
 
@@ -331,6 +358,7 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
     by the evaluation stage. Existing vote files are hit unless args.force
     is true.
     """
+    launched = 0
     for spec in classes:
         # Each selected main class, identified here by its detector name
         # name receives its own vote directory and cache file
@@ -375,6 +403,10 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
                 "--background_view_policy", str(args.background_view_policy),
             ],
         )
+        launched += 1
+
+    # Iterate over evaluation classes
+    return launched
 
 
 def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
@@ -382,7 +414,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     """
     Create labeled Gaussian files for every class and beta value
 
-    The returned list contains the beta values used
+    The returned tuple contains the beta values used and container count
     Existing labeled files are hit unless args.force is true.
     """
 
@@ -405,7 +437,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
         ).exists() for beta in betas) or args.force or args.force_thresholds:
             pending.append((spec, vote_path))
     if not pending:
-        return betas
+        return betas, 0
     command = [
         "--model_path", str(model_dir),
 
@@ -434,7 +466,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     if args.force or args.force_thresholds:
         command.append("--force")
     runtime.run_lifting("segmentation/threshold_labels.py", command)
-    return betas
+    return betas, 1
 
 
 def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
@@ -647,6 +679,7 @@ def main():
         pending_sources[0] if len(pending_sources) == 1 else "both"
     )
     run_started = time.perf_counter()
+    stage_records = []
 
     # Initialize the Docker runtime with the provided arguments.
     runtime = Runtime(
@@ -662,30 +695,58 @@ def main():
         output_root, parameters, _force_any(args), pending_sources,
         force_delete=args.force,
     )
-    dataset_dir = _prepare_scene(args, scene_instance, runtime, dataset_dir)
+    dataset_dir = _measure_stage(
+
+    # Set the vote stage runtime
+        stage_records, "prepare_dataset",
+        lambda: _prepare_scene(args, scene_instance, runtime, dataset_dir),
+        runtime=runtime,
+    )
     model_dir = cache.resolve_model_dir(args, data_root, output_root)
 
     # Generate reference masks
-    _generate_gt_masks(args, scene_instance, runtime, masks_gt)
+    _measure_stage(
+        stage_records, "generate_gt_masks",
+        lambda: _generate_gt_masks(args, scene_instance, runtime, masks_gt),
+        runtime=runtime,
+    )
     if args.mask_source in {"yolo", "both"}:
-        _generate_yolo_masks(args, runtime, dataset_dir, masks_yolo)
+        _measure_stage(
+
+    # Set the threshold stage runtime
+            stage_records, "generate_yolo_masks",
+            lambda: _generate_yolo_masks(args, runtime, dataset_dir, masks_yolo),
+            runtime=runtime,
+        )
 
     # Load the common scene data and train only when there is no model.
     scene = scene_instance.load_data()
     evaluation_classes = _classes_with_gt2d_views(masks_gt, scene.classes)
     model_ply = model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply"
     if not model_ply.exists():
-        runtime.run_train(dataset_dir, model_dir, args.iterations,
-                          args.resolution, args.train_data_device)
+        _measure_stage(
+            stage_records, "train_gaussians",
+            lambda: runtime.run_train(
+                dataset_dir, model_dir, args.iterations,
+
+    # Set the evaluation stage runtime
+                args.resolution, args.train_data_device,
+            ),
+            runtime=runtime,
+        )
     if not model_ply.exists():
         raise FileNotFoundError(f"trained Gaussian model missing: {model_ply}")
 
     # Build or reuse the mesh and Gaussian neighborhoods and GT labels.
-    gaussians_near_a_vertex, gaussian_labels = ground_truth.build(
-        scene, model_ply, gt_dir, args.tau, args.min_fraction,
-        args.mesh_to_gaussian_background_competes,
-        args.mesh_to_gaussian_transfer, args.force or args.force_transfer,
-        evaluation_scope_version=parameters["evaluation_scope_version"],
+    gaussians_near_a_vertex, gaussian_labels = _measure_stage(
+        stage_records, "ground_truth_transfer",
+        lambda: ground_truth.build(
+            scene, model_ply, gt_dir, args.tau, args.min_fraction,
+            args.mesh_to_gaussian_background_competes,
+            args.mesh_to_gaussian_transfer, args.force or args.force_transfer,
+            evaluation_scope_version=parameters["evaluation_scope_version"],
+        ),
+        runtime=runtime,
     )
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
 
@@ -697,11 +758,18 @@ def main():
             "status": "running",
             "dataset": scene.dataset,
             "scene_id": scene_id,
+
+    # Collect peak memory values
             "scene_name": scene.scene,
             "split": args.split,
             "source": args.mask_source,
             "output_root": str(output_root),
             "model_root": str(model_dir),
+            "elapsed_seconds": None,
+            "peak_cuda_memory_bytes": None,
+            "peak_cuda_memory_reserved_bytes": None,
+
+    # Record completed run fields
         })
         analytics_store.append("run_parameters", {
             "run_id": run_id,
@@ -748,29 +816,56 @@ def main():
         vote_classes = _mask_classes(mask_dir, evaluation_classes)
 
         # Export the clean reference transferred Gaussians into prediction directories
-        _export_gt_gaussians(
-            args, runtime, model_dir, gt_dir, source_dir, scene,
-            evaluation_classes,
+        _measure_stage(
+            stage_records, f"{source}:export_gt_gaussians",
+            lambda: _export_gt_gaussians(
+                args, runtime, model_dir, gt_dir, source_dir, scene,
+                evaluation_classes,
+            ),
+    # Set the source stage runtime
+            runtime=runtime,
         )
 
         # Accumulate votes
-        _run_votes(
-            args, runtime, dataset_dir, model_dir, mask_dir, source_dir, vote_classes,
-            analytics_store is not None,
-            vote_identifier=vote_identifier,
+        vote_launches = _measure_stage(
+            stage_records, f"{source}:votes",
+            lambda: _run_votes(
+                args, runtime, dataset_dir, model_dir, mask_dir, source_dir,
+                vote_classes,
+                analytics_store is not None,
+                vote_identifier,
+            ),
+
+    # Set the vote stage runtime
+            runtime=runtime,
         )
+        stage_records[-1]["container_count"] = vote_launches
 
         # Threshold the votes and produce labeled Gaussian files
-        betas = _run_thresholds(
-            args, runtime, model_dir, source_dir, vote_classes, vote_identifier,
+        betas, threshold_containers = _measure_stage(
+            stage_records, f"{source}:threshold_hysteresis",
+            lambda: _run_thresholds(
+                args, runtime, model_dir, source_dir, vote_classes,
+                vote_identifier,
+            ),
+            runtime=runtime,
+
+    # Set the threshold stage runtime
         )
+        stage_records[-1]["container_count"] = threshold_containers
 
         # Evaluate every requested beta for the selected mask source.
-        scene_results[source] = _evaluate_scene(
-            args, scene, gaussians_near_a_vertex, gaussian_labels,
-            full_xyz, full_opacity, evaluation_classes, vote_classes,
-            ground_truth_transfer_by_class, vote_identifier,
-            source_dir, betas, results_dir, source,
+        scene_results[source] = _measure_stage(
+            stage_records, f"{source}:evaluation_transfer",
+            lambda: _evaluate_scene(
+                args, scene, gaussians_near_a_vertex, gaussian_labels,
+                full_xyz, full_opacity, evaluation_classes, vote_classes,
+                ground_truth_transfer_by_class, vote_identifier,
+                source_dir, betas, results_dir, source,
+            ),
+
+    # Set the evaluation stage runtime
+            runtime=runtime,
         )
         if analytics_store is not None:
             record_source_analytics(
@@ -786,11 +881,28 @@ def main():
         previous_results = json.loads(summary_path.read_text())
     previous_results.update(scene_results)
     summary_path.write_text(json.dumps(previous_results, indent=2, default=str))
+
+    # Collect peak memory values
     if analytics_store is not None:
+        elapsed_seconds = time.perf_counter() - run_started
+        peak_memory_values = [
+            record["peak_cuda_memory_bytes"]
+            for record in stage_records
+            if record["peak_cuda_memory_bytes"] is not None
+        ]
+        peak_reserved_memory_values = [
+
+    # Record completed run fields
+            record["peak_cuda_memory_reserved_bytes"]
+            for record in stage_records
+            if record["peak_cuda_memory_reserved_bytes"] is not None
+        ]
         analytics_store.append("runs", {
             "run_id": run_id,
             "created_at": utc_now(),
             "status": "completed",
+
+    # Record completed run fields
             "dataset": scene.dataset,
             "scene_id": f"{scene.dataset}:{scene.scene}",
             "scene_name": scene.scene,
@@ -798,7 +910,32 @@ def main():
             "source": args.mask_source,
             "output_root": str(output_root),
             "model_root": str(model_dir),
+            "elapsed_seconds": elapsed_seconds,
+
+    # Record completed run fields
+            "peak_cuda_memory_bytes": max(peak_memory_values, default=None),
+            "peak_cuda_memory_reserved_bytes": max(
+                peak_reserved_memory_values, default=None,
+            ),
         })
+        for record in stage_records:
+            analytics_store.append("run_stages", {
+                "run_id": run_id,
+
+    # Record stage identity fields
+                "dataset": scene.dataset,
+                "scene_id": f"{scene.dataset}:{scene.scene}",
+                "stage": record["stage"],
+                "cache_mode": record["cache_mode"],
+                "container_count": record["container_count"],
+                "elapsed_seconds": record["elapsed_seconds"],
+                "peak_cuda_memory_bytes": record["peak_cuda_memory_bytes"],
+                "peak_cuda_memory_reserved_bytes": record[
+
+    # Add reserved memory field name
+                    "peak_cuda_memory_reserved_bytes"
+                ],
+            })
     _progress(f"Run finished in {time.perf_counter() - run_started:.1f}s")
     print(json.dumps({name: value["metrics_by_beta"]
                       for name, value in scene_results.items()}, indent=2))

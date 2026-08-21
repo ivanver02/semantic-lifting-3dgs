@@ -14,6 +14,8 @@ SCHEMA = {
     "runs": [
         "run_id", "created_at", "status", "dataset", "scene_id",
         "scene_name", "split", "source", "output_root", "model_root",
+        "elapsed_seconds", "peak_cuda_memory_bytes",
+        "peak_cuda_memory_reserved_bytes",
     ],
 
     "run_parameters": [
@@ -46,6 +48,13 @@ SCHEMA = {
     "classes": ["class_id", "dataset", "class_name", "detector_name", "detector_stored_id"],
 
     "run_sources": ["run_id", "source", "mask_directory", "segmentation_directory"],
+
+    "run_stages": [
+        "run_id", "dataset", "scene_id", "stage", "cache_mode",
+        "container_count",
+        "elapsed_seconds", "peak_cuda_memory_bytes",
+        "peak_cuda_memory_reserved_bytes",
+    ],
 
     "scene_classes": [
         "scene_id", "class_id", "gt_vertex_count", "gt_visible_vertex_count",
