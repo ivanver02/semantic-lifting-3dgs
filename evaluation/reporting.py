@@ -1,4 +1,4 @@
-# JSON and Markdown reports for evaluation results
+# JSON reports for evaluation results
 
 import json
 from pathlib import Path
@@ -7,11 +7,6 @@ import numpy as np
 from plyfile import PlyData
 
 from .common import atomic_write_text, ensure_dir
-
-
-def format_metric(value):
-    """ Format a metric value for the Markdown report """
-    return "-" if value is None else f"{value:.4f}"
 
 
 def _stat(values, name):
@@ -23,6 +18,8 @@ def _stat(values, name):
         "min": float(values.min()),
         "mean": float(values.mean()),
         "std": float(values.std()),
+
+    # Add the maximum statistic
         "max": float(values.max()),
     }[name]
 
@@ -36,14 +33,18 @@ def gaussian_statistics(path):
     names = set(vertex.data.dtype.names or ())
     scales = [
         np.asarray(vertex[name], dtype=np.float64)
+
+    # Collect the available scale fields
         for name in ("scale_0", "scale_1", "scale_2")
         if name in names
     ]
     size = np.linalg.norm(np.column_stack(scales), axis=1) if len(scales) == 3 else None
     opacity = np.asarray(vertex["opacity"], dtype=np.float64) if "opacity" in names else None
     return {
-        "gaussian_count": int(len(vertex)),
+        "gaussian_count": len(vertex),
         "size_min": _stat(size, "min"),
+
+    # Add size and opacity statistics
         "size_mean": _stat(size, "mean"),
         "size_std": _stat(size, "std"),
         "size_max": _stat(size, "max"),
@@ -52,61 +53,25 @@ def gaussian_statistics(path):
         "opacity_std": _stat(opacity, "std"),
         "opacity_max": _stat(opacity, "max"),
         "file_path": str(path),
+
+    # Finish the result payload
     }
 
 
 def write_result(results_dir, result):
-    """ Write one source result as JSON and a compact Markdown report """
+    """ Write one source result as JSON """
     ensure_dir(results_dir)
     tag = result["mask_source"] # Either "yolo" or "gt2d"
     json_path = results_dir / f"results_{tag}.json"
+    if json_path.exists():
+        previous = json.loads(json_path.read_text())
+        previous_betas = previous.get("parameters", {}).get("betas")
+        current_betas = result.get("parameters", {}).get("betas")
+
+    # Validate the beta sweep
+        if previous_betas != current_betas:
+            raise RuntimeError(
+                f"{json_path} was computed with betas {previous_betas!r}, "
+                f"but this run uses {current_betas!r}, use a distinct variant"
+            )
     atomic_write_text(json_path, json.dumps(result, indent=2, default=str) + "\n")
-
-    lines = [
-        f"# {result['dataset']} {result['scene']} ({tag})",
-        "",
-        "## Metrics by beta",
-    ]
-
-    for beta, beta_metrics in result["metrics_by_beta"].items():
-        lines += [
-            "",
-            f"### Beta {beta}",
-            f"mIoU: {format_metric(beta_metrics['mIoU'])}",
-            f"GT transfer mIoU: {format_metric(beta_metrics['ground_truth_transfer_mIoU'])}",
-            f"relative mIoU: {format_metric(beta_metrics['relative_mIoU'])}",
-            f"global IoU: {format_metric(beta_metrics['global_iou'])}",
-            f"macro precision: {format_metric(beta_metrics['macro_precision'])}",
-            f"macro recall: {format_metric(beta_metrics['macro_recall'])}",
-            f"global precision: {format_metric(beta_metrics['global_precision'])}",
-            f"global recall: {format_metric(beta_metrics['global_recall'])}",
-            f"ground-truth transfer macro precision: "
-            f"{format_metric(beta_metrics['ground_truth_transfer_macro_precision'])}",
-            f"ground-truth transfer macro recall: "
-            f"{format_metric(beta_metrics['ground_truth_transfer_macro_recall'])}",
-            f"ground-truth transfer global precision: "
-            f"{format_metric(beta_metrics['ground_truth_transfer_global_precision'])}",
-            f"ground-truth transfer global recall: "
-            f"{format_metric(beta_metrics['ground_truth_transfer_global_recall'])}",
-        ]
-
-    lines += ["", "## Per class and beta"]
-
-    # Add one row for every evaluated class and beta in the complete sweep
-    for name, item in result["per_class"].items():
-        for beta, sweep_item in item["sweep"].items():
-            prediction = sweep_item["iou"]
-            ground_truth_transfer = sweep_item["ground_truth_transfer_iou"]
-            lines += [
-                "",
-                f"### {name}, beta {beta}",
-                f"IoU: {format_metric(prediction['iou'])}",
-                f"Precision: {format_metric(prediction['precision'])}",
-                f"Recall: {format_metric(prediction['recall'])}",
-                f"GT transfer IoU: {format_metric(ground_truth_transfer['iou'])}",
-                f"GT transfer precision: {format_metric(ground_truth_transfer['precision'])}",
-                f"GT transfer recall: {format_metric(ground_truth_transfer['recall'])}",
-            ]
-
-    # Write the Markdown report to a file named after the mask source
-    (results_dir / f"results_{tag}.md").write_text("\n".join(lines) + "\n")

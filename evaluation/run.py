@@ -11,7 +11,8 @@ import numpy as np
 
 from . import cache, ground_truth, metrics, reporting, transfer
 from .analytics import AnalyticsStore, record_scene_analytics, record_source_analytics, utc_now
-from .common import safe_name, target_classes_by_detector, threshold_path, vote_class_dir, vote_id
+from .common import main_digest, safe_name, target_classes_by_detector, threshold_path, vote_class_dir, vote_id
+from .common import atomic_write_text
 from .runtime import Runtime
 
 from .replica.scene import ReplicaScene
@@ -22,6 +23,75 @@ DEFAULT_DATA_ROOT = Path("/mnt/hddb/dataTFGIvanVerdugo")
 REPLICA_VERTEX_LABEL_MIN_FRACTION = 0.6
 REPLICA_VISIBILITY_SLOP = 0.05
 SCANNETPP_MASK_BANDS = 4
+VARIANT_DEFAULTS = {
+    "hysteresis_gamma": 0.8,
+    "hysteresis_radius": 0.05,
+    "tau": 0.05,
+    "min_fraction": 0.5,
+    "gaussian_to_mesh_background_competes": True,
+    "mesh_to_gaussian_background_competes": True,
+    "mesh_to_gaussian_transfer": "radius_vote",
+    "gaussian_to_mesh_transfer": "radius_vote",
+    "opacity_weighting": True,
+    "min_opacity": 0.1,
+    "background_mode": "confidence_weighted",
+    "background_confidence": 0.25,
+    "background_view_policy": "target_views",
+}
+
+
+def _variant_parameters(args):
+    """ Return the configuration fields whose results belong to one variant """
+    return {
+        "hysteresis_gamma": args.hysteresis_gamma,
+        "hysteresis_radius": args.hysteresis_radius,
+        "tau": args.tau,
+        "min_fraction": args.min_fraction,
+        "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
+        "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
+
+    # Add transfer and weighting settings
+        "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
+        "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
+        "opacity_weighting": not args.no_opacity_weighting,
+        "min_opacity": args.min_opacity,
+        "background_mode": args.background_mode,
+        "background_confidence": args.background_confidence,
+        "background_view_policy": args.background_view_policy,
+    }
+
+
+def _resolve_variant(args, output_root):
+    """ Validate a readable variant label against its persisted configuration """
+    expected = "v" + main_digest(_variant_parameters(args))
+    if args.variant is None:
+        return expected
+    if args.variant == expected:
+        return args.variant
+    config = _variant_parameters(args)
+    path = output_root / "variant_config.json"
+
+    # Validate the saved variant settings
+    record = {"variants": {}}
+    if path.exists():
+        try:
+            record = json.loads(path.read_text(encoding="utf-8"))
+            record.setdefault("variants", {})
+        except (OSError, ValueError) as error:
+            raise RuntimeError(f"invalid variant configuration: {path}") from error
+    previous = record["variants"].get(args.variant)
+
+    # Return the selected variant
+    if previous is not None and previous != config:
+        raise ValueError(
+            f"--variant {args.variant!r} does not match the received flags, "
+            f"expected {expected!r}"
+        )
+    if previous is None:
+        record["variants"][args.variant] = config
+        atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
+    return args.variant
+
 
 def _progress(message):
     """Print a progress message immediately, even when stdout is buffered."""
@@ -66,6 +136,8 @@ def _parser():
     parser.add_argument("--data-root", type=Path, default=None, help="dataset path root, something like .../scannetpp")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-root", type=Path, default=None)
+    parser.add_argument("--variant", default=None,
+                        help="Result variant identity, defaults to a configuration digest")
     parser.add_argument("--model-root", type=Path, default=None, help="Gaussian model directory to reuse, if exists")
 
     # Select the source of the 2D masks and the container images that produce them
@@ -84,6 +156,8 @@ def _parser():
                         default=REPLICA_VISIBILITY_SLOP)
     parser.add_argument("--scannetpp-mask-version", type=int,
                         default=MASKS_CACHE_VERSION)
+
+    # Set the background mode default
     parser.add_argument("--scannetpp-mask-bands", type=int,
                         default=SCANNETPP_MASK_BANDS)
     parser.add_argument("--iterations", type=int, default=30000)
@@ -94,43 +168,57 @@ def _parser():
 
     # Configure mask generation, vote accumulation and threshold selection
     parser.add_argument("--yolo-conf", type=float, default=0.75)
-    parser.add_argument("--hysteresis-gamma", type=float, default=0.8)
-    parser.add_argument("--hysteresis-radius", type=float, default=0.05)
+    parser.add_argument("--hysteresis-gamma", type=float,
+                        default=VARIANT_DEFAULTS["hysteresis_gamma"])
+    parser.add_argument("--hysteresis-radius", type=float,
+                        default=VARIANT_DEFAULTS["hysteresis_radius"])
     parser.add_argument(
         "--background-mode",
         choices=["all_non_target", "explicit_background", "confidence_weighted"],
-        default="confidence_weighted",
+
+    # Set the background view policy default
+        default=VARIANT_DEFAULTS["background_mode"],
         help="How 2D non-target evidence is constructed",
     )
-    parser.add_argument("--background-confidence", type=float, default=0.25,
+    parser.add_argument("--background-confidence", type=float,
+        default=VARIANT_DEFAULTS["background_confidence"],
         help="Confidence assigned to pixels with semantic label zero")
     parser.add_argument(
         "--background-view-policy", choices=["target_views", "all_views"],
-        default="target_views",
+
+    # Set the Gaussian transfer option
+        default=VARIANT_DEFAULTS["background_view_policy"],
         help="Use only views containing target pixels or every matched view",
     )
     parser.add_argument("--betas", nargs="+", type=float, required=True,
         help="Beta values to evaluate for every target class")
 
-    # Configure transfer methods, background competition and predicted-label weighting
-    parser.add_argument("--tau", type=float, default=0.05)
-    parser.add_argument("--min-fraction", type=float, default=0.5)
+    # Configure transfer methods, background competition and prediction weighting
+    parser.add_argument("--tau", type=float, default=VARIANT_DEFAULTS["tau"])
+    parser.add_argument("--min-fraction", type=float, default=VARIANT_DEFAULTS["min_fraction"])
     parser.add_argument(
         "--mesh-to-gaussian-transfer",
         choices=["radius_vote", "nearest_neighbor_label"],
-        default="radius_vote",
+        default=VARIANT_DEFAULTS["mesh_to_gaussian_transfer"],
     )
     parser.add_argument(
+
+    # Finish the background competition option
         "--gaussian-to-mesh-transfer",
         choices=["radius_vote", "nearest_neighbor_label"],
-        default="radius_vote",
+        default=VARIANT_DEFAULTS["gaussian_to_mesh_transfer"],
     )
-    parser.add_argument("--min-opacity", type=float, default=0.1)
+    # Configure opacity and background competition
+    parser.add_argument("--min-opacity", type=float,
+                        default=VARIANT_DEFAULTS["min_opacity"])
     parser.add_argument(
         "--gaussian-to-mesh-background-competes",
         dest="gaussian_to_mesh_background_competes",
-        action="store_true", default=True,
+        action="store_true",
+        default=VARIANT_DEFAULTS["gaussian_to_mesh_background_competes"],
         help="Include background votes in predicted mesh labels",
+
+    # Set the mesh transfer option
     )
     parser.add_argument(
         "--no-gaussian-to-mesh-background-competes",
@@ -139,16 +227,15 @@ def _parser():
         help="Disable background competition in predicted mesh labels",
     )
     parser.add_argument(
+
+    # Set the transfer cache help text
         "--mesh-to-gaussian-background-competes",
         dest="mesh_to_gaussian_background_competes", action="store_true",
-        default=True,
+        default=VARIANT_DEFAULTS["mesh_to_gaussian_background_competes"],
         help="Use background votes when assigning GT labels to Gaussians",
     )
-    parser.add_argument(
-        "--no-mesh-to-gaussian-background-competes",
-        dest="mesh_to_gaussian_background_competes", action="store_false",
-        help="Do not use background votes when assigning GT labels to Gaussians",
-    )
+    parser.add_argument("--no-mesh-to-gaussian-background-competes", dest="mesh_to_gaussian_background_competes", action="store_false",
+        help="Do not use background votes when assigning GT labels to Gaussians")
     parser.add_argument("--no-opacity-weighting", action="store_true")
     parser.add_argument("--raster-block-size", type=int, default=16)
 
@@ -194,6 +281,26 @@ def _source_names(mask_source):
     if mask_source == "both":
         return ["yolo", "gt2d"]
     return [mask_source]
+
+
+def _validate_existing_beta_grids(results_dir, sources, betas, force):
+    """ Reject an overwrite with a different beta sweep """
+    if force:
+        return
+    for source in sources:
+        path = results_dir / f"results_{source}.json"
+        if not path.exists():
+            continue
+        previous = json.loads(path.read_text())
+
+    # Complete the YOLO command
+        previous_betas = previous.get("parameters", {}).get("betas")
+        if previous_betas != list(betas):
+            raise RuntimeError(
+                f"{path} already contains results for betas {previous_betas!r}, "
+                f"while this invocation uses {list(betas)!r}. The caller must "
+                "read the existing results or pass --force to discard them."
+            )
 
 
 def _pending_sources(output_root, mask_source, force):
@@ -268,7 +375,7 @@ def _prepare_scene(args, scene, runtime, dataset_dir):
     if args.dataset == "replica":
         return scene.prepare_dataset(dataset_dir)
 
-            # Scannet++ prepares its COLMAP model through the Docker container.
+        # Scannet++ prepares its COLMAP model in the container
     elif args.dataset == "scannetpp":
         return scene.prepare_dataset(runtime)
 
@@ -313,7 +420,7 @@ def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
     if (output_dir / "classes.json").exists() and not (args.force or args.force_masks):
         return
 
-    # Run the detector inside the lifting container.
+    # Run the detector in the lifting container
     runtime.run_lifting(
             "segmentation/generate_mask.py",
         [
@@ -475,6 +582,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                        available_classes,
                        ground_truth_transfer_by_class,
                        vote_identifier,
+                       variant,
                       segmentation_dir, betas, results_dir, source):
     """
     Evaluate one mask source and write its JSON and markdown results
@@ -535,6 +643,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                 args.gaussian_to_mesh_background_competes,
                 args.gaussian_to_mesh_transfer, ground_truth_transfer_metrics,
             )
+
+    # Validate the minimum fraction
             score = result["iou"]["iou"]
             sweep[str(beta)] = {
                 "beta": beta,
@@ -575,6 +685,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         "dataset": scene.dataset,
         "scene": scene.scene,
         "mask_source": source,
+        "variant": variant,
         "support": {
             "vertices_evaluated": int(scene.evaluation_mask.sum()),
         },
@@ -664,14 +775,20 @@ def main():
         args.resolution = 2 if args.dataset == "scannetpp" else 1
     if args.train_data_device is None:
         args.train_data_device = "cpu" if args.dataset == "scannetpp" else "cuda"
+    variant = _resolve_variant(args, output_root)
+    results_dir = results_dir / variant
     parameters = cache.run_parameters(args, data_root)
     vote_identifier = vote_id(parameters)
+    _validate_existing_beta_grids(
+        results_dir, _source_names(args.mask_source), args.betas, _force_any(args),
+    )
 
     # Do not initialize scenes, containers or caches when the requested report exists.
     pending_sources = _pending_sources(output_root, args.mask_source, _force_any(args))
     if not pending_sources:
         cache.prepare_run_metadata(
             output_root, parameters, False, _source_names(args.mask_source),
+            variant,
         )
         print("[skip] All requested detector results already exist")
         return
@@ -692,7 +809,7 @@ def main():
 
     # Prepare metadata and reuse caches within this output root
     cache.prepare_run_metadata(
-        output_root, parameters, _force_any(args), pending_sources,
+        output_root, parameters, _force_any(args), pending_sources, variant,
         force_delete=args.force,
     )
     dataset_dir = _measure_stage(
@@ -749,6 +866,10 @@ def main():
         runtime=runtime,
     )
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
+    full_model_stats = (
+        reporting.gaussian_statistics(model_ply)
+        if analytics_store is not None else None
+    )
 
     if analytics_store is not None:
         scene_id = f"{scene.dataset}:{scene.scene}"
@@ -773,6 +894,7 @@ def main():
         })
         analytics_store.append("run_parameters", {
             "run_id": run_id,
+            "variant": variant,
             "vote_id": vote_identifier,
             **parameters,
             "mask_source": args.mask_source,
@@ -860,7 +982,7 @@ def main():
             lambda: _evaluate_scene(
                 args, scene, gaussians_near_a_vertex, gaussian_labels,
                 full_xyz, full_opacity, evaluation_classes, vote_classes,
-                ground_truth_transfer_by_class, vote_identifier,
+                ground_truth_transfer_by_class, vote_identifier, variant,
                 source_dir, betas, results_dir, source,
             ),
 
@@ -869,18 +991,22 @@ def main():
         )
         if analytics_store is not None:
             record_source_analytics(
-                analytics_store, run_id, source, scene, evaluation_classes, betas,
-                source_dir, scene_results[source], vote_identifier,
-                args.hysteresis_gamma, args.hysteresis_radius, model_ply,
+                analytics_store, run_id, source, scene,
+                f"{scene.dataset}:{scene.scene}", evaluation_classes, betas,
+                source_dir, scene_results[source],
+                vote_identifier, args.hysteresis_gamma, args.hysteresis_radius,
+                full_model_stats,
             )
 
-    # Update the source summary without dropping results from another detector.
+    # Update the source summary without dropping other results
     summary_path = results_dir / "results.json"
     previous_results = {}
     if summary_path.exists():
         previous_results = json.loads(summary_path.read_text())
     previous_results.update(scene_results)
-    summary_path.write_text(json.dumps(previous_results, indent=2, default=str))
+    atomic_write_text(
+        summary_path, json.dumps(previous_results, indent=2, default=str) + "\n",
+    )
 
     # Collect peak memory values
     if analytics_store is not None:

@@ -99,6 +99,8 @@ def run_parameters(args, data_root):
         "iterations": args.iterations,
         "resolution": args.resolution,
         "train_data_device": args.train_data_device,
+
+    # Add mask and training settings
         "yolo_conf": args.yolo_conf,
         "hysteresis_gamma": args.hysteresis_gamma,
         "hysteresis_radius": args.hysteresis_radius,
@@ -107,6 +109,8 @@ def run_parameters(args, data_root):
         "background_view_policy": args.background_view_policy,
         "betas": list(args.betas),
         "tau": args.tau,
+
+    # Add transfer and raster settings
         "min_fraction": args.min_fraction,
         "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
         "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
@@ -182,16 +186,19 @@ def _write_scope_metadata(path, metadata):
             os.unlink(temporary_name)
 
 
-def prepare_run_metadata(output_root, parameters, force, sources, force_delete=False):
+def prepare_run_metadata(output_root, parameters, force, sources, variant=None, force_delete=False):
     """ Prepare the output directory and write run parameters """
     common_metadata_path = output_root / "run_parameters.json"
     common_previous = None
     if common_metadata_path.exists():
         common_previous = json.loads(common_metadata_path.read_text())
     other_sources_have_results = any(
-        (output_root / "results" / f"results_{source}.md").exists()
+        any((output_root / "results").rglob(f"results_{source}.json"))
         for source in {"yolo", "gt2d"} - set(sources)
+
+    # Complete the source result check
     )
+    result_root = output_root / "results" / variant if variant else output_root / "results"
 
     scopes = [
         ("meta_dataset.json", DATASET_METADATA_KEYS, "dataset/model"),
@@ -233,17 +240,17 @@ def prepare_run_metadata(output_root, parameters, force, sources, force_delete=F
                 if vote_dir.exists():
                     shutil.rmtree(vote_dir, ignore_errors=True)
             for suffix in ["json", "md"]:
-                (output_root / "results" / f"results_{source}.{suffix}").unlink(
+                (result_root / f"results_{source}.{suffix}").unlink(
                     missing_ok=True,
                 )
 
     if (force_delete and common_previous is not None and not other_sources_have_results and
             (common_previous.get("iterations") != parameters["iterations"] or
              common_previous.get("resolution") != parameters["resolution"])):
+        
         shutil.rmtree(output_root / "model", ignore_errors=True)
         shutil.rmtree(output_root / "dataset", ignore_errors=True)
 
-    # Create the output root directory and record parameters for later runs.
     ensure_dir(output_root)
     for filename, keys, _artifact in scopes:
         _write_scope_metadata(

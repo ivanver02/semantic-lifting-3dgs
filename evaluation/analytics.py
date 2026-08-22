@@ -19,7 +19,7 @@ SCHEMA = {
     ],
 
     "run_parameters": [
-        "run_id", "vote_id", "evaluation_scope_version", "dataset", "scene", "split",
+        "run_id", "variant", "vote_id", "evaluation_scope_version", "dataset", "scene", "split",
         "data_root", "iterations", "resolution", "train_data_device",
         "vote_data_device", "sequence_name", "frame_step", "yolo_conf",
         "hysteresis_gamma", "hysteresis_radius",
@@ -61,9 +61,8 @@ SCHEMA = {
         "gt_evaluated_vertex_count",
     ],
 
-    "run_betas": ["run_id", "source", "beta_id", "beta_order", "beta"],
     "vote_statistics": [
-        "run_id", "source", "vote_id", "class_id", "num_cameras", "num_class_views",
+        "run_id", "variant", "scene_id", "source", "vote_id", "class_id", "num_cameras", "num_class_views",
         "num_gaussians", "target_weight_sum", "background_weight_sum",
         "supported_gaussians", "target_score_mean", "target_score_std",
         "target_score_min", "target_score_p05", "target_score_p25",
@@ -74,13 +73,19 @@ SCHEMA = {
     ],
 
     "gaussian_statistics": [
-        "run_id", "source", "vote_id", "class_id", "beta_id", "beta", "set_type", "gaussian_count",
+        "run_id", "variant", "scene_id", "source", "vote_id", "class_id", "beta_id", "beta", "set_type", "gaussian_count",
         "size_min", "size_mean", "size_std", "size_max", "opacity_min",
         "opacity_mean", "opacity_std", "opacity_max", "file_path",
     ],
 
+    "model_statistics": [
+        "run_id", "variant", "scene_id", "file_path", "gaussian_count",
+        "size_min", "size_mean", "size_std", "size_max", "opacity_min",
+        "opacity_mean", "opacity_std", "opacity_max",
+    ],
+
     "class_beta_metrics": [
-        "run_id", "source", "vote_id", "class_id", "beta_id", "beta", "tp", "fp", "fn",
+        "run_id", "variant", "scene_id", "source", "vote_id", "class_id", "beta_id", "beta", "hysteresis_gamma", "tp", "fp", "fn",
         "gt_count", "pred_count", "precision", "recall", "iou",
         "ground_truth_transfer_tp", "ground_truth_transfer_fp",
         "ground_truth_transfer_fn", "ground_truth_transfer_gt_count",
@@ -90,7 +95,7 @@ SCHEMA = {
     ],
 
     "aggregate_beta_metrics": [
-        "run_id", "source", "beta_id", "beta", "mIoU", "global_iou",
+        "run_id", "variant", "scene_id", "source", "beta_id", "beta", "hysteresis_gamma", "mIoU", "global_iou",
         "macro_precision", "macro_recall", "global_precision", "global_recall",
         "ground_truth_transfer_mIoU", "ground_truth_transfer_macro_precision",
         "ground_truth_transfer_macro_recall",
@@ -208,25 +213,16 @@ def record_scene_analytics(store, args, scene, scene_id):
         }, ["scene_id", "class_id"])
 
 
-def record_source_analytics(store, run_id, source, scene, classes, betas,
+def record_source_analytics(store, run_id, source, scene, scene_id, classes, betas,
                             source_dir, result, vote_identifier,
-                            hysteresis_gamma, hysteresis_radius, model_ply):
+                            hysteresis_gamma, hysteresis_radius, full_model_stats):
     """ Record votes, Gaussian summaries and metrics for one mask source """
-    store.append("gaussian_statistics", {
+    store.append_unique("model_statistics", {
         "run_id": run_id,
-        "source": source,
-        "set_type": "full_model",
-        **gaussian_statistics(model_ply),
-    })
-    for beta_order, beta in enumerate(betas, start=1):
-        store.append("run_betas", {
-            "run_id": run_id,
-            "source": source,
-            "beta_id": f"{run_id}:{source}:{beta_order}",
-            "beta_order": beta_order,
-            "beta": beta,
-        })
-
+        "variant": result.get("variant"),
+        "scene_id": scene_id,
+        **full_model_stats,
+    }, ["scene_id"])
     for spec in classes:
         class_id = scene.class_id(spec.name)
         analytics_class_id = f"{scene.dataset}:{class_id}"
@@ -240,9 +236,13 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
             vote_stats = json.loads(vote_stats_path.read_text())
             vote_stats.update({
                 "run_id": run_id,
+                "variant": result.get("variant"),
+                "scene_id": scene_id,
                 "source": source,
                 "vote_id": vote_identifier,
                 "class_id": analytics_class_id,
+
+    # Record transferred Gaussian statistics
             })
             store.append("vote_statistics", vote_stats)
 
@@ -250,9 +250,14 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
         ground_truth_transfer_stats = gaussian_statistics(ground_truth_transfer_path)
         store.append("gaussian_statistics", {
             "run_id": run_id,
+            "variant": result.get("variant"),
+            "scene_id": scene_id,
             "source": source,
             "vote_id": vote_identifier,
+
+    # Read the beta sweep entry
             "class_id": analytics_class_id,
+            "beta": None,
             "set_type": "ground_truth_transfer",
             **ground_truth_transfer_stats,
         })
@@ -272,11 +277,15 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
 
     # Complete predicted Gaussian fields
                 "run_id": run_id,
+                "variant": result.get("variant"),
+                "scene_id": scene_id,
                 "source": source,
                 "vote_id": vote_identifier,
                 "class_id": analytics_class_id,
                 "beta_id": beta_id,
                 "beta": beta,
+
+    # Add class metric metadata
                 "set_type": "predicted",
                 **stats,
             })
@@ -285,12 +294,19 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
             prediction = sweep["iou"]
             ground_truth_transfer_metrics = sweep["ground_truth_transfer_iou"]
             store.append("class_beta_metrics", {
+
+    # Add transfer metric values
                 "run_id": run_id,
+                "variant": result.get("variant"),
+                "scene_id": scene_id,
                 "source": source,
                 "vote_id": vote_identifier,
                 "class_id": analytics_class_id,
                 "beta_id": beta_id,
                 "beta": beta,
+
+    # Add aggregate metric metadata
+                "hysteresis_gamma": hysteresis_gamma,
                 "tp": prediction["tp"],
                 "fp": prediction["fp"],
                 "fn": prediction["fn"],
@@ -298,6 +314,8 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
                 "pred_count": prediction["pred_count"],
                 "precision": prediction["precision"],
                 "recall": prediction["recall"],
+
+    # Complete metric fields
                 "iou": prediction["iou"],
                 "ground_truth_transfer_tp": ground_truth_transfer_metrics["tp"],
                 "ground_truth_transfer_fp": ground_truth_transfer_metrics["fp"],
@@ -306,6 +324,8 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
                 "ground_truth_transfer_pred_count": ground_truth_transfer_metrics["pred_count"],
                 "ground_truth_transfer_precision": ground_truth_transfer_metrics["precision"],
                 "ground_truth_transfer_recall": ground_truth_transfer_metrics["recall"],
+
+    # Complete metric fields
                 "ground_truth_transfer_iou": ground_truth_transfer_metrics["iou"],
                 "relative_iou": sweep["relative_iou"],
             })
@@ -316,8 +336,13 @@ def record_source_analytics(store, run_id, source, scene, classes, betas,
             continue
         store.append("aggregate_beta_metrics", {
             "run_id": run_id,
+            "variant": result.get("variant"),
+            "scene_id": scene_id,
+
+    # Complete metric fields
             "source": source,
             "beta_id": f"{run_id}:{source}:{beta_order}",
             "beta": beta,
+            "hysteresis_gamma": hysteresis_gamma,
             **aggregate,
         })
