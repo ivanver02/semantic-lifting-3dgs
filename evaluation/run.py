@@ -2,6 +2,7 @@
 
 import argparse
 import json
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -10,7 +11,7 @@ import cv2
 import numpy as np
 
 from . import cache, ground_truth, metrics, reporting, transfer
-from .analytics import AnalyticsStore, record_scene_analytics, record_source_analytics, utc_now
+from .analytics import AnalyticsStore, collect_run_metadata, record_scene_analytics, record_source_analytics, utc_now
 from .common import main_digest, safe_name, target_classes_by_detector, threshold_path, vote_class_dir, vote_id
 from .common import atomic_write_text
 from .runtime import Runtime
@@ -760,6 +761,17 @@ def main():
         AnalyticsStore(data_root.parent / "analytics")
         if args.save_results_to_csv else None
     )
+    run_metadata = {}
+    if analytics_store is not None:
+        run_metadata = collect_run_metadata(
+
+    # Measure YOLO mask generation
+            args.repo_root,
+            args.repo_root / "yolo26x-seg.pt",
+            [args.train_image, args.lifting_image, args.colmap_image],
+            sys.argv,
+            analytics_store.root.parent / ".run_metadata_cache",
+        )
 
     # Prepare paths for several outputs
     dataset_dir = output_root / "dataset"
@@ -897,6 +909,7 @@ def main():
             "variant": variant,
             "vote_id": vote_identifier,
             **parameters,
+            **run_metadata,
             "mask_source": args.mask_source,
         })
         record_scene_analytics(analytics_store, args, scene, scene_id)

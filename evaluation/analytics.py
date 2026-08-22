@@ -1,11 +1,15 @@
 # Append only CSV tables for validation analysis
 
 import csv
+import hashlib
 import json
+import os
+import shlex
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import safe_name, threshold_path, vote_class_dir
+from .common import atomic_write_text, safe_name, threshold_path, vote_class_dir
 from .reporting import gaussian_statistics
 
 
@@ -29,7 +33,9 @@ SCHEMA = {
         "gaussian_to_mesh_transfer", "min_opacity",
         "gaussian_to_mesh_background_competes", "mesh_to_gaussian_background_competes",
         "opacity_weighting",
-        "raster_block_size", "mask_source",
+        "raster_block_size", "mask_source", "code_commit", "image_digest",
+        "detector_sha256", "code_dirty", "gpu_name", "driver_version",
+        "cuda_visible_devices", "command",
     ],
 
     "scenes": [
@@ -105,6 +111,129 @@ SCHEMA = {
     ],
 
 }
+
+
+def _command_output(command):
+    """ Return command output"""
+    try:
+        result = subprocess.run(
+            command, check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip() or None
+
+
+def _sha256(path):
+    """ Return a file digest """
+    if not path.exists():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _sha256_cached(path, cache_root=None):
+    """ Reuse a detector digest when its signature is unchanged """
+    if cache_root is None:
+        return _sha256(path)
+    cache_root = Path(cache_root)
+    cache_path = cache_root / "run_metadata_cache.json"
+    cache = {}
+    if cache_path.exists():
+        try:
+
+    # Load the run metadata cache
+            cache = json.loads(cache_path.read_text())
+        except (OSError, ValueError):
+            cache = {}
+    key = str(path.resolve())
+    signature = None
+    if path.exists():
+        stat = path.stat()
+        signature = {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+    # Check the cached file signature
+    previous = cache.get(key)
+    if previous is not None and previous.get("signature") == signature:
+        return previous.get("digest")
+    digest = _sha256(path)
+    cache[key] = {"signature": signature, "digest": digest}
+    atomic_write_text(cache_path, json.dumps(cache, indent=2, sort_keys=True) + "\n")
+    return digest
+
+
+def _git_dirty(repo_root):
+    """ Return whether the repository has uncommitted changes """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "status", "--porcelain"],
+            check=True, capture_output=True, text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+
+    # Return the repository state
+    return bool(result.stdout.strip())
+
+
+def _image_digest(image_name):
+    """ Return an image digest or local image ID """
+    output = _command_output([
+        "docker", "image", "inspect", "--format={{json .RepoDigests}}\t{{.Id}}",
+        image_name,
+    ])
+    if output is None:
+        return None
+    repo_digests, separator, image_id = output.partition("\t")
+
+    # Require a separated image response
+    if not separator:
+        return None
+    try:
+        repo_digests = json.loads(repo_digests)
+    except json.JSONDecodeError:
+        repo_digests = []
+    if repo_digests:
+        return {"kind": "repo_digest", "value": repo_digests}
+
+    # Return the local image identifier
+    return {"kind": "image_id", "value": image_id}
+
+
+def collect_run_metadata(repo_root, detector_path, image_names, command, cache_root=None):
+    """ Collect reproducibility metadata """
+    commit = _command_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"])
+    image_digest = {name: _image_digest(name) for name in image_names}
+
+    gpu_output = _command_output([
+        "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader",
+    ])
+    gpu_names = []
+    driver_versions = []
+    if gpu_output is not None:
+        for line in gpu_output.splitlines():
+            name, separator, driver = line.partition(",")
+
+    # Record detected GPU details
+            if separator:
+                gpu_names.append(name.strip())
+                driver_versions.append(driver.strip())
+
+    return {
+        "code_commit": commit,
+        "image_digest": json.dumps(image_digest, sort_keys=True),
+        "detector_sha256": _sha256_cached(detector_path, cache_root),
+        "code_dirty": _git_dirty(repo_root),
+        "gpu_name": json.dumps(gpu_names),
+        "driver_version": json.dumps(driver_versions),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+
+    # Add the command run metadata
+        "command": shlex.join(command),
+    }
 
 
 def utc_now():
