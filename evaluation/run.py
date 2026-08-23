@@ -63,7 +63,7 @@ def _variant_parameters(args):
     }
 
 
-def _resolve_variant(args, output_root):
+def _resolve_variant(args, output_root, dry_run=False):
     """ Validate a readable variant label against its persisted configuration """
     expected = "v" + main_digest(_variant_parameters(args))
     if args.variant is None:
@@ -89,7 +89,7 @@ def _resolve_variant(args, output_root):
             f"--variant {args.variant!r} does not match the received flags, "
             f"expected {expected!r}"
         )
-    if previous is None:
+    if previous is None and not dry_run:
         record["variants"][args.variant] = config
         atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
     return args.variant
@@ -148,6 +148,8 @@ def _parser():
                         help="Experiment name stored in the resumability state store")
     parser.add_argument("--retry-failed", action="store_true",
                         help="Retry state store units previously marked failed")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the source plan without initializing evaluation")
     parser.add_argument("--model-root", type=Path, default=None, help="Gaussian model directory to reuse, if exists")
 
     # Select the source of the 2D masks and the container images that produce them
@@ -706,6 +708,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             _progress(
                 f"{source}: class '{spec.name}' beta {beta} ready "
                 f"(IoU={score:.4f}, {time.perf_counter() - beta_started:.1f}s)"
+
+    # Select pending sources
             )
 
         _progress(
@@ -734,6 +738,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         "support": {
             "vertices_evaluated": int(scene.evaluation_mask.sum()),
         },
+
+    # Return dry run details
         "parameters": {
             "hysteresis_gamma": args.hysteresis_gamma,
             "hysteresis_radius": args.hysteresis_radius,
@@ -742,6 +748,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             "background_view_policy": args.background_view_policy,
             "betas": betas,
             "tau": args.tau,
+
+    # Stop when no sources are pending
             "min_fraction": args.min_fraction,
             "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
             "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
@@ -782,19 +790,19 @@ def main():
     if args.raster_block_size <= 0:
         raise ValueError("--raster-block-size must be greater than zero")
 
-    # Determine the data root directory and resolve it to an absolute path.
+    # Resolve the data root directory
     data_root = (
         args.data_root
         if args.data_root is not None
         else DEFAULT_DATA_ROOT / args.dataset
-    ).resolve() # Resolve the data root path to an absolute path
+    ).resolve()
 
-    # Determine the output root directory and resolve it to an absolute path.
+    # Resolve the output root directory
     output_root = (
         args.output_root
         if args.output_root is not None
         else data_root / "evaluation" / args.scene
-    ).resolve() # Resolve the output root path to an absolute path
+    ).resolve()
 
     # Check if the output root is within the data root
     try:
@@ -828,12 +836,12 @@ def main():
     gt_dir = output_root / "gt"
     results_dir = output_root / "results"
 
-    # Resolve training defaults before checking whether an existing report is valid.
+    # Resolve training defaults before checking existing reports
     if args.resolution is None:
         args.resolution = 2 if args.dataset == "scannetpp" else 1
     if args.train_data_device is None:
         args.train_data_device = "cpu" if args.dataset == "scannetpp" else "cuda"
-    variant = _resolve_variant(args, output_root)
+    variant = _resolve_variant(args, output_root, args.dry_run)
     results_dir = results_dir / variant
     parameters = cache.run_parameters(args, data_root)
     vote_identifier = vote_id(parameters)
@@ -841,7 +849,7 @@ def main():
     # Pass training settings
     experiment = args.experiment or args.split
     state_store = (
-        StateStore(args.state_store)
+        StateStore(args.state_store, read_only=args.dry_run)
         if args.state_store is not None else None
     )
     _validate_existing_beta_grids(
@@ -856,6 +864,13 @@ def main():
         args.retry_failed,
         vote_identifier,
     )
+    if args.dry_run:
+        requested = _source_names(args.mask_source)
+
+    # Record run scene fields
+        skipped = [source for source in requested if source not in pending_sources]
+        print(json.dumps({"run": False, "pending": pending_sources, "skipped": skipped}))
+        return
     if not pending_sources:
         cache.prepare_run_metadata(
             output_root, parameters, False, pending_sources, variant,
