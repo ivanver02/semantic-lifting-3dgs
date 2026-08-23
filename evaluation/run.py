@@ -15,6 +15,7 @@ from .analytics import AnalyticsStore, collect_run_metadata, record_scene_analyt
 from .common import main_digest, safe_name, target_classes_by_detector, threshold_path, vote_class_dir, vote_id
 from .common import atomic_write_text
 from .runtime import Runtime
+from .state_store import StateStore, unit_id as state_store_unit_id
 
 from .replica.scene import ReplicaScene
 from .scannetpp.scene import MASKS_CACHE_VERSION, ScannetScene
@@ -139,6 +140,14 @@ def _parser():
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--variant", default=None,
                         help="Result variant identity, defaults to a configuration digest")
+    parser.add_argument("--state-store", type=Path, default=None,
+                        help="Optional experiment state store used for resumability")
+    parser.add_argument("--experiment", default=None,
+
+    # Set the reuse source help text
+                        help="Experiment name stored in the resumability state store")
+    parser.add_argument("--retry-failed", action="store_true",
+                        help="Retry state store units previously marked failed")
     parser.add_argument("--model-root", type=Path, default=None, help="Gaussian model directory to reuse, if exists")
 
     # Select the source of the 2D masks and the container images that produce them
@@ -304,14 +313,49 @@ def _validate_existing_beta_grids(results_dir, sources, betas, force):
             )
 
 
-def _pending_sources(output_root, mask_source, force):
-    """Return sources whose final Markdown result still needs to be generated."""
+def _pending_sources(output_root, mask_source, force, variant, state_store=None,
+                     dataset=None, scene=None, experiment=None, parameters=None,
+                     retry_failed=False, vote_identifier=None):
+    """ Return sources not marked done in the state store """
     pending = []
     for source in _source_names(mask_source):
-        result_path = output_root / "results" / f"results_{source}.md"
-        if result_path.exists() and not force:
-            print(f"[skip] {source}: result already exists at {result_path}")
+        identifier = (
+            state_store_unit_id(experiment, dataset, scene, variant)
+            if state_store is not None else None
+        )
+        result_path = output_root / "results" / variant / f"results_{source}.json"
+
+    # Add incomplete sources
+        fingerprint = (
+            main_digest(parameters, length=16) if parameters is not None else None
+        )
+        required_metadata = [
+            output_root / "meta_dataset.json",
+            output_root / "meta_masks_gt2d.json",
+            output_root / "meta_gt.json",
+            output_root / f"meta_votes_{source}_{vote_identifier}.json",
+
+    # Read the previous beta list
+        ] if parameters is not None else []
+        if source == "yolo":
+            required_metadata.append(output_root / "meta_masks_yolo.json")
+        complete_metadata = all(path.exists() for path in required_metadata)
+        state = state_store.state(identifier) if state_store is not None else None
+        source_done = (
+            state_store.is_source_done(identifier, source, fingerprint)
+            if state_store is not None else False
+
+    # Continue the class example
+        )
+        if (state_store is not None and state == "failed" and not retry_failed and
+                not force):
+            print(f"skip: {source}: state store unit {identifier} is failed, use --retry-failed")
+        elif (state_store is not None and source_done and
+                result_path.exists() and complete_metadata and not force):
+            print(f"skip: {source}: state store unit {identifier} is done")
         else:
+
+    # Complete the replica mask command
             pending.append(source)
     return pending
 
@@ -706,6 +750,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
         },
         "metrics_by_beta": metrics_by_beta,
+
+    # Initialize state store unit storage
         "per_class": per_class,
     }
     reporting.write_result(results_dir, result)
@@ -791,26 +837,54 @@ def main():
     results_dir = results_dir / variant
     parameters = cache.run_parameters(args, data_root)
     vote_identifier = vote_id(parameters)
+
+    # Pass training settings
+    experiment = args.experiment or args.split
+    state_store = (
+        StateStore(args.state_store)
+        if args.state_store is not None else None
+    )
     _validate_existing_beta_grids(
         results_dir, _source_names(args.mask_source), args.betas, _force_any(args),
     )
 
-    # Do not initialize scenes, containers or caches when the requested report exists.
-    pending_sources = _pending_sources(output_root, args.mask_source, _force_any(args))
+
+    # Resolve pending source units
+    pending_sources = _pending_sources(
+        output_root, args.mask_source, _force_any(args), variant, state_store,
+        args.dataset, args.scene, experiment, parameters,
+        args.retry_failed,
+        vote_identifier,
+    )
     if not pending_sources:
         cache.prepare_run_metadata(
-            output_root, parameters, False, _source_names(args.mask_source),
-            variant,
+            output_root, parameters, False, pending_sources, variant,
         )
-        print("[skip] All requested detector results already exist")
+        print("skip: All requested state store units are complete or awaiting retry")
+
+    # Record run parameters
         return
     args.mask_source = (
         pending_sources[0] if len(pending_sources) == 1 else "both"
     )
+    parameters = cache.run_parameters(args, data_root)
+    vote_identifier = vote_id(parameters)
     run_started = time.perf_counter()
     stage_records = []
 
-    # Initialize the Docker runtime with the provided arguments.
+    # Pass the transfer method
+    state_store_unit = None
+    if state_store is not None:
+        state_store_unit = state_store_unit_id(
+            experiment, args.dataset, args.scene, variant,
+        )
+        state_store.begin(
+            state_store_unit, experiment, args.dataset, args.scene, variant, run_id,
+            parameters_fingerprint=main_digest(parameters, length=16),
+            sources=pending_sources,
+        )
+
+    # Initialize the Docker runtime
     runtime = Runtime(
         args.repo_root, data_root, args.train_image,
         args.lifting_image, args.colmap_image,
@@ -883,6 +957,7 @@ def main():
         if analytics_store is not None else None
     )
 
+    # Record the active run in analytics
     if analytics_store is not None:
         scene_id = f"{scene.dataset}:{scene.scene}"
         analytics_store.append("runs", {
@@ -1010,6 +1085,8 @@ def main():
                 vote_identifier, args.hysteresis_gamma, args.hysteresis_radius,
                 full_model_stats,
             )
+        if state_store is not None:
+            state_store.finish(state_store_unit, source=source)
 
     # Update the source summary without dropping other results
     summary_path = results_dir / "results.json"
