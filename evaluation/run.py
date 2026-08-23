@@ -92,15 +92,15 @@ def _resolve_variant(args, output_root, dry_run=False):
     if previous is None and not dry_run:
         record["variants"][args.variant] = config
         atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
-    return args.variant
-
-
-def _progress(message):
-    """Print a progress message immediately, even when stdout is buffered."""
-    print(f"[progress] {message}", flush=True)
-
 
     # Use empty memory values without a runtime
+    return args.variant
+
+def _progress(message):
+    """ Print a progress message immediately, even when stdout is buffered """
+    print(f"progress: {message}", flush=True)
+
+
 def _measure_stage(stage_records, name, function, cache_mode="miss", runtime=None):
     """ Run one stage and retain elapsed time plus container CUDA peak memory """
     if runtime is not None:
@@ -295,26 +295,6 @@ def _source_names(mask_source):
     return [mask_source]
 
 
-def _validate_existing_beta_grids(results_dir, sources, betas, force):
-    """ Reject an overwrite with a different beta sweep """
-    if force:
-        return
-    for source in sources:
-        path = results_dir / f"results_{source}.json"
-        if not path.exists():
-            continue
-        previous = json.loads(path.read_text())
-
-    # Complete the YOLO command
-        previous_betas = previous.get("parameters", {}).get("betas")
-        if previous_betas != list(betas):
-            raise RuntimeError(
-                f"{path} already contains results for betas {previous_betas!r}, "
-                f"while this invocation uses {list(betas)!r}. The caller must "
-                "read the existing results or pass --force to discard them."
-            )
-
-
 def _pending_sources(output_root, mask_source, force, variant, state_store=None,
                      dataset=None, scene=None, experiment=None, parameters=None,
                      retry_failed=False, vote_identifier=None):
@@ -362,6 +342,26 @@ def _pending_sources(output_root, mask_source, force, variant, state_store=None,
     return pending
 
 
+def _validate_existing_beta_grids(results_dir, sources, betas, force):
+    """ Reject an overwrite with a different beta sweep """
+    if force:
+        return
+    for source in sources:
+        path = results_dir / f"results_{source}.json"
+        if not path.exists():
+            continue
+        previous = json.loads(path.read_text())
+
+    # Complete the YOLO command
+        previous_betas = previous.get("parameters", {}).get("betas")
+        if previous_betas != list(betas):
+            raise RuntimeError(
+                f"{path} already contains results for betas {previous_betas!r}, "
+                f"while this invocation uses {list(betas)!r}. The caller must "
+                "read the existing results or pass --force to discard them."
+            )
+
+
 def _mask_classes(mask_dir, classes):
     """Select target class records present in a generated mask directory.
 
@@ -376,6 +376,8 @@ def _mask_classes(mask_dir, classes):
     "18": "horse",
     "55": "donut",
     "58": "couch",
+
+    # Add the reference export script
     "61": "dining table",
     "65": "mouse"
 }
@@ -387,11 +389,10 @@ def _mask_classes(mask_dir, classes):
     if not classes_path.exists():
         raise FileNotFoundError(f"mask class metadata not found: {classes_path}")
 
-    # Read detector names written by YOLO in classes.json.
+        # Read detector names from classes json
     names = set(json.loads(classes_path.read_text()).values())
 
-    # Use the detector name to retrieve the corresponding main
-    # class record.
+            # Map detector names to main class records
     mapping = target_classes_by_detector(classes)
 
     # Keep only supported classes
@@ -404,7 +405,7 @@ def _mask_classes(mask_dir, classes):
 
 
 def _classes_with_gt2d_views(mask_dir, classes):
-    """Return classes that occur in at least one generated GT2D view."""
+    """ Return classes that occur in at least one generated GT2D view """
     present_ids = set()
     for path in (mask_dir / "semantic").glob("*.png"):
         semantic = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
@@ -412,6 +413,8 @@ def _classes_with_gt2d_views(mask_dir, classes):
             present_ids.update(np.unique(semantic).tolist())
     return [
         spec for spec in classes
+
+    # Finish the vote reuse check
         if spec.detector_stored_id in present_ids
     ]
 
@@ -476,6 +479,8 @@ def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
             "--model", str(runtime.repo_root / "yolo26x-seg.pt"),
             "--conf", str(args.yolo_conf),
         ],
+
+    # Add optional statistics arguments
     )
 
 
@@ -489,6 +494,8 @@ def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
     if not class_specs:
         return
     runtime.run_lifting(
+
+    # Run the vote command
         "segmentation/export_gt_gaussians.py",
         [
             "--model_path", str(model_dir),
@@ -630,7 +637,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                        ground_truth_transfer_by_class,
                        vote_identifier,
                        variant,
-                      segmentation_dir, betas, results_dir, source):
+                       segmentation_dir, betas, results_dir, source):
     """
     Evaluate one mask source and write its JSON and markdown results
 
@@ -700,6 +707,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                 "relative_iou": (
                     result["iou"]["iou"] /
                     result["ground_truth_transfer_iou"]["iou"]
+
+    # Collect run metadata inputs
                     if result["ground_truth_transfer_iou"]["iou"] else 0.0
                 ),
                 "score": score,
@@ -773,20 +782,32 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
 def main():
     """ Run preparation, mask generation, voting, thresholding and evaluation """
     args = _parser().parse_args()
+
+    # Validate confidence and threshold ranges
     if not 0.0 <= args.background_confidence <= 1.0:
         raise ValueError("--background-confidence must be in [0, 1]")
+    
     if any(beta < 0.0 or beta > 1.0 for beta in args.betas):
         raise ValueError("all --betas must be in [0, 1]")
+    
     if args.frame_step <= 0:
         raise ValueError("--frame-step must be greater than zero")
+    
     if args.tau <= 0:
         raise ValueError("--tau must be greater than zero")
+
+    # Measure dataset preparation
     if not 0.0 <= args.min_fraction <= 1.0:
         raise ValueError("--min-fraction must be in [0, 1]")
+    
     if args.hysteresis_gamma < 0.0:
         raise ValueError("--hysteresis-gamma must be non-negative")
+
+    # Validate hysteresis radius
     if args.hysteresis_radius <= 0.0:
         raise ValueError("--hysteresis-radius must be greater than zero")
+
+    # Validate raster settings
     if args.raster_block_size <= 0:
         raise ValueError("--raster-block-size must be greater than zero")
 
@@ -871,6 +892,7 @@ def main():
         skipped = [source for source in requested if source not in pending_sources]
         print(json.dumps({"run": False, "pending": pending_sources, "skipped": skipped}))
         return
+    
     if not pending_sources:
         cache.prepare_run_metadata(
             output_root, parameters, False, pending_sources, variant,
@@ -905,7 +927,7 @@ def main():
         args.lifting_image, args.colmap_image,
     )
 
-    # Create a scene instance for the selected dataset.
+    # Create the selected dataset scene
     scene_instance = _make_scene(args, data_root, masks_gt)
 
     # Prepare metadata and reuse caches within this output root
@@ -937,7 +959,7 @@ def main():
             runtime=runtime,
         )
 
-    # Load the common scene data and train only when there is no model.
+    # Load scene data and train when no model exists
     scene = scene_instance.load_data()
     evaluation_classes = _classes_with_gt2d_views(masks_gt, scene.classes)
     model_ply = model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply"
@@ -955,7 +977,7 @@ def main():
     if not model_ply.exists():
         raise FileNotFoundError(f"trained Gaussian model missing: {model_ply}")
 
-    # Build or reuse the mesh and Gaussian neighborhoods and GT labels.
+    # Build or reuse transfer neighborhoods and labels
     gaussians_near_a_vertex, gaussian_labels = _measure_stage(
         stage_records, "ground_truth_transfer",
         lambda: ground_truth.build(
@@ -1001,10 +1023,11 @@ def main():
             **parameters,
             **run_metadata,
             "mask_source": args.mask_source,
+
+    # Record stage identity fields
         })
         record_scene_analytics(analytics_store, args, scene, scene_id)
 
-    # Evaluate each mask source (yolo or 2dgt) independently.
     scene_results = {}
     ground_truth_transfer_by_class = {}
     for spec in evaluation_classes:
@@ -1079,7 +1102,7 @@ def main():
         )
         stage_records[-1]["container_count"] = threshold_containers
 
-        # Evaluate every requested beta for the selected mask source.
+        # Evaluate every beta for the selected source
         scene_results[source] = _measure_stage(
             stage_records, f"{source}:evaluation_transfer",
             lambda: _evaluate_scene(
@@ -1097,6 +1120,8 @@ def main():
                 analytics_store, run_id, source, scene,
                 f"{scene.dataset}:{scene.scene}", evaluation_classes, betas,
                 source_dir, scene_results[source],
+
+    # Pass source analytics identifiers
                 vote_identifier, args.hysteresis_gamma, args.hysteresis_radius,
                 full_model_stats,
             )

@@ -25,6 +25,8 @@ SCHEMA = {
     "run_parameters": [
         "run_id", "variant", "vote_id", "evaluation_scope_version", "dataset", "scene", "split",
         "data_root", "iterations", "resolution", "train_data_device",
+        "replica_vertex_label_min_fraction", "replica_visibility_slop",
+        "scannetpp_mask_version", "scannetpp_mask_bands",
         "vote_data_device", "sequence_name", "frame_step", "yolo_conf",
         "hysteresis_gamma", "hysteresis_radius",
         "background_mode", "background_confidence", "background_view_policy",
@@ -260,34 +262,138 @@ class AnalyticsStore:
         """ Create the analytics directory and table headers """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
+        self._unique_keys = {}
 
-        # Initialize every table with its header if the file does not exist or is empty
         for table, fields in SCHEMA.items():
             path = self.root / f"{table}.csv"
             if not path.exists() or path.stat().st_size == 0:
                 with path.open("w", newline="", encoding="utf-8") as handle:
                     csv.DictWriter(handle, fieldnames=fields).writeheader()
+                continue
+
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                reader = csv.DictReader(handle)
+                if reader.fieldnames == fields:
+                    continue
+                rows = list(reader)
+            temporary_path = path.with_suffix(".csv.tmp")
+            try:
+                with temporary_path.open("w", newline="", encoding="utf-8") as handle:
+
+    # Rewrite the table with its schema
+                    writer = csv.DictWriter(
+                        handle, fieldnames=fields, extrasaction="ignore"
+                    )
+                    writer.writeheader()
+                    writer.writerows(rows)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                os.replace(temporary_path, path)
+
+    # Remove the temporary table
+            finally:
+                temporary_path.unlink(missing_ok=True)
+
 
     def append(self, table, row):
         """Append one row using the table schema"""
         fields = SCHEMA[table]
 
-        # Ignore extra keys and fill missing fields with empty CSV values
         values = {field: row.get(field) for field in fields}
         with (self.root / f"{table}.csv").open("a", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=fields).writerow(values)
 
+
     def append_unique(self, table, row, key_fields):
         """Append a row when its key is new"""
         path = self.root / f"{table}.csv"
-
-        # Compare string representations because CSV values are read as strings
         key = tuple(str(row.get(field, "")) for field in key_fields)
-        with path.open("r", newline="", encoding="utf-8") as handle:
-            for existing in csv.DictReader(handle):
-                if tuple(existing.get(field, "") for field in key_fields) == key:
-                    return
+        cache_key = (table, tuple(key_fields))
+        keys = self._unique_keys.setdefault(cache_key, set())
+        if not keys and path.exists():
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                keys.update(
+
+    # Load existing unique keys
+                    tuple(existing.get(field, "") for field in key_fields)
+                    for existing in csv.DictReader(handle)
+                )
+        if key in keys:
+            return
         self.append(table, row)
+        keys.add(key)
+
+
+def deduplicate_analytics(root):
+    """ Return a deduplicated analytics view """
+    root = Path(root)
+    view = {}
+    for table in SCHEMA:
+        path = root / f"{table}.csv"
+        if path.exists():
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                view[table] = list(csv.DictReader(handle))
+
+    # Represent missing tables as empty lists
+        else:
+            view[table] = []
+
+    runs = {}
+    for row in view["runs"]:
+        current = runs.get(row.get("run_id"))
+        if current is None:
+            runs[row.get("run_id")] = dict(row)
+            continue
+        current_completed = current.get("status") == "completed"
+        row_completed = row.get("status") == "completed"
+
+    # Select the latest run record
+        if (row_completed and not current_completed) or (
+                row_completed == current_completed and
+                row.get("created_at", "") >= current.get("created_at", "")
+        ):
+            runs[row.get("run_id")] = dict(row)
+    for row in runs.values():
+        if row.get("status") != "completed":
+            row["status"] = "incomplete"
+
+    # Replace incomplete run records
+    view["runs"] = list(runs.values())
+
+    completed = {
+        run_id: row.get("created_at", "")
+        for run_id, row in runs.items()
+        if row.get("status") == "completed"
+    }
+
+    keys = {
+        "aggregate_beta_metrics": (
+            "scene_id", "variant", "source", "beta", "hysteresis_gamma",
+        ),
+        "class_beta_metrics": (
+            "scene_id", "variant", "source", "beta", "hysteresis_gamma", "class_id",
+        ),
+        "vote_statistics": ("scene_id", "variant", "source", "vote_id", "class_id"),
+
+    # Store the selected run records
+        "gaussian_statistics": (
+            "scene_id", "variant", "source", "vote_id", "class_id",
+            "beta", "set_type",
+        ),
+        "model_statistics": ("scene_id",),
+    }
+    for table, key_fields in keys.items():
+        selected = {}
+
+    # Add Gaussian table keys
+        for row in view.get(table, []):
+            key = tuple(row.get(field, "") for field in key_fields)
+            rank = completed.get(row.get("run_id", ""), "")
+            previous = selected.get(key)
+            if previous is None or rank >= previous[0]:
+                selected[key] = (rank, row)
+        view[table] = [item[1] for item in selected.values()]
+    return view
 
 
 def record_scene_analytics(store, args, scene, scene_id):
@@ -299,6 +405,8 @@ def record_scene_analytics(store, args, scene, scene_id):
         "scene_name": scene.scene,
         "split": args.split,
         "scene_path": str(getattr(scene, "scene_root", "")),
+
+    # Record scene size fields
         "num_vertices": len(scene.vertices),
         "num_images": scene.num_images,
     }, ["scene_id"])
@@ -311,6 +419,8 @@ def record_scene_analytics(store, args, scene, scene_id):
         "cx": [row["cx"] for row in scene.camera_intrinsics],
         "cy": [row["cy"] for row in scene.camera_intrinsics],
     }
+
+    # Build camera summary fields
     camera_row = {
         "scene_id": scene_id,
         "dataset": scene.dataset,
@@ -319,6 +429,8 @@ def record_scene_analytics(store, args, scene, scene_id):
     for field, values in camera_fields.items():
         summary = _summary(values)
         camera_row.update({
+
+    # Add camera summary values
             f"{field}_min": summary["min"],
             f"{field}_mean": summary["mean"],
             f"{field}_max": summary["max"],
@@ -327,6 +439,8 @@ def record_scene_analytics(store, args, scene, scene_id):
     for class_id, spec in enumerate(scene.classes):
         class_mask = scene.semantic_labels == class_id
         store.append_unique("classes", {
+
+    # Record class metadata
             "class_id": f"{scene.dataset}:{class_id}",
             "dataset": scene.dataset,
             "class_name": spec.name,
@@ -335,6 +449,8 @@ def record_scene_analytics(store, args, scene, scene_id):
         }, ["class_id"])
         store.append_unique("scene_classes", {
             "scene_id": scene_id,
+
+    # Record scene class support
             "class_id": f"{scene.dataset}:{class_id}",
             "gt_vertex_count": int(class_mask.sum()),
             "gt_visible_vertex_count": int((class_mask & scene.visible).sum()),
