@@ -10,6 +10,7 @@ from evaluation.common import atomic_write_text
 from evaluation.state_store import unit_id
 from evaluation.scripts.experiment_common import (
     command,
+    observed_vote_counts,
     run_units,
     sources,
     token,
@@ -301,6 +302,17 @@ def main(argv=None):
     selection_path.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(selection_path, json.dumps(selection, indent=2) + "\n")
     print(json.dumps(selection, indent=2, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                "observed_vote_containers": observed_vote_counts(
+                    args.analytics,
+                    sweep_units,
+                )
+            },
+            sort_keys=True,
+        )
+    )
 
     # Return the sweep results
     return 0

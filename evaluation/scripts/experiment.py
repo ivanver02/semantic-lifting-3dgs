@@ -11,6 +11,7 @@ from evaluation.scripts.experiment_common import (
     GAMMAS,
     command,
     dump_plan,
+    observed_vote_counts,
     run_units,
     token,
 )
@@ -249,6 +250,17 @@ def main(argv=None):
             split=settings["split"],
             extra=unit.get("extra", ()),
         ),
+    )
+    print(
+        json.dumps(
+            {
+                "observed_vote_containers": observed_vote_counts(
+                    args.analytics,
+                    planned,
+                )
+            },
+            sort_keys=True,
+        )
     )
     return 0
 

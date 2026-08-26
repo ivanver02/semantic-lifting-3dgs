@@ -5,6 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from evaluation.analytics import deduplicate_analytics
 from evaluation.state_store import read_state_store, unit_id
 
 
@@ -67,6 +68,53 @@ def command(args, unit, *, betas, gamma, split, extra=(), tau=None, theta=None):
         # Add the retry flag
         result.append("--retry-failed")
     return result
+
+
+def observed_vote_counts(analytics, units):
+    """ Count observed vote containers by scene, source and variant """
+    if not Path(analytics).exists():
+        return []
+
+    view = deduplicate_analytics(analytics)
+    allowed = {
+        (unit.get("dataset"), unit["scene"], unit["variant"])
+        for unit in units
+        if unit.get("variant") is not None
+    }
+
+    run_identity = {}
+    for row in view.get("run_parameters", []):
+        scene = row.get("scene", "").split(":")[-1]
+        identity = (row.get("dataset"), scene, row.get("variant"))
+        if identity in allowed:
+            run_identity[row.get("run_id")] = identity
+
+    observed = {}
+    for row in view.get("run_stages", []):
+        stage = row.get("stage", "")
+
+        if not stage.endswith(":votes"):
+            continue
+        identity = run_identity.get(row.get("run_id"))
+
+        if identity is None:
+            continue
+
+        dataset, scene, variant = identity
+        source = stage.removesuffix(":votes")
+        key = (dataset, scene, source, variant)
+        observed[key] = observed.get(key, 0) + int(row.get("container_count") or 0)
+
+    return [
+        {
+            "dataset": dataset,
+            "scene": scene,
+            "source": source,
+            "variant": variant,
+            "container_count": count,
+        }
+        for (dataset, scene, source, variant), count in sorted(observed.items())
+    ]
 
 
 def dump_plan(args, driver, units, *, notes=None, invocation_units=None):
