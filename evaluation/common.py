@@ -16,28 +16,26 @@ class TargetClassInfo:
     """
 
     def __init__(self, name, name_by_detector, detector_stored_id):
-        """Store class names and the detector mask ID"""
         self.name = name
         self.name_by_detector = name_by_detector
         self.detector_stored_id = detector_stored_id
 
 
-class SceneData: # Created when loading data in the scene files
+class SceneData:  # Created when loading data in the scene files
     """
     Ground truth and visibility data in the common scene representation
 
-    The arrays related to vertex all use the same order of vertices in the mesh
+    The arrays related to vertices all use the same order of vertices in the mesh
     - annotated says whether the source dataset provides a semantic annotation
     - visible says if the vertex was observed by any of the selected camera views
     - classes contains the TargetClassInfo classes evaluated by the pipeline
     """
 
     def __init__(self, dataset, scene, vertices, semantic_labels,
-                 annotated, visible, classes, num_images=0,
-                 camera_intrinsics=None):
-        """ 
-        Store the scene names, vertex arrays and target classes 
-        
+                 annotated, visible, classes):
+        """
+        Store the scene names, vertex arrays and target classes
+
         - dataset: The dataset name
         - scene: The scene name within the dataset
         - vertices: 3D coordinates of the mesh vertices in the scene
@@ -54,10 +52,6 @@ class SceneData: # Created when loading data in the scene files
         self.visible = visible
         self.classes = classes
 
-    # Store image and camera metadata
-        self.num_images = int(num_images)
-        self.camera_intrinsics = list(camera_intrinsics or [])
-
     @property
     def class_ids(self):
         """ Map each main class name to its local scene ID """
@@ -67,7 +61,7 @@ class SceneData: # Created when loading data in the scene files
     def evaluation_mask(self):
         """
         Returns a boolean mask for vertices that should be included in evaluation
-        
+
         Consequences of defining the evaluation mask this way:
         - Vertices that are not annotated or not visible are excluded from evaluation.
         - Vertices that are annotated but not in the target classes are included in evaluation, and can cause false positives.
@@ -143,8 +137,6 @@ def atomic_write_text(path, text):
     )
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-
-    # Write and flush the temporary file
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
