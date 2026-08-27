@@ -14,22 +14,29 @@ from arguments import get_combined_args
 from segmentation.projection import GaussianProjector
 from utils.general_utils import build_scaling_rotation
 
-def get_covariance_3d(gaussians, scaling_modifier = 1.0) -> torch.Tensor:
-        """
-        Compute the full 3D covariance matrix for each Gaussian
+# Quantiles recorded for the target evidence fraction distribution. They are
+# consumed by the analytics CSV and reported in the manuscript appendix.
+QUANTILE_LEVELS = [0.05, 0.25, 0.50, 0.75, 0.90, 0.925, 0.95, 0.975, 0.99, 0.999]
+QUANTILE_NAMES = ["p05", "p25", "median", "p75", "p90", "p92_5", "p95", "p97_5", "p99", "p99_9"]
 
-        Returns:
-            torch.Tensor: tensor containing covariance matrices, with shape (N, 3, 3) 
-        """
 
-        # Build the scaled rotation matrix
-        scaling = gaussians.get_scaling
-        rotation = gaussians.get_rotation
-        L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-        
-        # Form the covariance matrix
-        covariance = L @ L.transpose(1, 2) # Shape: (N, 3, 3)
-        return covariance
+def get_covariance_3d(gaussians, scaling_modifier=1.0) -> torch.Tensor:
+    """
+    Compute the full 3D covariance matrix for each Gaussian
+
+    Returns:
+        torch.Tensor: tensor containing covariance matrices, with shape (N, 3, 3)
+    """
+
+    # Build the scaled rotation matrix
+    scaling = gaussians.get_scaling
+    rotation = gaussians.get_rotation
+    L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+
+    # Form the covariance matrix
+    covariance = L @ L.transpose(1, 2)  # Shape: (N, 3, 3)
+    return covariance
+
 
 def get_target_class_id(args, classes_json_path):
     """
@@ -40,23 +47,22 @@ def get_target_class_id(args, classes_json_path):
 
     # Load the detector ID mapping
     with open(classes_json_path, 'r') as f:
-            classes_map = json.load(f)
-            
+        classes_map = json.load(f)
+
     # Invert the stored ID to detector name mapping
     name_to_id = {v: int(k) for k, v in classes_map.items()}
-    
+
     # Resolve the requested detector name
     if args.target_class not in name_to_id:
         raise ValueError(f"Target class {args.target_class} not found in classes.json")
-        
-    target_id = name_to_id[args.target_class]
-    return target_id
+
+    return name_to_id[args.target_class]
 
 
 def get_background_mask_and_confidence(detector_label_mask, confidence_mask, target_id, background_mode, background_confidence):
     """
     Return selected nontarget pixels and their background confidence
-    
+
     background_confidence is the fallback assigned to explicit background pixels
     """
     # Identify pixels outside the target class
@@ -84,17 +90,33 @@ def get_background_mask_and_confidence(detector_label_mask, confidence_mask, tar
     return background_mask, background_confidence_map.clamp(0.0, 1.0)
 
 
-def main(args):
-    # Validate confidence settings
-    if not 0.0 <= args.background_confidence <= 1.0:
-        raise ValueError("background_confidence must be in [0, 1]")
+def _score_summary(scores):
+    """ Summarize the target evidence fraction over supported Gaussians """
+    values = scores.detach().float().cpu()
+    if values.numel() == 0:
+        summary = {"min": None, "mean": None, "std": None, "max": None}
+        summary.update({name: None for name in QUANTILE_NAMES})
+        return summary
 
+    quantiles = torch.quantile(values, torch.tensor(QUANTILE_LEVELS, dtype=values.dtype))
+    summary = {
+        "min": float(values.min().item()),
+        "mean": float(values.mean().item()),
+        "std": float(values.std(unbiased=False).item()),
+        "max": float(values.max().item()),
+    }
+    summary.update(dict(zip(QUANTILE_NAMES, (float(item.item()) for item in quantiles))))
+    return summary
+
+
+def main(args):
     # Define the gaussians
     gaussians = GaussianModel(sh_degree=args.sh_degree, use_labels=True)
     ply_path = os.path.join(args.model_path, "point_cloud", f"iteration_{args.loaded_iter}", "point_cloud.ply")
     gaussians.load_ply(ply_path)
-    
+
     cov3D = get_covariance_3d(gaussians)
+
     # Keep source images on the CPU while Scene builds camera data
     load_images_on_cpu = getattr(args, "data_device", "cuda") == "cpu"
     scene = Scene(args, gaussians, load_iteration=args.loaded_iter, shuffle=False)
@@ -105,7 +127,7 @@ def main(args):
                     setattr(camera, attribute, None)
             camera.data_device = torch.device(args.device)
 
-    # Clear unused CUDA memory
+        # Clear unused CUDA memory
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -116,45 +138,40 @@ def main(args):
     global_target_weights = torch.zeros((total_gaussians,), device=args.device, dtype=torch.float32)
     global_background_weights = torch.zeros((total_gaussians,), device=args.device, dtype=torch.float32)
 
-    # Read stored detector names
+    # Read stored detector names and resolve the requested class
     classes_json_path = os.path.join(args.mask_dir, "classes.json")
     target_id = get_target_class_id(args, classes_json_path)
 
-
     # Iterate through scene cameras to find these views
     train_cameras = scene.getTrainCameras()
-    masked_cameras = [] # Cameras that have a corresponding 2D mask
-    
+    masked_cameras = []  # Cameras that have a corresponding 2D mask
+
     for cam in train_cameras:
         basename = os.path.basename(cam.image_name)
         name_no_ext = os.path.splitext(basename)[0]
         name = f"{name_no_ext}.png"
-        
+
         conf_full_path = os.path.join(args.mask_dir, "confidence", name)
         if os.path.exists(conf_full_path):
             masked_cameras.append((cam, {
                 "semantic": os.path.join("semantic", name),
-                "confidence": os.path.join("confidence", name)
+                "confidence": os.path.join("confidence", name),
             }))
-            
-    # Process the matched camera views
+
     print(f"Matched {len(masked_cameras)} cameras in the scene.")
 
     class_views = 0  # Views where the target class actually appears
 
-
     # Iterate through the matched cameras and accumulate votes for the target class
-    for i, (cam, mask_info) in enumerate(masked_cameras):
-        print(f"\n  Processing View {i+1}/{len(masked_cameras)}: {cam.image_name}")
-
+    for cam, mask_info in masked_cameras:
         # Getting semantic data
         sem_path = os.path.join(args.mask_dir, mask_info["semantic"])
-        semantic_img = cv2.imread(sem_path, cv2.IMREAD_UNCHANGED) # (H, W)
-        
+        semantic_img = cv2.imread(sem_path, cv2.IMREAD_UNCHANGED)  # (H, W)
+
         # Resize semantic mask to match camera dimensions
         if semantic_img.shape[:2] != (cam.image_height, cam.image_width):
             semantic_img = cv2.resize(semantic_img, (cam.image_width, cam.image_height), interpolation=cv2.INTER_NEAREST)
-            
+
         detector_label_mask = torch.tensor(semantic_img, dtype=torch.long, device=args.device)
         semantic_height, semantic_width = semantic_img.shape
 
@@ -167,26 +184,25 @@ def main(args):
             confidence_img = cv2.resize(confidence_img, (cam.image_width, cam.image_height), interpolation=cv2.INTER_NEAREST)
 
         confidence_mask = torch.tensor(confidence_img, dtype=torch.float32, device=args.device)
-        
-    # Normalize stored byte confidence values
+
+        # Normalize stored byte confidence values
         if confidence_mask.max() > 1.0:
             confidence_mask /= 255.0
 
         # Check whether the target detector ID is present in this view
-        target_mask_view = detector_label_mask == target_id
-        has_target = bool(target_mask_view.any().item())
+        has_target = bool((detector_label_mask == target_id).any().item())
         if has_target:
             class_views += 1
         elif args.background_view_policy == "target_views":
             # Empty detector views provide no positive evidence and would let uncertain background dominate the ratio
             continue
 
-        background_mask, background_confidence = (get_background_mask_and_confidence(
-                detector_label_mask,
-                confidence_mask,
-                target_id,
-                args.background_mode,
-                args.background_confidence))
+        background_mask, background_confidence = get_background_mask_and_confidence(
+            detector_label_mask,
+            confidence_mask,
+            target_id,
+            args.background_mode,
+            args.background_confidence)
 
         # Projection of 3D Gaussians into 2D camera space
         projector = GaussianProjector(cam)
@@ -195,12 +211,11 @@ def main(args):
         projection_results = projector.project(gaussians.get_xyz, cov3D)
 
         means2D = projection_results['means2D']
-        cov2D = projection_results['cov2D'] # (M, 2, 2)
-        depths = projection_results['depths'] # (M,)
-        indices = projection_results['indices'] # (M,)
+        cov2D = projection_results['cov2D']  # (M, 2, 2)
+        depths = projection_results['depths']  # (M,)
+        indices = projection_results['indices']  # (M,)
 
-
-        opacities = gaussians.get_opacity[indices] # (M,)
+        opacities = gaussians.get_opacity[indices]  # (M,)
         '''
         Equation 4 but projected in 2D
         Calculate the inverse matrix once per Gaussian instead of once per pixel
@@ -209,19 +224,17 @@ def main(args):
         As it's symmetric, we have only 3 unique values: [[A, B], [B, C]] where A = inv_cov2D[0,0], B = inv_cov2D[0,1], C = inv_cov2D[1,1]
         '''
 
-    # Compute inverse covariance parameters
-
         det = cov2D[:, 0, 0] * cov2D[:, 1, 1] - cov2D[:, 0, 1] * cov2D[:, 0, 1]
         det_inv = 1.0 / det
         conic = torch.stack([
-            cov2D[:, 1, 1] * det_inv,     
-            -cov2D[:, 0, 1] * det_inv,    
-            cov2D[:, 0, 0] * det_inv      
+            cov2D[:, 1, 1] * det_inv,
+            -cov2D[:, 0, 1] * det_inv,
+            cov2D[:, 0, 0] * det_inv
         ], dim=1)
 
         '''
-        A Gaussian theoretically stretches to infinity, but in practice, its energy is negligible after 3 standard deviations. 
-        To find the "width" of the Gaussian, we need the lengths of its major and minor axes. 
+        A Gaussian theoretically stretches to infinity, but in practice, its energy is negligible after 3 standard deviations.
+        To find the "width" of the Gaussian, we need the lengths of its major and minor axes.
         These lengths are the square roots of the covariance eigenvalues
         '''
 
@@ -231,7 +244,7 @@ def main(args):
         sqrt_term = torch.sqrt(discriminant)
         eig1 = 0.5 * (trace + sqrt_term)
         eig2 = 0.5 * (trace - sqrt_term)
-        radius = torch.ceil(3.0 * torch.sqrt(torch.max(eig1, eig2))) # (M,)
+        radius = torch.ceil(3.0 * torch.sqrt(torch.max(eig1, eig2)))  # (M,)
 
         # Sorting the gaussians by depth, before focusing on any tile
         sort_indices = torch.argsort(depths)
@@ -240,8 +253,6 @@ def main(args):
         opacities = opacities[sort_indices]
         radius = radius[sort_indices]
 
-        # Now we save how the original indexes of the Gaussians are ordered after sorting by depth
-        # Keep the original Gaussian indices after depth sorting
         # Keep original indices so tile votes can be restored after depth sorting
         sorted_original_indices = indices[sort_indices]
 
@@ -266,14 +277,14 @@ def main(args):
         # Rasterization:
         BLOCK_SIZE = args.raster_block_size
         grid_columns = (semantic_width + BLOCK_SIZE - 1) // BLOCK_SIZE
-        grid_rows = (semantic_height + BLOCK_SIZE - 1) // BLOCK_SIZE 
-        
+        grid_rows = (semantic_height + BLOCK_SIZE - 1) // BLOCK_SIZE
+
         # Convert the Gaussian's 2D position and size from pixel coordinates to tile coordinates
         grid_min_x = ((means2D[:, 0] - radius).clamp(min=0) / BLOCK_SIZE).int()
         grid_min_y = ((means2D[:, 1] - radius).clamp(min=0) / BLOCK_SIZE).int()
         grid_max_x = ((means2D[:, 0] + radius).clamp(max=semantic_width-1) / BLOCK_SIZE).int()
         grid_max_y = ((means2D[:, 1] + radius).clamp(max=semantic_height-1) / BLOCK_SIZE).int()
-        
+
         # The grid_min and grid_max tensors now represent the bounding tiles for each Gaussian in terms of tile indices
         grid_min = torch.stack([grid_min_x, grid_min_y], dim=1)
         grid_max = torch.stack([grid_max_x, grid_max_y], dim=1)
@@ -287,10 +298,10 @@ def main(args):
 
                 if gaussians_in_tile.shape[0] == 0:
                     continue
-                    
+
                 '''
                 For each overlapping Gaussian, calculate its contribution to the tile pixels
-                This applies the 2D Gaussian formula using precomputed conic parameters and opacities, 
+                This applies the 2D Gaussian formula using precomputed conic parameters and opacities,
                 accumulates pixel blending weights, checks the semantic mask against the target class,
                 and accumulate votes using the original indices
                 '''
@@ -298,7 +309,7 @@ def main(args):
                 tile_means = means2D[gaussians_in_tile]
                 tile_conics = conic[gaussians_in_tile]
                 tile_opacities = opacities[gaussians_in_tile]
-                
+
                 # Obtain the boundaries of the current tile in pixel coordinates
                 pix_min_x = column_tile * BLOCK_SIZE
                 pix_min_y = row_tile * BLOCK_SIZE
@@ -320,14 +331,14 @@ def main(args):
                         [20, 21, 22]])
                 And flat_x will be tensor([20, 21, 22, 20, 21, 22, 20, 21, 22])
                 '''
-                
+
                 # Create a grid of pixel coordinates for the current tile
                 y_range = torch.arange(pix_min_y, pix_max_y, device=args.device)
                 x_range = torch.arange(pix_min_x, pix_max_x, device=args.device)
 
                 # grid_y becomes a 2D grid where every row is identical, grid_x becomes a 2D grid where every column is identical
                 grid_y, grid_x = torch.meshgrid(y_range, x_range, indexing='ij')
-                
+
                 # Write the grid in a whole 1D array to make it easier to compute the Gaussian formula for all pixels in the tile at once
                 flat_y = grid_y.flatten()
                 flat_x = grid_x.flatten()
@@ -342,16 +353,16 @@ def main(args):
 
                 dx = flat_x.unsqueeze(0) - tile_means[:, 0].unsqueeze(1)
                 dy = flat_y.unsqueeze(0) - tile_means[:, 1].unsqueeze(1)
-                
+
                 # This calculates how intense the Gaussian is at those specific distances
                 gaussian_exponent = -0.5 * (tile_conics[:, 0].unsqueeze(1) * dx**2 +
                                 tile_conics[:, 2].unsqueeze(1) * dy**2) - \
                                 tile_conics[:, 1].unsqueeze(1) * dx * dy
-                
+
                 # The opacity of the Gaussian modulates its contributions
                 # alpha shape: (N_Gaussians_in_tile, N_Pixels_in_tile)
                 alpha = tile_opacities.view(-1, 1) * torch.exp(gaussian_exponent.clamp(max=0))
-                
+
                 transmission = 1.0 - alpha
                 accumulated_transmission = torch.cumprod(transmission, dim=0)
 
@@ -360,8 +371,7 @@ def main(args):
                 ones = torch.ones((1, alpha.shape[1]), device=args.device)
 
                 # The rest of the rows are the accumulated transmission of the previous gaussians, which tells us how much light reaches the current layer
-                # Describe Gaussian and pixel dimensions in the tile
-                T = torch.cat([ones, accumulated_transmission[:-1]], dim=0) # (N_Gaussians_in_tile, N_Pixels_in_tile)
+                T = torch.cat([ones, accumulated_transmission[:-1]], dim=0)  # (N_Gaussians_in_tile, N_Pixels_in_tile)
 
                 '''
                 First, alpha is multiplied by the accumulated transmission T to obtain the
@@ -369,7 +379,7 @@ def main(args):
 
                 weights = alpha * T
 
-                weights has shape (N_gaussians_in_tile, N_pixels_in_tile). Each row corresponds to one Gaussian and each column 
+                weights has shape (N_gaussians_in_tile, N_pixels_in_tile). Each row corresponds to one Gaussian and each column
                 to one pixel in the tile, representing each Gaussian contribution
                 '''
 
@@ -380,7 +390,7 @@ def main(args):
 
                 '''
                 The target and background confidences are then applied independently:
-                
+
                 target_confidences = confidence_mask[flat_y, flat_x]
                 background_confidences = background_confidence[flat_y, flat_x]
 
@@ -418,12 +428,10 @@ def main(args):
 
     # Save the global votes and weights for later use in thresholding
     safe_class_name = args.target_class.replace(" ", "_")
-    class_output_dir = os.path.join(
-        args.output_dir, safe_class_name, args.vote_id,
-    )
+    class_output_dir = os.path.join(args.output_dir, safe_class_name, args.vote_id)
     os.makedirs(class_output_dir, exist_ok=True)
     voting_data_path = os.path.join(class_output_dir, f"voting_data_{safe_class_name}.pt")
-    
+
     voting_data = {
         'target_weights': global_target_weights,
         'background_weights': global_background_weights,
@@ -432,54 +440,16 @@ def main(args):
         'target_id': target_id,
         'background_mode': args.background_mode,
         'background_confidence': args.background_confidence,
-
-    # Add background policy metadata
         'background_view_policy': args.background_view_policy,
     }
 
-    # Save statistics if requested
+    # Vote statistics are only written when analytics recording is enabled
     if args.statistics_path:
         evidence = global_target_weights + global_background_weights
         supported = evidence > 0
         scores = torch.zeros_like(evidence)
         scores[supported] = global_target_weights[supported] / evidence[supported]
 
-        def stats(values):
-            values = values.detach().float().cpu()
-            # Prepare quantile levels and values
-            quantile_levels = torch.tensor(
-                [0.05, 0.25, 0.50, 0.75, 0.90, 0.925, 0.95, 0.975, 0.99, 0.999],
-                dtype=values.dtype,
-            )
-            quantiles = (
-                torch.quantile(values, quantile_levels)
-                if values.numel()
-                else torch.empty(10)
-
-    # Complete the quantile tensor
-            )
-            # Return summary statistics
-            return {
-                'min': float(values.min().item()) if values.numel() else None,
-                'mean': float(values.mean().item()) if values.numel() else None,
-                'std': float(values.std(unbiased=False).item()) if values.numel() else None,
-                'p05': float(quantiles[0].item()) if values.numel() else None,
-                'p25': float(quantiles[1].item()) if values.numel() else None,
-                'median': float(quantiles[2].item()) if values.numel() else None,
-                'p75': float(quantiles[3].item()) if values.numel() else None,
-
-    # Add upper quantile fields
-                'p90': float(quantiles[4].item()) if values.numel() else None,
-                'p92_5': float(quantiles[5].item()) if values.numel() else None,
-                'p95': float(quantiles[6].item()) if values.numel() else None,
-                'p97_5': float(quantiles[7].item()) if values.numel() else None,
-                'p99': float(quantiles[8].item()) if values.numel() else None,
-                'p99_9': float(quantiles[9].item()) if values.numel() else None,
-                'max': float(values.max().item()) if values.numel() else None,
-            }
-
-        # Summarize supported target scores
-        score_stats = stats(scores[supported])
         statistics = {
             'num_cameras': len(masked_cameras),
             'num_class_views': class_views,
@@ -487,28 +457,12 @@ def main(args):
             'target_weight_sum': float(global_target_weights.sum().item()),
             'background_weight_sum': float(global_background_weights.sum().item()),
             'supported_gaussians': int(supported.sum().item()),
-
-    # Add score summary fields
-            'target_score_min': score_stats['min'],
-            'target_score_mean': score_stats['mean'],
-            'target_score_std': score_stats['std'],
-            'target_score_max': score_stats['max'],
-            'target_score_p05': score_stats['p05'],
-            'target_score_p25': score_stats['p25'],
-            'target_score_median': score_stats['median'],
-            'target_score_p75': score_stats['p75'],
-
-    # Add final score percentiles
-            'target_score_p90': score_stats['p90'],
-            'target_score_p92_5': score_stats['p92_5'],
-            'target_score_p95': score_stats['p95'],
-            'target_score_p97_5': score_stats['p97_5'],
-            'target_score_p99': score_stats['p99'],
-            'target_score_p99_9': score_stats['p99_9'],
+            **{f'target_score_{name}': value
+               for name, value in _score_summary(scores[supported]).items()},
             'supported_fraction': float(supported.float().mean().item()),
         }
 
-    # Write statistics atomically
+        # Write statistics atomically
         os.makedirs(os.path.dirname(args.statistics_path), exist_ok=True)
         fd, temporary_name = tempfile.mkstemp(
             dir=os.path.dirname(args.statistics_path), suffix=".tmp",
@@ -517,15 +471,13 @@ def main(args):
             with os.fdopen(fd, 'w') as handle:
                 json.dump(statistics, handle, indent=2)
                 handle.write("\n")
-
-    # Flush the statistics file
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(temporary_name, args.statistics_path)
         finally:
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
-    
+
     # Persist the voting data atomically
     fd, temporary_name = tempfile.mkstemp(
         dir=class_output_dir, suffix=".pt.tmp",
@@ -535,8 +487,7 @@ def main(args):
         torch.save(voting_data, temporary_name)
         os.replace(temporary_name, voting_data_path)
     finally:
-
-    # Remove an incomplete vote file
+        # Remove an incomplete vote file
         if os.path.exists(temporary_name):
             os.unlink(temporary_name)
     print(f"Saved voting weights to {voting_data_path}")
@@ -545,18 +496,16 @@ def main(args):
 if __name__ == "__main__":
     parser = ArgumentParser()
 
-    # Model and target configuration
-    parser.add_argument("--model_path", default="../example_data/output/truck_test")
-    parser.add_argument("--sh_degree", type=int, default=3) # Spherical Harmonics degree for the Gaussian model
+    # Model, source data and target configuration
+    parser.add_argument("--model_path", required=True, help="Path to trained 3DGS model output")
+    parser.add_argument("--source_path", required=True, help="Prepared dataset directory used by Scene")
+    parser.add_argument("--mask_dir", required=True, help="Directory containing semantic and confidence masks")
+    parser.add_argument("--output_dir", required=True, help="Directory to save outputs")
+    parser.add_argument("--target_class", required=True, help="Detector name of the segmented class; only one object at a time")
+    parser.add_argument("--sh_degree", type=int, default=3)  # Spherical Harmonics degree for the Gaussian model
     parser.add_argument("--loaded_iter", type=int, default=30000, help="Iteration number to load from the model")
-    parser.add_argument("--target_class", type=str, default="truck", help="Only one object at a time can be segmented. The name must match one of the classes in the YOLO model.")
     parser.add_argument("--vote_id", type=str, default="default", help="Identity of the vote configuration")
-
-    # Paths
-    parser.add_argument("--statistics_path", type=str, default=None)
-    parser.add_argument("--mask_dir", default="./data/2D_mask/02-04_23-18", help="Directory containing semantic and confidence masks")
-    parser.add_argument("--output_dir", default="./data/output/02-04_23-18", help="Directory to save outputs")
-    parser.add_argument("--source_path", type=str, default=None, help="Path to the source directory containing images/colmap data")
+    parser.add_argument("--statistics_path", type=str, default=None, help="Optional JSON path for vote statistics")
 
     # Device configuration and performance
     parser.add_argument("--device", type=str, default="cuda", help="Device to load tensors on")
@@ -576,6 +525,6 @@ if __name__ == "__main__":
         raise ValueError("--raster_block_size must be greater than zero")
     if not 0.0 <= args.background_confidence <= 1.0:
         raise ValueError("--background_confidence must be in [0, 1]")
-    
+
     with torch.no_grad():
         main(args)
