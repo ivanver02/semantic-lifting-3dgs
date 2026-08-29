@@ -7,13 +7,17 @@ import uuid
 from pathlib import Path
 
 
+TRAIN_IMAGE = "tfgivanverdugo/semantic-fusion-gs-train:cuda11.6"
+LIFTING_IMAGE = "tfgivanverdugo/semantic-fusion-fusion:cuda11.6"
+COLMAP_IMAGE = "tfgivanverdugo/semantic-fusion-colmap:3.13.0-cpu"
+
+
 class Runtime:
     """ Run training, lifting scripts and COLMAP through Docker """
 
-    def __init__(self, repo_root, data_root, train_image="tfgivanverdugo/semantic-fusion-gs-train:cuda11.6",
-                 lifting_image="tfgivanverdugo/semantic-fusion-fusion:cuda11.6",
-                 colmap_image="tfgivanverdugo/semantic-fusion-colmap:3.13.0-cpu"):
-
+    def __init__(self, repo_root, data_root,
+                 train_image=TRAIN_IMAGE, lifting_image=LIFTING_IMAGE,
+                 colmap_image=COLMAP_IMAGE):
         """ Store host roots and the three container image names """
         self.repo_root = Path(repo_root).resolve()
         self.data_root = Path(data_root).resolve()
@@ -45,7 +49,7 @@ class Runtime:
         """
         Build a Docker command from an image and its command arguments
 
-        gpu dds the NVIDIA runtime when enabled.
+        gpu adds the NVIDIA runtime when enabled.
         command is the sequence of program arguments that runs inside the container.
         """
 
@@ -58,7 +62,7 @@ class Runtime:
             # Keep files created in mounted directories owned by the host user
             result += ["--user", f"{os.getuid()}:{os.getgid()}"]
 
-            # Set writable cache locations because the repository mount is read only
+        # Writable cache locations because the repository mount is read only
         result += [
             "-e", "HOME=/tmp",
             "-e", "MPLCONFIGDIR=/tmp/matplotlib",
@@ -67,8 +71,6 @@ class Runtime:
             "-v", f"{self.repo_root}:/repo:ro",
             "-v", f"{self.data_root}:/data:rw",
             "-w", "/repo",
-
-    # Add Docker image and working directory
             image,
         ]
 
@@ -106,15 +108,13 @@ class Runtime:
         command = [
             "python", "evaluation/runtime_metrics.py",
             f"--{target_kind}", target,
-
-    # Finish the memory metrics command
             "--metrics-path", mapped_metrics_path,
             "--", *args,
         ]
 
         # Run the target and merge measured peaks
         try:
-            # Never allow a previous interrupted container to provide this run's
+            # Never allow a previous interrupted container to provide this run's values
             metrics_path.unlink(missing_ok=True)
             self._run(self._docker_command(image, gpu, command))
             metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
@@ -122,7 +122,6 @@ class Runtime:
                 ("peak_cuda_memory_bytes", "_stage_peak_cuda_memory_bytes"),
                 ("peak_cuda_memory_reserved_bytes", "_stage_peak_cuda_memory_reserved_bytes"),
             ):
-
                 # Keep the largest value for the stage
                 peak = metrics.get(key)
                 if peak is not None:
@@ -167,7 +166,6 @@ class Runtime:
     def run_colmap(self, arguments):
         """ Run COLMAP in the CPU container with the supplied arguments """
         # COLMAP receives all input and output paths through the shared mounts
-        args = list(arguments)
-        mapped = [self._container_path(str(item)) for item in args]
+        mapped = [self._container_path(str(item)) for item in arguments]
         command = self._docker_command(self.colmap_image, False, ["colmap"] + mapped)
         self._run(command)
