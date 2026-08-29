@@ -55,8 +55,6 @@ class ScannetScene:
         self.scene = scene
         self.scene_root = self.data_root / "validation_data" / scene
         self.scans = self.scene_root / "scans"
-
-    # Store the generated support directory
         self.support_dir = Path(support_dir)
 
     @property
@@ -120,13 +118,11 @@ class ScannetScene:
                 f"Scannet++ GT support is missing: {support_path}. "
                 "Generate the GT 2D masks before loading the scene."
             )
-        
         if not cache_info_path.exists():
             raise FileNotFoundError(
                 f"Scannet++ GT support metadata is missing: {cache_info_path}. "
                 "Regenerate the GT 2D masks with the current pipeline."
             )
-
         if not intrinsics_path.exists():
             raise FileNotFoundError(
                 f"Scannet++ camera intrinsics are missing: {intrinsics_path}. "
@@ -139,13 +135,10 @@ class ScannetScene:
 
         # Load the visibility support data, which indicates which vertices are visible in the rendered views
         support = np.load(support_path)
-        camera_intrinsics = json.loads(intrinsics_path.read_text())
-
-        # Visibility is computed by nvdiffrast from the rendered triangle IDs and stored per mesh vertex
         visible = support["visible_vertices"].astype(bool)
         if visible.shape != (len(vertices),):
             raise ValueError("Scannet++ GT support and semantic mesh use different vertex counts")
-        
+
         return SceneData(
             dataset="scannetpp",
             scene=self.scene,
@@ -154,10 +147,6 @@ class ScannetScene:
             annotated=((dataset_labels >= 0) & (dataset_labels < len(dataset_names))),
             visible=visible,
             classes=CLASSES,
-
-    # Add camera metadata
-            num_images=len(camera_intrinsics),
-            camera_intrinsics=camera_intrinsics,
         )
 
     def prepare_dataset(self, runtime, max_image_size=1600):
@@ -169,7 +158,7 @@ class ScannetScene:
         output = self.prepared_dir
         if ((output / "sparse" / "0" / "cameras.bin").exists() or (output / "sparse" / "0" / "cameras.txt").exists()):
             return output
-        
+
         # Prefer the dataset resized images, but if not available, use the original images
         images = self.scene_root / "dslr" / "resized_images"
         if not images.exists():
@@ -194,24 +183,22 @@ class ScannetScene:
             sparse_zero.mkdir(parents=True, exist_ok=True)
             for item in sparse.iterdir():
                 if item.is_file() and item.suffix in {".bin", ".txt"}:
-                    shutil.move(str(item), str(sparse_zero / item.name)) # shutil.move can move across filesystems
+                    shutil.move(str(item), str(sparse_zero / item.name))  # shutil.move can move across filesystems
         return output
 
-    def generate_gt_masks(self, runtime, output_dir, bands=4, viz=0,
+    def generate_gt_masks(self, runtime, output_dir, bands=4,
                           force=False, resolution=None,
                           mask_version=MASKS_CACHE_VERSION):
         """
         Generate or reuse rasterized Scannet++ GT masks and visibility support
 
         - bands: number of horizontal image bands used to reduce GPU memory
-        - viz: number of optional visualizations to write, to see what the rasterization looks like
         - force: regenerate masks and support data even when completion files exist
         """
 
-        # Reuse masks and support data when both completion markers exist
+        # Reuse masks and support data when all completion markers exist and match the current contract
         cache_info_path = output_dir / "render_metadata.json"
         cache_info = None
-
         if cache_info_path.exists():
             cache_info = json.loads(cache_info_path.read_text())
 
@@ -221,7 +208,7 @@ class ScannetScene:
                 cache_info.get("bands") == bands and
                 cache_info.get("resolution") == resolution and not force):
             return output_dir
-        
+
         # Rasterize the mesh inside the lifting container because nvdiffrast requires CUDA
         runtime.run_lifting_module(
             "evaluation.scannetpp.gt_masks",
@@ -231,11 +218,8 @@ class ScannetScene:
                 "--metadata", str(self.metadata_path),
                 "--output_dir", str(output_dir),
                 "--bands", str(bands),
-
-    # Add mask rendering options
                 "--mask_version", str(mask_version),
                 "--resolution", str(resolution),
-                "--viz", str(viz),
             ] + (["--force"] if force else []),
         )
         return output_dir
