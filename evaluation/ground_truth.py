@@ -11,30 +11,30 @@ from .common import atomic_write_text, ensure_dir
 from . import transfer
 
 
-def _neighborhood_metadata(scene, gaussian_ply, tau, neighborhood_chunk_size, evaluation_scope_version, gaussian_count):
-    """ Describe the neighborhood arrays """
+def _neighborhood_metadata(scene, gaussian_ply, tau, evaluation_scope_version, gaussian_count):
+    """
+    Describe the neighborhood arrays
+
+    The Gaussian model signature (size and mtime) is part of the contract, so a
+    retrained model rebuilds the neighborhoods instead of mixing them.
+    """
     stat = gaussian_ply.stat()
     return {
         "evaluation_scope_version": evaluation_scope_version,
         "dataset": scene.dataset,
         "scene": scene.scene,
-        "vertices": len(scene.vertices),
-        "classes": [item.name for item in scene.classes],
-
-    # Add Gaussian file metadata
         "gaussians": int(gaussian_count),
         "ply_size": int(stat.st_size),
         "ply_mtime_ns": int(stat.st_mtime_ns),
-        "ply_path": str(gaussian_ply.resolve()),
         "tau": float(tau),
-        "neighborhood_chunk_size": int(neighborhood_chunk_size),
     }
 
 
-def _labels_metadata(neighborhood_metadata, min_fraction, mesh_to_gaussian_background_competes, mesh_to_gaussian_transfer):
+def _labels_metadata(neighborhood_metadata, min_fraction,
+                     mesh_to_gaussian_background_competes, mesh_to_gaussian_transfer):
     """ Describe labels derived from neighborhood data """
     return {
-        "neighborhood": neighborhood_metadata,
+        **neighborhood_metadata,
         "min_fraction": float(min_fraction),
         "mesh_to_gaussian_background_competes": bool(
             mesh_to_gaussian_background_competes
@@ -55,13 +55,13 @@ def _needs_rebuild(meta_path, expected, force):
 
 def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_background_competes,
           mesh_to_gaussian_transfer="radius_vote", force=False,
-          neighborhood_chunk_size=None, evaluation_scope_version=6):
+          evaluation_scope_version=6):
     """
     Build or reuse the neighborhoods and the Gaussians GT local semantic labels used for evaluation
 
     - The cache contains both directions of the radius neighborhoods and semantic labels for the Gaussian model
     - The transfer method chooses between radius voting and nearest-neighbor label assignment
-    
+
     mesh_to_gaussian_background_competes controls whether non-target mesh labels
     participate when transferring GT labels from the mesh to Gaussians.
     force makes cached files rebuild even when their metadata matches.
@@ -72,15 +72,9 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
     neighborhood_meta_path = gt_dir / "neighborhood_meta.json"
     labels_meta_path = gt_dir / "labels_meta.json"
 
-    if neighborhood_chunk_size is None:
-        neighborhood_chunk_size = transfer.RADIUS_NEIGHBOR_CHUNK_SIZE
-
     full_xyz, _ = transfer.load_gaussian_ply(gaussian_ply)
     neighborhood_expected = _neighborhood_metadata(
-        scene, gaussian_ply, tau, neighborhood_chunk_size,
-
-    # Add the evaluation scope version
-        evaluation_scope_version, len(full_xyz),
+        scene, gaussian_ply, tau, evaluation_scope_version, len(full_xyz),
     )
     labels_expected = _labels_metadata(
         neighborhood_expected, min_fraction,
@@ -88,8 +82,6 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
     )
     neighborhoods_rebuild = _needs_rebuild(
         neighborhood_meta_path, neighborhood_expected, force,
-
-    # Check the neighborhood cache
     )
     labels_rebuild = neighborhoods_rebuild or _needs_rebuild(
         labels_meta_path, labels_expected, force,
@@ -101,7 +93,7 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
 
     if neighborhoods_rebuild or not gaussians_near_a_vertex_path.exists():
         gaussians_near_a_vertex = transfer.build_radius_neighbors(
-            scene.vertices, cKDTree(full_xyz), tau, neighborhood_chunk_size,
+            scene.vertices, cKDTree(full_xyz), tau,
         )
         transfer.save_neighbors(gaussians_near_a_vertex_path, gaussians_near_a_vertex)
 
@@ -110,7 +102,7 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
 
     if neighborhoods_rebuild or not vertices_near_a_gaussian_path.exists():
         vertices_near_a_gaussian = transfer.build_radius_neighbors(
-            full_xyz, cKDTree(scene.vertices), tau, neighborhood_chunk_size,
+            full_xyz, cKDTree(scene.vertices), tau,
         )
         transfer.save_neighbors(vertices_near_a_gaussian_path, vertices_near_a_gaussian)
 
@@ -132,10 +124,10 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
                 np.ones(len(reference_labels), dtype=np.float64), classes,
                 min_fraction, mesh_to_gaussian_background_competes,
             )
+
+        # Write the label archive atomically
         fd, temporary_name = tempfile.mkstemp(
             dir=gaussian_labels_path.parent, suffix=".npz",
-
-    # Close the temporary label file
         )
         try:
             with os.fdopen(fd, "wb") as temporary:
@@ -144,8 +136,7 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
                 os.fsync(temporary.fileno())
             os.replace(temporary_name, gaussian_labels_path)
         finally:
-
-    # Remove an incomplete label file
+            # Remove an incomplete label file
             if os.path.exists(temporary_name):
                 os.unlink(temporary_name)
 

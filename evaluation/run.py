@@ -11,20 +11,40 @@ import cv2
 import numpy as np
 
 from . import cache, ground_truth, metrics, reporting, transfer
-from .analytics import AnalyticsStore, collect_run_metadata, record_scene_analytics, record_source_analytics, utc_now
-from .common import main_digest, safe_name, target_classes_by_detector, threshold_path, vote_class_dir, vote_id
-from .common import atomic_write_text
+from .analytics import (
+    AnalyticsStore,
+    collect_run_metadata,
+    record_class_inventory,
+    record_source_analytics,
+    utc_now,
+)
+from .common import (
+    atomic_write_text,
+    main_digest,
+    safe_name,
+    target_classes_by_detector,
+    threshold_path,
+    vote_class_dir,
+    vote_id,
+)
 from .runtime import Runtime
-from .state_store import StateStore, unit_id as state_store_unit_id
-
 from .replica.scene import ReplicaScene
 from .scannetpp.scene import MASKS_CACHE_VERSION, ScannetScene
 
 
 DEFAULT_DATA_ROOT = Path("/mnt/hddb/dataTFGIvanVerdugo")
+
+# Protocol values frozen in the manuscript configuration (Table of the
+# experimental design). They are not command line options on purpose: changing
+# them means changing the documented experiment.
+SEQUENCE_NAME = "Sequence_2"
+FRAME_STEP = 5
 REPLICA_VERTEX_LABEL_MIN_FRACTION = 0.6
 REPLICA_VISIBILITY_SLOP = 0.05
 SCANNETPP_MASK_BANDS = 4
+YOLO_CONF = 0.75
+RASTER_BLOCK_SIZE = 16
+
 VARIANT_DEFAULTS = {
     "hysteresis_gamma": 0.8,
     "hysteresis_radius": 0.05,
@@ -63,68 +83,65 @@ def _variant_parameters(args):
     }
 
 
-def _resolve_variant(args, output_root, dry_run=False):
-    """ Validate a readable variant label against its persisted configuration """
-    expected = "v" + main_digest(_variant_parameters(args))
-    if args.variant is None:
-        return expected
-    if args.variant == expected:
+def _resolve_variant(args):
+    """
+    Resolve the result variant label
+
+    A readable label such as frozen_g0_8 can be passed explicitly, otherwise
+    the configuration digest identifies the variant on its own.
+    """
+    if args.variant is not None:
         return args.variant
-    config = _variant_parameters(args)
-    path = output_root / "variant_config.json"
+    return "v" + main_digest(_variant_parameters(args))
 
-    # Validate the saved variant settings
-    record = {"variants": {}}
-    if path.exists():
-        try:
-            record = json.loads(path.read_text(encoding="utf-8"))
-            record.setdefault("variants", {})
-        except (OSError, ValueError) as error:
-            raise RuntimeError(f"invalid variant configuration: {path}") from error
-    previous = record["variants"].get(args.variant)
-
-    # Return the selected variant
-    if previous is not None and previous != config:
-        raise ValueError(
-            f"--variant {args.variant!r} does not match the received flags, "
-            f"expected {expected!r}"
-        )
-    if previous is None and not dry_run:
-        record["variants"][args.variant] = config
-        atomic_write_text(path, json.dumps(record, indent=2, sort_keys=True) + "\n")
-
-    # Use empty memory values without a runtime
-    return args.variant
 
 def _progress(message):
     """ Print a progress message immediately, even when stdout is buffered """
     print(f"progress: {message}", flush=True)
 
 
-def _measure_stage(stage_records, name, function, cache_mode="miss", runtime=None):
+def _artifact_stamp(path):
+    """
+    Identify the current state of a stage artifact.
+
+    A stage that reuses its output leaves the file alone, so an unchanged stamp
+    across the call means the work came from the cache. Reading the state
+    instead of restating each reuse condition keeps the label and the caching
+    rule from drifting apart, and it is the only thing that works for the
+    stages whose real work happens inside a container and returns nothing.
+    """
+    try:
+        status = path.stat()
+    except OSError:
+        return None
+    return status.st_mtime_ns, status.st_size, status.st_ino
+
+
+def _measure_stage(stage_records, name, function, artifact=None, runtime=None):
     """ Run one stage and retain elapsed time plus container CUDA peak memory """
     if runtime is not None:
         runtime.begin_stage()
+    before = _artifact_stamp(artifact) if artifact is not None else None
     started = time.perf_counter()
     try:
         return function()
     finally:
         memory = runtime.end_stage() if runtime is not None else {
-
-    # Add measured memory fields
             "allocated": None,
             "reserved": None,
         }
+        after = _artifact_stamp(artifact) if artifact is not None else None
         stage_records.append({
             "stage": name,
-            "cache_mode": cache_mode,
+            "cache_mode": (
+                "hit" if before is not None and after == before else "miss"
+            ),
             "container_count": None,
             "elapsed_seconds": time.perf_counter() - started,
-
-    # Set the experiment help text
             "peak_cuda_memory_bytes": memory["allocated"],
             "peak_cuda_memory_reserved_bytes": memory["reserved"],
         })
+
 
 def _parser():
     """ Build the parser for the evaluation workflow """
@@ -140,46 +157,20 @@ def _parser():
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--variant", default=None,
                         help="Result variant identity, defaults to a configuration digest")
-    parser.add_argument("--state-store", type=Path, default=None,
-                        help="Optional experiment state store used for resumability")
-    parser.add_argument("--experiment", default=None,
-
-    # Set the reuse source help text
-                        help="Experiment name stored in the resumability state store")
-    parser.add_argument("--retry-failed", action="store_true",
-                        help="Retry state store units previously marked failed")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the source plan without initializing evaluation")
     parser.add_argument("--model-root", type=Path, default=None, help="Gaussian model directory to reuse, if exists")
 
-    # Select the source of the 2D masks and the container images that produce them
+    # Select the source of the 2D masks
     parser.add_argument("--mask-source", choices=["yolo", "gt2d", "both"], default="yolo")
     parser.add_argument("--split", choices=["train", "validation", "test"], default="validation")
-    parser.add_argument("--train-image", default="tfgivanverdugo/semantic-fusion-gs-train:cuda11.6")
-    parser.add_argument("--lifting-image", default="tfgivanverdugo/semantic-fusion-fusion:cuda11.6")
-    parser.add_argument("--colmap-image", default="tfgivanverdugo/semantic-fusion-colmap:3.13.0-cpu")
-
-    # Configure dataset preparation and Gaussian training
-    parser.add_argument("--sequence-name", default="Sequence_2")
-    parser.add_argument("--frame-step", type=int, default=5)
-    parser.add_argument("--replica-vertex-label-min-fraction", type=float,
-                        default=REPLICA_VERTEX_LABEL_MIN_FRACTION)
-    parser.add_argument("--replica-visibility-slop", type=float,
-                        default=REPLICA_VISIBILITY_SLOP)
-    parser.add_argument("--scannetpp-mask-version", type=int,
-                        default=MASKS_CACHE_VERSION)
-
-    # Set the background mode default
-    parser.add_argument("--scannetpp-mask-bands", type=int,
-                        default=SCANNETPP_MASK_BANDS)
     parser.add_argument("--iterations", type=int, default=30000)
     parser.add_argument("--resolution", type=int, default=None,
         help="training image scale: 1 is original, 2 is half width and height")
     parser.add_argument("--train-data-device", choices=["cuda", "cpu"], default=None)
     parser.add_argument("--vote-data-device", choices=["cuda", "cpu"], default="cpu")
 
-    # Configure mask generation, vote accumulation and threshold selection
-    parser.add_argument("--yolo-conf", type=float, default=0.75)
+    # Configure threshold selection and transfer
     parser.add_argument("--hysteresis-gamma", type=float,
                         default=VARIANT_DEFAULTS["hysteresis_gamma"])
     parser.add_argument("--hysteresis-radius", type=float,
@@ -187,8 +178,6 @@ def _parser():
     parser.add_argument(
         "--background-mode",
         choices=["all_non_target", "explicit_background", "confidence_weighted"],
-
-    # Set the background view policy default
         default=VARIANT_DEFAULTS["background_mode"],
         help="How 2D non-target evidence is constructed",
     )
@@ -197,15 +186,11 @@ def _parser():
         help="Confidence assigned to pixels with semantic label zero")
     parser.add_argument(
         "--background-view-policy", choices=["target_views", "all_views"],
-
-    # Set the Gaussian transfer option
         default=VARIANT_DEFAULTS["background_view_policy"],
         help="Use only views containing target pixels or every matched view",
     )
     parser.add_argument("--betas", nargs="+", type=float, required=True,
         help="Beta values to evaluate for every target class")
-
-    # Configure transfer methods, background competition and prediction weighting
     parser.add_argument("--tau", type=float, default=VARIANT_DEFAULTS["tau"])
     parser.add_argument("--min-fraction", type=float, default=VARIANT_DEFAULTS["min_fraction"])
     parser.add_argument(
@@ -214,23 +199,20 @@ def _parser():
         default=VARIANT_DEFAULTS["mesh_to_gaussian_transfer"],
     )
     parser.add_argument(
-
-    # Finish the background competition option
         "--gaussian-to-mesh-transfer",
         choices=["radius_vote", "nearest_neighbor_label"],
         default=VARIANT_DEFAULTS["gaussian_to_mesh_transfer"],
     )
-    # Configure opacity and background competition
     parser.add_argument("--min-opacity", type=float,
                         default=VARIANT_DEFAULTS["min_opacity"])
+
+    # Background competition and opacity weighting switches used by ablations
     parser.add_argument(
         "--gaussian-to-mesh-background-competes",
         dest="gaussian_to_mesh_background_competes",
         action="store_true",
         default=VARIANT_DEFAULTS["gaussian_to_mesh_background_competes"],
         help="Include background votes in predicted mesh labels",
-
-    # Set the mesh transfer option
     )
     parser.add_argument(
         "--no-gaussian-to-mesh-background-competes",
@@ -239,8 +221,6 @@ def _parser():
         help="Disable background competition in predicted mesh labels",
     )
     parser.add_argument(
-
-    # Set the transfer cache help text
         "--mesh-to-gaussian-background-competes",
         dest="mesh_to_gaussian_background_competes", action="store_true",
         default=VARIANT_DEFAULTS["mesh_to_gaussian_background_competes"],
@@ -249,43 +229,25 @@ def _parser():
     parser.add_argument("--no-mesh-to-gaussian-background-competes", dest="mesh_to_gaussian_background_competes", action="store_false",
         help="Do not use background votes when assigning GT labels to Gaussians")
     parser.add_argument("--no-opacity-weighting", action="store_true")
-    parser.add_argument("--raster-block-size", type=int, default=16)
 
     # Rebuild cached data instead of reusing files from an earlier run
     parser.add_argument("--force", action="store_true")
-    parser.add_argument("--force-masks", action="store_true", help="Rebuild only the requested mask artifacts")
-    parser.add_argument("--force-votes", action="store_true", help="Rebuild only the matching vote artifact")
-    parser.add_argument("--force-thresholds", action="store_true", help="Rebuild only the matching threshold artifacts")
-    parser.add_argument("--force-transfer", action="store_true", help="Rebuild only the ground-truth transfer artifact")
     parser.add_argument("--save_results_to_csv", action="store_true", default=False,
         help="Append validation results and summaries to dataTFGIvanVerdugo/analytics")
+
+    # Frozen protocol values; they are part of the documented experiment and
+    # therefore not exposed as options
+    parser.set_defaults(
+        sequence_name=SEQUENCE_NAME,
+        frame_step=FRAME_STEP,
+        replica_vertex_label_min_fraction=REPLICA_VERTEX_LABEL_MIN_FRACTION,
+        replica_visibility_slop=REPLICA_VISIBILITY_SLOP,
+        scannetpp_mask_version=MASKS_CACHE_VERSION,
+        scannetpp_mask_bands=SCANNETPP_MASK_BANDS,
+        yolo_conf=YOLO_CONF,
+        raster_block_size=RASTER_BLOCK_SIZE,
+    )
     return parser
-
-
-def _force_any(args):
-    """ Whether this invocation intentionally invalidates a stage cache """
-    return any(getattr(args, name, False) for name in (
-        "force", "force_masks", "force_votes", "force_thresholds",
-        "force_transfer",
-    ))
-
-
-def _make_scene(args, data_root, support_dir):
-    """
-    Create a scene instance based on the dataset type and provided arguments
-
-    The returned instance loads the dataset specific mesh, labels and visibility
-    information into the common scene representation
-    """
-    
-    if args.dataset == "replica":
-        return ReplicaScene(
-            data_root, args.scene, args.sequence_name, args.frame_step, seed=3,
-            vertex_label_min_fraction=args.replica_vertex_label_min_fraction,
-            visibility_slop=args.replica_visibility_slop,
-        )
-    elif args.dataset == "scannetpp":
-        return ScannetScene(data_root, args.scene, support_dir)
 
 
 def _source_names(mask_source):
@@ -295,51 +257,12 @@ def _source_names(mask_source):
     return [mask_source]
 
 
-def _pending_sources(output_root, mask_source, force, variant, state_store=None,
-                     dataset=None, scene=None, experiment=None, parameters=None,
-                     retry_failed=False, vote_identifier=None):
-    """ Return sources not marked done in the state store """
-    pending = []
-    for source in _source_names(mask_source):
-        identifier = (
-            state_store_unit_id(experiment, dataset, scene, variant)
-            if state_store is not None else None
-        )
-        result_path = output_root / "results" / variant / f"results_{source}.json"
-
-    # Add incomplete sources
-        fingerprint = (
-            main_digest(parameters, length=16) if parameters is not None else None
-        )
-        required_metadata = [
-            output_root / "meta_dataset.json",
-            output_root / "meta_masks_gt2d.json",
-            output_root / "meta_gt.json",
-            output_root / f"meta_votes_{source}_{vote_identifier}.json",
-
-    # Read the previous beta list
-        ] if parameters is not None else []
-        if source == "yolo":
-            required_metadata.append(output_root / "meta_masks_yolo.json")
-        complete_metadata = all(path.exists() for path in required_metadata)
-        state = state_store.state(identifier) if state_store is not None else None
-        source_done = (
-            state_store.is_source_done(identifier, source, fingerprint)
-            if state_store is not None else False
-
-    # Continue the class example
-        )
-        if (state_store is not None and state == "failed" and not retry_failed and
-                not force):
-            print(f"skip: {source}: state store unit {identifier} is failed, use --retry-failed")
-        elif (state_store is not None and source_done and
-                result_path.exists() and complete_metadata and not force):
-            print(f"skip: {source}: state store unit {identifier} is done")
-        else:
-
-    # Complete the replica mask command
-            pending.append(source)
-    return pending
+def _pending_sources(results_dir, sources, force):
+    """ Return sources whose result JSON does not exist yet """
+    return [
+        source for source in sources
+        if force or not (results_dir / f"results_{source}.json").exists()
+    ]
 
 
 def _validate_existing_beta_grids(results_dir, sources, betas, force):
@@ -351,8 +274,6 @@ def _validate_existing_beta_grids(results_dir, sources, betas, force):
         if not path.exists():
             continue
         previous = json.loads(path.read_text())
-
-    # Complete the YOLO command
         previous_betas = previous.get("parameters", {}).get("betas")
         if previous_betas != list(betas):
             raise RuntimeError(
@@ -366,21 +287,12 @@ def _mask_classes(mask_dir, classes):
     """Select target class records present in a generated mask directory.
 
     classes is the collection of TargetClassInfo supported by the scene.
-    classes.json can look like this:
+    classes.json maps stored detector IDs to detector names:
 
     {
-    "73": "refrigerator",
-    "63": "tv",
-    "59": "potted plant",
-    "57": "chair",
-    "18": "horse",
-    "55": "donut",
-    "58": "couch",
-
-    # Add the reference export script
-    "61": "dining table",
-    "65": "mouse"
-}
+        "73": "refrigerator",
+        "63": "tv"
+    }
 
     The returned list contains only records whose detector name appears in the
     mask metadata.
@@ -389,13 +301,11 @@ def _mask_classes(mask_dir, classes):
     if not classes_path.exists():
         raise FileNotFoundError(f"mask class metadata not found: {classes_path}")
 
-        # Read detector names from classes json
+    # Read detector names from classes json
     names = set(json.loads(classes_path.read_text()).values())
 
-            # Map detector names to main class records
+    # Map detector names to main class records and keep only supported classes
     mapping = target_classes_by_detector(classes)
-
-    # Keep only supported classes
     selected = []
     for name in sorted(names):
         spec = mapping.get(name)
@@ -413,8 +323,6 @@ def _classes_with_gt2d_views(mask_dir, classes):
             present_ids.update(np.unique(semantic).tolist())
     return [
         spec for spec in classes
-
-    # Finish the vote reuse check
         if spec.detector_stored_id in present_ids
     ]
 
@@ -425,7 +333,7 @@ def _prepare_scene(args, scene, runtime, dataset_dir):
     if args.dataset == "replica":
         return scene.prepare_dataset(dataset_dir)
 
-        # Scannet++ prepares its COLMAP model in the container
+    # Scannet++ prepares its COLMAP model in the container
     elif args.dataset == "scannetpp":
         return scene.prepare_dataset(runtime)
 
@@ -438,7 +346,7 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
     """
 
     # Replica can generate its actual GT masks directly from the semantic image sequence
-    force = args.force or args.force_masks
+    force = args.force
     if args.dataset == "replica":
         runtime.run_lifting_module(
             "evaluation.replica.gt_masks",
@@ -446,8 +354,6 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
                 "--data_root", str(scene.data_root),
                 "--scene", scene.scene,
                 "--sequence_name", scene.sequence.name,
-
-    # Add the source dataset arguments
                 "--frame_step", str(scene.frame_step),
                 "--vertex_label_min_fraction", str(scene.vertex_label_min_fraction),
                 "--visibility_slop", str(scene.visibility_slop),
@@ -456,7 +362,7 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
             ] + (["--force"] if force else []),
         )
 
-            # Scannet++ renders its masks from the mesh through the lifting container, they will be considered our "GT"
+    # Scannet++ renders its masks from the mesh through the lifting container, they will be considered our "GT"
     elif args.dataset == "scannetpp":
         scene.generate_gt_masks(
             runtime, output_dir, bands=args.scannetpp_mask_bands, force=force,
@@ -467,20 +373,18 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
 def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
     """ Generate or reuse YOLO masks for the prepared dataset images """
     # The classes file says whether the mask directory exists
-    if (output_dir / "classes.json").exists() and not (args.force or args.force_masks):
+    if (output_dir / "classes.json").exists() and not args.force:
         return
 
     # Run the detector in the lifting container
     runtime.run_lifting(
-            "segmentation/generate_mask.py",
+        "segmentation/generate_mask.py",
         [
             "--images_dir", str(dataset_dir / "images"),
             "--output_root", str(output_dir),
             "--model", str(runtime.repo_root / "yolo26x-seg.pt"),
             "--conf", str(args.yolo_conf),
         ],
-
-    # Add optional statistics arguments
     )
 
 
@@ -494,18 +398,14 @@ def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
     if not class_specs:
         return
     runtime.run_lifting(
-
-    # Run the vote command
         "segmentation/export_gt_gaussians.py",
         [
             "--model_path", str(model_dir),
-             "--gt_labels_path", str(gt_dir / "gt_gaussian_labels.npz"),
+            "--gt_labels_path", str(gt_dir / "gt_gaussian_labels.npz"),
             "--output_dir", str(segmentation_dir),
             "--loaded_iter", str(args.iterations),
         ] + sum((["--class_spec", item] for item in class_specs), []),
     )
-
-    # Return the number of launches
 
 
 def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
@@ -521,22 +421,20 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
     """
     launched = 0
     for spec in classes:
-        # Each selected main class, identified here by its detector name
-        # name receives its own vote directory and cache file
+        # Each selected main class, identified here by its detector name,
+        # receives its own vote directory and cache file
         vote_identifier = vote_identifier or vote_id(vars(args))
         class_dir = vote_class_dir(segmentation_dir, spec, vote_identifier)
         safe = safe_name(spec.name_by_detector)
         vote_path = class_dir / f"voting_data_{safe}.pt"
         statistics_path = class_dir / "vote_statistics.json"
         if (vote_path.exists() and
-                not (args.force or args.force_votes) and
+                not args.force and
                 (not save_statistics or statistics_path.exists())):
-
-    # Add threshold command arguments
             continue
 
         # Accumulate votes for this main class using masks whose pixels contain
-                        # stored detector IDs
+        # stored detector IDs
         command = [
             "--model_path", str(model_dir),
             "--mask_dir", str(mask_dir),
@@ -545,8 +443,6 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
             "--target_class", spec.name_by_detector,
             "--loaded_iter", str(args.iterations),
             "--raster_block_size", str(args.raster_block_size),
-
-    # Add each class specification
             "--source_path", str(dataset_dir),
             "--data_device", str(args.vote_data_device),
         ]
@@ -556,7 +452,6 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
                 str(statistics_path),
             ]
 
-    # Append the threshold force flag
         runtime.run_lifting(
             "segmentation/accumulate_votes.py", command + [
                 "--background_mode", str(args.background_mode),
@@ -566,7 +461,6 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
         )
         launched += 1
 
-    # Iterate over evaluation classes
     return launched
 
 
@@ -575,7 +469,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     """
     Create labeled Gaussian files for every class and beta value
 
-    The returned tuple contains the beta values used and container count
+    The returned tuple contains the beta values used and container count.
     Existing labeled files are hit unless args.force is true.
     """
 
@@ -591,18 +485,14 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
         if not vote_path.exists():
             continue
         if any(not threshold_path(
-
-    # Resolve the threshold path
                 segmentation_dir, spec, vote_identifier,
                 args.hysteresis_gamma, args.hysteresis_radius, beta,
-        ).exists() for beta in betas) or args.force or args.force_thresholds:
+        ).exists() for beta in betas) or args.force:
             pending.append((spec, vote_path))
     if not pending:
         return betas, 0
     command = [
         "--model_path", str(model_dir),
-
-    # Store the relative score
         "--output_dir", str(segmentation_dir),
         "--cache_dir", str(segmentation_dir),
         "--beta", *[str(beta) for beta in betas],
@@ -612,8 +502,6 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     ]
     for spec, vote_path in pending:
         command += [
-
-    # Finish the beta progress message
             "--class_spec", json.dumps({
                 "target_class": spec.name_by_detector,
                 "voting_data_path": str(vote_path),
@@ -623,8 +511,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
             }, separators=(",", ":")),
         ]
 
-    # Add result parameters
-    if args.force or args.force_thresholds:
+    if args.force:
         command.append("--force")
     runtime.run_lifting("segmentation/threshold_labels.py", command)
     return betas, 1
@@ -639,7 +526,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                        variant,
                        segmentation_dir, betas, results_dir, source):
     """
-    Evaluate one mask source and write its JSON and markdown results
+    Evaluate one mask source and write its JSON results
 
     betas is the beta threshold grid
     """
@@ -653,31 +540,14 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
     )
     available_names = {spec.name for spec in available_classes}
 
-    # Add per class results
-    for class_index, spec in enumerate(classes, start=1):
-        class_started = time.perf_counter()
-        _progress(
-            f"{source}: class {class_index}/{len(classes)} "
-            f"'{spec.name}' - calculating GT transfer"
-        )
-
+    for spec in classes:
         ground_truth_transfer_metrics = ground_truth_transfer_by_class[spec.name]
-        _progress(
-            f"{source}: class '{spec.name}' GT transfer ready "
-            f"({time.perf_counter() - class_started:.1f}s)"
-        )
 
         sweep = {}
         for beta_index, beta in enumerate(betas, start=1):
-            beta_started = time.perf_counter()
-            _progress(
-                f"{source}: class '{spec.name}' beta "
-                f"{beta_index}/{len(betas)} ({beta}) - evaluating"
-            )
 
             # A missing labeled file represents an empty prediction for this
-            # class and beta, so its Ground Truth instances still contribute
-            # Ground truth instances still contribute false negatives
+            # class and beta, so its Ground Truth instances still contribute to false negatives
             path = threshold_path(
                 segmentation_dir, spec, vote_identifier,
                 args.hysteresis_gamma, args.hysteresis_radius, beta,
@@ -698,7 +568,6 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                 args.gaussian_to_mesh_transfer, ground_truth_transfer_metrics,
             )
 
-    # Validate the minimum fraction
             score = result["iou"]["iou"]
             sweep[str(beta)] = {
                 "beta": beta,
@@ -707,24 +576,11 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                 "relative_iou": (
                     result["iou"]["iou"] /
                     result["ground_truth_transfer_iou"]["iou"]
-
-    # Collect run metadata inputs
                     if result["ground_truth_transfer_iou"]["iou"] else 0.0
                 ),
                 "score": score,
             }
             per_class_by_beta.setdefault(str(beta), {})[spec.name] = result
-            _progress(
-                f"{source}: class '{spec.name}' beta {beta} ready "
-                f"(IoU={score:.4f}, {time.perf_counter() - beta_started:.1f}s)"
-
-    # Select pending sources
-            )
-
-        _progress(
-            f"{source}: class '{spec.name}' finished "
-            f"({time.perf_counter() - class_started:.1f}s)"
-        )
 
         # Store the complete beta sweep for this class
         per_class[spec.name] = {
@@ -738,7 +594,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         for beta, beta_classes in per_class_by_beta.items()
     }
 
-    # Save the scene name, evaluation masks, parameters and metrics to JSON and markdown
+    # Save the scene name, evaluation masks, parameters and metrics to JSON
     result = {
         "dataset": scene.dataset,
         "scene": scene.scene,
@@ -747,8 +603,6 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         "support": {
             "vertices_evaluated": int(scene.evaluation_mask.sum()),
         },
-
-    # Return dry run details
         "parameters": {
             "hysteresis_gamma": args.hysteresis_gamma,
             "hysteresis_radius": args.hysteresis_radius,
@@ -757,8 +611,6 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             "background_view_policy": args.background_view_policy,
             "betas": betas,
             "tau": args.tau,
-
-    # Stop when no sources are pending
             "min_fraction": args.min_fraction,
             "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
             "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
@@ -767,8 +619,6 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
         },
         "metrics_by_beta": metrics_by_beta,
-
-    # Initialize state store unit storage
         "per_class": per_class,
     }
     reporting.write_result(results_dir, result)
@@ -783,42 +633,25 @@ def main():
     """ Run preparation, mask generation, voting, thresholding and evaluation """
     args = _parser().parse_args()
 
-    # Validate confidence and threshold ranges
-    if not 0.0 <= args.background_confidence <= 1.0:
-        raise ValueError("--background-confidence must be in [0, 1]")
-    
+    # Validate the operating point ranges used by the host side calculations
     if any(beta < 0.0 or beta > 1.0 for beta in args.betas):
         raise ValueError("all --betas must be in [0, 1]")
-    
-    if args.frame_step <= 0:
-        raise ValueError("--frame-step must be greater than zero")
-    
     if args.tau <= 0:
         raise ValueError("--tau must be greater than zero")
-
-    # Measure dataset preparation
     if not 0.0 <= args.min_fraction <= 1.0:
         raise ValueError("--min-fraction must be in [0, 1]")
-    
     if args.hysteresis_gamma < 0.0:
         raise ValueError("--hysteresis-gamma must be non-negative")
-
-    # Validate hysteresis radius
     if args.hysteresis_radius <= 0.0:
         raise ValueError("--hysteresis-radius must be greater than zero")
 
-    # Validate raster settings
-    if args.raster_block_size <= 0:
-        raise ValueError("--raster-block-size must be greater than zero")
-
-    # Resolve the data root directory
+    # Resolve the data root and output root directories
     data_root = (
         args.data_root
         if args.data_root is not None
         else DEFAULT_DATA_ROOT / args.dataset
     ).resolve()
 
-    # Resolve the output root directory
     output_root = (
         args.output_root
         if args.output_root is not None
@@ -831,136 +664,86 @@ def main():
     except ValueError:
         raise ValueError("--output-root must be inside --data-root")
 
-    run_id = str(uuid.uuid4())
-    analytics_store = (
-        AnalyticsStore(data_root.parent / "analytics")
-        if args.save_results_to_csv else None
-    )
-    run_metadata = {}
-    if analytics_store is not None:
-        run_metadata = collect_run_metadata(
-
-    # Measure YOLO mask generation
-            args.repo_root,
-            args.repo_root / "yolo26x-seg.pt",
-            [args.train_image, args.lifting_image, args.colmap_image],
-            sys.argv,
-            analytics_store.root.parent / ".run_metadata_cache",
-        )
-
-    # Prepare paths for several outputs
-    dataset_dir = output_root / "dataset"
-    model_dir = output_root / "model"
-    masks_gt = output_root / "masks_gt2d"
-    masks_yolo = output_root / "masks_yolo"
-    segmentation_root = output_root / "segmentation"
-    gt_dir = output_root / "gt"
-    results_dir = output_root / "results"
-
     # Resolve training defaults before checking existing reports
     if args.resolution is None:
         args.resolution = 2 if args.dataset == "scannetpp" else 1
     if args.train_data_device is None:
         args.train_data_device = "cpu" if args.dataset == "scannetpp" else "cuda"
-    variant = _resolve_variant(args, output_root, args.dry_run)
-    results_dir = results_dir / variant
+
+    variant = _resolve_variant(args)
+    results_dir = output_root / "results" / variant
     parameters = cache.run_parameters(args, data_root)
     vote_identifier = vote_id(parameters)
-
-    # Pass training settings
-    experiment = args.experiment or args.split
-    state_store = (
-        StateStore(args.state_store, read_only=args.dry_run)
-        if args.state_store is not None else None
-    )
+    requested_sources = _source_names(args.mask_source)
     _validate_existing_beta_grids(
-        results_dir, _source_names(args.mask_source), args.betas, _force_any(args),
+        results_dir, requested_sources, args.betas, args.force,
     )
 
-
-    # Resolve pending source units
-    pending_sources = _pending_sources(
-        output_root, args.mask_source, _force_any(args), variant, state_store,
-        args.dataset, args.scene, experiment, parameters,
-        args.retry_failed,
-        vote_identifier,
-    )
+    # Decide which mask sources still need a run
+    pending_sources = _pending_sources(results_dir, requested_sources, args.force)
     if args.dry_run:
-        requested = _source_names(args.mask_source)
-
-    # Record run scene fields
-        skipped = [source for source in requested if source not in pending_sources]
+        skipped = [source for source in requested_sources if source not in pending_sources]
         print(json.dumps({"run": False, "pending": pending_sources, "skipped": skipped}))
         return
-    
-    if not pending_sources:
-        cache.prepare_run_metadata(
-            output_root, parameters, False, pending_sources, variant,
-        )
-        print("skip: All requested state store units are complete or awaiting retry")
 
-    # Record run parameters
+    if not pending_sources:
+        print("skip: All requested sources already have results")
         return
-    args.mask_source = (
-        pending_sources[0] if len(pending_sources) == 1 else "both"
+
+    run_id = str(uuid.uuid4())
+    analytics_store = (
+        AnalyticsStore(data_root.parent / "analytics")
+        if args.save_results_to_csv else None
     )
-    parameters = cache.run_parameters(args, data_root)
-    vote_identifier = vote_id(parameters)
+    run_metadata = (
+        collect_run_metadata(args.repo_root, sys.argv)
+        if analytics_store is not None else {}
+    )
     run_started = time.perf_counter()
     stage_records = []
 
-    # Pass the transfer method
-    state_store_unit = None
-    if state_store is not None:
-        state_store_unit = state_store_unit_id(
-            experiment, args.dataset, args.scene, variant,
-        )
-        state_store.begin(
-            state_store_unit, experiment, args.dataset, args.scene, variant, run_id,
-            parameters_fingerprint=main_digest(parameters, length=16),
-            sources=pending_sources,
-        )
-
-    # Initialize the Docker runtime
-    runtime = Runtime(
-        args.repo_root, data_root, args.train_image,
-        args.lifting_image, args.colmap_image,
-    )
-
-    # Create the selected dataset scene
+    # Initialize the Docker runtime and create the selected dataset scene
+    runtime = Runtime(args.repo_root, data_root)
+    masks_gt = output_root / "masks_gt2d"
     scene_instance = _make_scene(args, data_root, masks_gt)
 
-    # Prepare metadata and reuse caches within this output root
-    cache.prepare_run_metadata(
-        output_root, parameters, _force_any(args), pending_sources, variant,
-        force_delete=args.force,
+    # Prepare metadata contracts and reuse caches within this output root
+    cache.prepare_run_metadata(output_root, parameters, args.force, pending_sources)
+
+    # Replica writes its COLMAP model into the run directory, while Scannet++ ignores it and keeps an undistorted one beside the scene
+    # Therefore, the artifact of dataset preparation does not live in the same place for the two
+    dataset_dir = output_root / "dataset"
+    prepared_root = (
+        dataset_dir if args.dataset == "replica" else scene_instance.prepared_dir
     )
     dataset_dir = _measure_stage(
-
-    # Set the vote stage runtime
         stage_records, "prepare_dataset",
         lambda: _prepare_scene(args, scene_instance, runtime, dataset_dir),
+        artifact=prepared_root / "sparse" / "0",
         runtime=runtime,
     )
     model_dir = cache.resolve_model_dir(args, data_root, output_root)
 
-    # Generate reference masks
+    # Generate reference masks: they are always produced or hit because they define which instances are observable and therefore evaluable
     _measure_stage(
         stage_records, "generate_gt_masks",
         lambda: _generate_gt_masks(args, scene_instance, runtime, masks_gt),
+        artifact=masks_gt / "classes.json",
         runtime=runtime,
     )
-    if args.mask_source in {"yolo", "both"}:
+    if "yolo" in pending_sources:
+        masks_yolo = output_root / "masks_yolo"
         _measure_stage(
-
-    # Set the threshold stage runtime
             stage_records, "generate_yolo_masks",
             lambda: _generate_yolo_masks(args, runtime, dataset_dir, masks_yolo),
+            artifact=masks_yolo / "classes.json",
             runtime=runtime,
         )
 
     # Load scene data and train when no model exists
     scene = scene_instance.load_data()
+    if analytics_store is not None:
+        record_class_inventory(analytics_store, scene, f"{scene.dataset}:{scene.scene}")
     evaluation_classes = _classes_with_gt2d_views(masks_gt, scene.classes)
     model_ply = model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply"
     if not model_ply.exists():
@@ -968,8 +751,6 @@ def main():
             stage_records, "train_gaussians",
             lambda: runtime.run_train(
                 dataset_dir, model_dir, args.iterations,
-
-    # Set the evaluation stage runtime
                 args.resolution, args.train_data_device,
             ),
             runtime=runtime,
@@ -978,57 +759,22 @@ def main():
         raise FileNotFoundError(f"trained Gaussian model missing: {model_ply}")
 
     # Build or reuse transfer neighborhoods and labels
+    segmentation_root = output_root / "segmentation"
+    gt_dir = output_root / "gt"
     gaussians_near_a_vertex, gaussian_labels = _measure_stage(
         stage_records, "ground_truth_transfer",
         lambda: ground_truth.build(
             scene, model_ply, gt_dir, args.tau, args.min_fraction,
             args.mesh_to_gaussian_background_competes,
-            args.mesh_to_gaussian_transfer, args.force or args.force_transfer,
+            args.mesh_to_gaussian_transfer, args.force,
             evaluation_scope_version=parameters["evaluation_scope_version"],
         ),
+        artifact=gt_dir / "gt_gaussian_labels.npz",
         runtime=runtime,
     )
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
-    full_model_stats = (
-        reporting.gaussian_statistics(model_ply)
-        if analytics_store is not None else None
-    )
 
-    # Record the active run in analytics
-    if analytics_store is not None:
-        scene_id = f"{scene.dataset}:{scene.scene}"
-        analytics_store.append("runs", {
-            "run_id": run_id,
-            "created_at": utc_now(),
-            "status": "running",
-            "dataset": scene.dataset,
-            "scene_id": scene_id,
-
-    # Collect peak memory values
-            "scene_name": scene.scene,
-            "split": args.split,
-            "source": args.mask_source,
-            "output_root": str(output_root),
-            "model_root": str(model_dir),
-            "elapsed_seconds": None,
-            "peak_cuda_memory_bytes": None,
-            "peak_cuda_memory_reserved_bytes": None,
-
-    # Record completed run fields
-        })
-        analytics_store.append("run_parameters", {
-            "run_id": run_id,
-            "variant": variant,
-            "vote_id": vote_identifier,
-            **parameters,
-            **run_metadata,
-            "mask_source": args.mask_source,
-
-    # Record stage identity fields
-        })
-        record_scene_analytics(analytics_store, args, scene, scene_id)
-
-    scene_results = {}
+    # The ground truth reference per class is shared by every mask source
     ground_truth_transfer_by_class = {}
     for spec in evaluation_classes:
         reference = metrics.evaluate_class(
@@ -1036,29 +782,21 @@ def main():
             full_opacity, spec, None,
             args.tau, args.min_fraction, not args.no_opacity_weighting,
             args.min_opacity, args.gaussian_to_mesh_background_competes,
-
-    # Add reserved memory field name
             args.gaussian_to_mesh_transfer,
         )
         ground_truth_transfer_by_class[spec.name] = reference[
             "ground_truth_transfer_iou"
         ]
 
-    # Process each requested mask source
-    for source in _source_names(args.mask_source):
-        # Select the mask directory
-        mask_dir = masks_yolo if source == "yolo" else masks_gt
-
-        # Select the segmentation directory for this mask source
+    # Process every source that still needs results
+    scene_results = {}
+    results_dir_for = {
+        source: results_dir for source in pending_sources
+    }
+    for source in pending_sources:
+        # Select the mask directory and the segmentation directory for this mask source
+        mask_dir = output_root / ("masks_yolo" if source == "yolo" else "masks_gt2d")
         source_dir = segmentation_root / source
-
-        if analytics_store is not None:
-            analytics_store.append("run_sources", {
-                "run_id": run_id,
-                "source": source,
-                "mask_directory": str(mask_dir),
-                "segmentation_directory": str(source_dir),
-            })
 
         # Only source classes absent from its mask metadata are excluded from vote generation
         vote_classes = _mask_classes(mask_dir, evaluation_classes)
@@ -1070,7 +808,6 @@ def main():
                 args, runtime, model_dir, gt_dir, source_dir, scene,
                 evaluation_classes,
             ),
-    # Set the source stage runtime
             runtime=runtime,
         )
 
@@ -1083,11 +820,10 @@ def main():
                 analytics_store is not None,
                 vote_identifier,
             ),
-
-    # Set the vote stage runtime
             runtime=runtime,
         )
         stage_records[-1]["container_count"] = vote_launches
+        stage_records[-1]["cache_mode"] = "hit" if vote_launches == 0 else "miss"
 
         # Threshold the votes and produce labeled Gaussian files
         betas, threshold_containers = _measure_stage(
@@ -1097,10 +833,11 @@ def main():
                 vote_identifier,
             ),
             runtime=runtime,
-
-    # Set the threshold stage runtime
         )
         stage_records[-1]["container_count"] = threshold_containers
+        stage_records[-1]["cache_mode"] = (
+            "hit" if threshold_containers == 0 else "miss"
+        )
 
         # Evaluate every beta for the selected source
         scene_results[source] = _measure_stage(
@@ -1109,10 +846,8 @@ def main():
                 args, scene, gaussians_near_a_vertex, gaussian_labels,
                 full_xyz, full_opacity, evaluation_classes, vote_classes,
                 ground_truth_transfer_by_class, vote_identifier, variant,
-                source_dir, betas, results_dir, source,
+                source_dir, betas, results_dir_for[source], source,
             ),
-
-    # Set the evaluation stage runtime
             runtime=runtime,
         )
         if analytics_store is not None:
@@ -1120,13 +855,8 @@ def main():
                 analytics_store, run_id, source, scene,
                 f"{scene.dataset}:{scene.scene}", evaluation_classes, betas,
                 source_dir, scene_results[source],
-
-    # Pass source analytics identifiers
                 vote_identifier, args.hysteresis_gamma, args.hysteresis_radius,
-                full_model_stats,
             )
-        if state_store is not None:
-            state_store.finish(state_store_unit, source=source)
 
     # Update the source summary without dropping other results
     summary_path = results_dir / "results.json"
@@ -1138,7 +868,7 @@ def main():
         summary_path, json.dumps(previous_results, indent=2, default=str) + "\n",
     )
 
-    # Collect peak memory values
+    # Record the completed run, its parameters and its stages
     if analytics_store is not None:
         elapsed_seconds = time.perf_counter() - run_started
         peak_memory_values = [
@@ -1147,8 +877,6 @@ def main():
             if record["peak_cuda_memory_bytes"] is not None
         ]
         peak_reserved_memory_values = [
-
-    # Record completed run fields
             record["peak_cuda_memory_reserved_bytes"]
             for record in stage_records
             if record["peak_cuda_memory_reserved_bytes"] is not None
@@ -1157,8 +885,6 @@ def main():
             "run_id": run_id,
             "created_at": utc_now(),
             "status": "completed",
-
-    # Record completed run fields
             "dataset": scene.dataset,
             "scene_id": f"{scene.dataset}:{scene.scene}",
             "scene_name": scene.scene,
@@ -1167,18 +893,21 @@ def main():
             "output_root": str(output_root),
             "model_root": str(model_dir),
             "elapsed_seconds": elapsed_seconds,
-
-    # Record completed run fields
             "peak_cuda_memory_bytes": max(peak_memory_values, default=None),
             "peak_cuda_memory_reserved_bytes": max(
                 peak_reserved_memory_values, default=None,
             ),
         })
+        analytics_store.append("run_parameters", {
+            "run_id": run_id,
+            "variant": variant,
+            "vote_id": vote_identifier,
+            **parameters,
+            **run_metadata,
+        })
         for record in stage_records:
             analytics_store.append("run_stages", {
                 "run_id": run_id,
-
-    # Record stage identity fields
                 "dataset": scene.dataset,
                 "scene_id": f"{scene.dataset}:{scene.scene}",
                 "stage": record["stage"],
@@ -1187,14 +916,29 @@ def main():
                 "elapsed_seconds": record["elapsed_seconds"],
                 "peak_cuda_memory_bytes": record["peak_cuda_memory_bytes"],
                 "peak_cuda_memory_reserved_bytes": record[
-
-    # Add reserved memory field name
                     "peak_cuda_memory_reserved_bytes"
                 ],
             })
     _progress(f"Run finished in {time.perf_counter() - run_started:.1f}s")
     print(json.dumps({name: value["metrics_by_beta"]
                       for name, value in scene_results.items()}, indent=2))
+
+
+def _make_scene(args, data_root, support_dir):
+    """
+    Create a scene instance based on the dataset type and provided arguments
+
+    The returned instance loads the dataset specific mesh, labels and visibility
+    information into the common scene representation
+    """
+    if args.dataset == "replica":
+        return ReplicaScene(
+            data_root, args.scene, args.sequence_name, args.frame_step, seed=3,
+            vertex_label_min_fraction=args.replica_vertex_label_min_fraction,
+            visibility_slop=args.replica_visibility_slop,
+        )
+    elif args.dataset == "scannetpp":
+        return ScannetScene(data_root, args.scene, support_dir)
 
 
 if __name__ == "__main__":

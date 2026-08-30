@@ -1,13 +1,12 @@
-# Run metadata and evaluation caches
+# Run metadata contracts that decide which artifacts are reused
 
 import json
-import os
-import shutil
-import tempfile
 
 from .common import atomic_write_text, ensure_dir, vote_id
 
 
+# Each scope lists the parameters that invalidate one kind of cached artifact
+# When any of these values changes, the corresponding artifact is rebuilt
 VOTE_CACHE_KEYS = [
     "evaluation_scope_version", "dataset", "scene", "data_root",
     "sequence_name", "frame_step",
@@ -48,8 +47,13 @@ def _has_model(model_dir, iterations):
 
 
 def resolve_model_dir(args, data_root, output_root):
-    """ Determine the Gaussian model directory to use for evaluation """
+    """
+    Determine the Gaussian model directory to use for evaluation
 
+    --model-root reuses an explicit model; otherwise an already trained model
+    is reused when it exists, and only then does training write into the run's
+    own output directory.
+    """
     if args.model_root is not None:
         model_dir = args.model_root.resolve()
         if not _has_model(model_dir, args.iterations):
@@ -59,11 +63,12 @@ def resolve_model_dir(args, data_root, output_root):
             )
         return model_dir
 
-    # Check the output model directory
+    # Check the run's own output model directory
     output_model = output_root / "model"
     if _has_model(output_model, args.iterations):
         return output_model
 
+    # Reuse an existing Gaussian model from earlier training when it exists
     if args.dataset == "replica":
         conventional_models = [
             data_root / args.scene / "eval_output" / "gs_model",
@@ -72,8 +77,6 @@ def resolve_model_dir(args, data_root, output_root):
         conventional_models = [args.repo_root / "output" / args.scene]
     for conventional_model in conventional_models:
         if _has_model(conventional_model, args.iterations):
-
-    # Reuse the conventional model directory
             print(f"model: Using existing Gaussian model: {conventional_model}")
             return conventional_model
 
@@ -81,7 +84,7 @@ def resolve_model_dir(args, data_root, output_root):
 
 
 def run_parameters(args, data_root):
-    """ Prepare parameters for cache validation """
+    """ Prepare the full parameter record used by every cache contract """
     return {
         "evaluation_scope_version": 6,
         "dataset": args.dataset,
@@ -89,8 +92,6 @@ def run_parameters(args, data_root):
         "split": args.split,
         "data_root": str(data_root),
         "sequence_name": args.sequence_name,
-
-    # Add frame sampling settings
         "frame_step": args.frame_step,
         "replica_vertex_label_min_fraction": args.replica_vertex_label_min_fraction,
         "replica_visibility_slop": args.replica_visibility_slop,
@@ -99,8 +100,6 @@ def run_parameters(args, data_root):
         "iterations": args.iterations,
         "resolution": args.resolution,
         "train_data_device": args.train_data_device,
-
-    # Add mask and training settings
         "yolo_conf": args.yolo_conf,
         "hysteresis_gamma": args.hysteresis_gamma,
         "hysteresis_radius": args.hysteresis_radius,
@@ -109,8 +108,6 @@ def run_parameters(args, data_root):
         "background_view_policy": args.background_view_policy,
         "betas": list(args.betas),
         "tau": args.tau,
-
-    # Add transfer and raster settings
         "min_fraction": args.min_fraction,
         "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
         "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
@@ -119,36 +116,27 @@ def run_parameters(args, data_root):
         "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
         "opacity_weighting": not args.no_opacity_weighting,
         "raster_block_size": args.raster_block_size,
-
-    # Add the vote device setting
         "vote_data_device": args.vote_data_device,
     }
 
 
-def _scope_metadata(parameters, keys):
-    """ Return parameters for one artifact scope """
-    return {key: parameters[key] for key in keys}
-
-
 def _validate_scope_metadata(path, expected, artifact, force):
-    """ Validate one artifact contract """
+    """
+    Validate one artifact contract against its stored metadata
+
+    A mismatch means the directory already contains artifacts produced with
+    different parameters, so reusing them would silently mix experiments.
+    """
     if not path.exists():
         return
-
     try:
         previous = json.loads(path.read_text())
     except (OSError, ValueError) as error:
         raise RuntimeError(
             f"{path} is unreadable or truncated, rebuild this artifact scope"
         ) from error
-    _validate_scope_values(previous, expected, artifact, force, path)
-
-
-def _validate_scope_values(previous, expected, artifact, force, path):
-    """ Validate scope metadata values """
     if previous == expected or force:
         return
-
     mismatches = [
         (key, previous.get(key), expected.get(key))
         for key in expected
@@ -157,8 +145,6 @@ def _validate_scope_values(previous, expected, artifact, force, path):
     changes = "\n".join(
         f"  {key}: {old!r} -> {new!r}" for key, old, new in mismatches
     )
-
-    # Raise the metadata mismatch
     raise RuntimeError(
         f"{path.parent} contains incompatible metadata for {artifact}:\n"
         f"{changes}\n"
@@ -166,40 +152,13 @@ def _validate_scope_values(previous, expected, artifact, force, path):
     )
 
 
-def _write_scope_metadata(path, metadata):
-    """ Write a scope contract """
-    ensure_dir(path.parent)
-    temporary_fd, temporary_name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
-    )
-    try:
-        with os.fdopen(temporary_fd, "w", encoding="utf-8") as temporary:
-            json.dump(metadata, temporary, indent=2)
+def prepare_run_metadata(output_root, parameters, force, sources):
+    """
+    Validate and write one metadata contract per reusable artifact scope
 
-    # Flush the metadata file
-            temporary.write("\n")
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, path)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
-
-
-def prepare_run_metadata(output_root, parameters, force, sources, variant=None, force_delete=False):
-    """ Prepare the output directory and write run parameters """
-    common_metadata_path = output_root / "run_parameters.json"
-    common_previous = None
-    if common_metadata_path.exists():
-        common_previous = json.loads(common_metadata_path.read_text())
-    other_sources_have_results = any(
-        any((output_root / "results").rglob(f"results_{source}.json"))
-        for source in {"yolo", "gt2d"} - set(sources)
-
-    # Complete the source result check
-    )
-    result_root = output_root / "results" / variant if variant else output_root / "results"
-
+    Existing contracts are checked before any stage runs, so an incompatible
+    invocation stops instead of mixing cached files from other settings.
+    """
     scopes = [
         ("meta_dataset.json", DATASET_METADATA_KEYS, "dataset/model"),
         ("meta_masks_gt2d.json", GT_MASK_CACHE_KEYS, "GT2D masks"),
@@ -207,54 +166,24 @@ def prepare_run_metadata(output_root, parameters, force, sources, variant=None, 
     ]
     if "yolo" in sources:
         scopes.append(("meta_masks_yolo.json", YOLO_MASK_METADATA_KEYS, "YOLO masks"))
+    identifier = vote_id(parameters)
     for source in sources:
-
-    # Add the source vote scope
-        identifier = vote_id(parameters)
         scopes.append((
             f"meta_votes_{source}_{identifier}.json",
             VOTE_CACHE_KEYS,
             f"{source} votes ({identifier})",
         ))
 
-    for filename, keys, artifact in scopes:
-        metadata_path = output_root / filename
-        expected = _scope_metadata(parameters, keys)
-        if metadata_path.exists():
-            _validate_scope_metadata(metadata_path, expected, artifact, force)
-        elif common_previous is not None and not filename.startswith("meta_votes_"):
-            _validate_scope_values(
-                common_previous, expected, artifact, force, common_metadata_path,
-            )
-
-    for source in sources:
-        if force_delete:
-            mask_dir = output_root / ("masks_gt2d" if source == "gt2d" else "masks_yolo")
-            shutil.rmtree(mask_dir, ignore_errors=True)
-            source_segmentation = output_root / "segmentation" / source
-            identifier = vote_id(parameters)
-            for class_dir in source_segmentation.iterdir() if source_segmentation.exists() else ():
-                vote_dir = class_dir / identifier
-
-    # Remove cached source artifacts
-                if vote_dir.exists():
-                    shutil.rmtree(vote_dir, ignore_errors=True)
-            for suffix in ["json", "md"]:
-                (result_root / f"results_{source}.{suffix}").unlink(
-                    missing_ok=True,
-                )
-
-    if (force_delete and common_previous is not None and not other_sources_have_results and
-            (common_previous.get("iterations") != parameters["iterations"] or
-             common_previous.get("resolution") != parameters["resolution"])):
-        
-        shutil.rmtree(output_root / "model", ignore_errors=True)
-        shutil.rmtree(output_root / "dataset", ignore_errors=True)
-
     ensure_dir(output_root)
+    for filename, keys, artifact in scopes:
+        expected = {key: parameters[key] for key in keys}
+        _validate_scope_metadata(output_root / filename, expected, artifact, force)
+
+    # Persist the validated contracts and the full parameter snapshot
     for filename, keys, _artifact in scopes:
-        _write_scope_metadata(
-            output_root / filename, _scope_metadata(parameters, keys),
+        expected = {key: parameters[key] for key in keys}
+        atomic_write_text(
+            output_root / filename, json.dumps(expected, indent=2) + "\n",
         )
     atomic_write_text(
         output_root / "run_parameters.json",
