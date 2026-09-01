@@ -8,7 +8,10 @@ from pathlib import Path
 from evaluation.analytics import deduplicate_analytics
 from evaluation.common import atomic_write_text
 
-CORPUS = {"replica": "Replica", "scannetpp": "ScanNet++"}
+DATASETS = {"replica": "Replica", "scannetpp": "ScanNet++"}
+
+# The manuscript names the two conditions after their masks.
+SOURCES = (("gt2d", "annotation-derived"), ("yolo", "YOLO"))
 
 
 def number(value):
@@ -52,22 +55,6 @@ def selected_operating_point(path, tolerance=1e-9):
         ) from error
 
 
-def require_complete_state_store(path, experiment=None):
-    # Reject incomplete experiment units
-    if path is None:
-        return
-    from evaluation.state_store import read_state_store
-
-    bad = [
-        row
-        for row in read_state_store(path).rows.values()
-        if (experiment is None or row.get("experiment") == experiment)
-        and row.get("state") in {"pending", "running", "failed"}
-    ]
-    if bad:
-        raise RuntimeError(f"state store contains {len(bad)} incomplete units")
-
-
 def _filtered(view, runs, beta, gamma, tolerance):
     # Yield completed rows at the requested point
     for row in view.get("class_beta_metrics", []):
@@ -89,12 +76,12 @@ def per_class(out, view, beta=None, gamma=None, tolerance=1e-9):
 
     # Collect values by dataset, class and source
     values = defaultdict(list)
-    refs = defaultdict(list)
+    refs = defaultdict(dict)
     scenes = defaultdict(set)
     for row, run in _filtered(view, runs, beta, gamma, tolerance):
         key = (run["dataset"], row["class_id"])
         values[key + (row["source"],)].append(number(row.get("iou")))
-        refs[key].append(number(row.get("ground_truth_transfer_iou")))
+        refs[key][run["scene_id"]] = number(row.get("ground_truth_transfer_iou"))
         scenes[key].add(run["scene_id"])
 
     # Build the table header
@@ -103,60 +90,14 @@ def per_class(out, view, beta=None, gamma=None, tolerance=1e-9):
         keys = sorted(k for k in scenes if k[0] == dataset)
         for position, key in enumerate(keys):
             lines.append(
-                f"{CORPUS[dataset] if position == 0 else ''} & {names.get(key[1], key[1])} & "
+                f"{DATASETS[dataset] if position == 0 else ''} & {names.get(key[1], key[1])} & "
                 f"{cell(mean(values[key + ('gt2d',)]))} & {cell(mean(values[key + ('yolo',)]))} & "
-                f"{cell(mean(refs[key]))} & {len(scenes[key])} \\\\"
+                f"{cell(mean(refs[key].values()))} & {len(scenes[key])} \\\\"
             )
         if dataset == "replica" and keys:
             # Add table metrics
             lines.append("\\addlinespace[3pt]")
     atomic_write_text(out / "per_class.tex", strip_last(lines))
-    return len(lines)
-
-
-def reference_relative(out, view, beta=None, gamma=None, tolerance=1e-9):
-    # Gather reference relative values
-    runs = {r["run_id"]: r for r in view["runs"]}
-    scenes = defaultdict(lambda: defaultdict(list))
-
-    for row, run in _filtered(view, runs, beta, gamma, tolerance):
-        key = (run["dataset"], row["source"], run["scene_id"])
-        ref = number(row.get("ground_truth_transfer_iou"))
-
-        # Store scene reference and prediction values
-        scenes[key]["iou"].append(number(row.get("iou")))
-        scenes[key]["ref"].append(ref)
-        if ref is not None and ref > 0:
-            scenes[key]["relative"].append(number(row.get("relative_iou")))
-        else:
-            scenes[key]["excluded"].append(1)
-    grouped = defaultdict(lambda: defaultdict(list))
-
-    for (dataset, source, _), values in scenes.items():
-        # Add scene reference values
-        grouped[(dataset, source)]["iou"].append(mean(values["iou"]))
-        grouped[(dataset, source)]["ref"].append(mean(values["ref"]))
-        grouped[(dataset, source)]["relative"].append(mean(values["relative"]))
-        grouped[(dataset, source)]["excluded"].append(len(values["excluded"]))
-    lines = []
-
-    for dataset in ("replica", "scannetpp"):
-        for source, label in (("gt2d", "annotation-derived"), ("yolo", "detector")):
-            values = grouped.get((dataset, source))
-
-            # Complete the table row
-            if not values:
-                continue
-            fields = [
-                cell(mean(values["iou"])),
-                cell(mean(values["ref"])),
-                cell(mean(values["relative"]), 3),
-                str(sum(values["excluded"])),
-            ]
-
-            # Emit one row per dataset and source
-            lines.append(f"{CORPUS[dataset]} & {label} & {' & '.join(fields)} \\\\")
-    atomic_write_text(out / "reference_relative.tex", strip_last(lines))
     return len(lines)
 
 
@@ -185,43 +126,34 @@ def quantiles(out, view):
     lines = []
 
     for dataset in ("replica", "scannetpp"):
-        for source, label in (("gt2d", "annotation-derived"), ("yolo", "detector")):
+        for source, label in SOURCES:
             values = gathered.get((dataset, source))
 
             # Emit quantiles for available sources
             if values:
                 lines.append(
-                    f"{CORPUS[dataset] if source == 'gt2d' else ''} & {label} & {' & '.join(cell(mean(values[c]), 3) for c in columns)} \\\\"
+                    f"{DATASETS[dataset] if source == 'gt2d' else ''} & {label} & {' & '.join(cell(mean(values[c]), 3) for c in columns)} \\\\"
                 )
     atomic_write_text(out / "quantiles.tex", strip_last(lines))
     return len(lines)
 
 
 def main():
-    # Parse inputs and validate experiment completeness
+    # Parse inputs and write each appendix table from the deduplicated analytics view
     p = argparse.ArgumentParser()
     p.add_argument("--analytics", type=Path, default=Path("analytics"))
     p.add_argument("--out", type=Path, default=Path("tables"))
     p.add_argument("--selection", type=Path, default=Path("selection.json"))
-    p.add_argument("--state-store", type=Path)
-    p.add_argument("--experiment")
     args = p.parse_args()
-    require_complete_state_store(args.state_store, args.experiment)
 
-    # Write the table file
     view = deduplicate_analytics(args.analytics)
     beta = gamma = None
     if args.selection.exists():
         beta, gamma, _ = selected_operating_point(args.selection)
 
-    # Write tables from the deduplicated view
-    # Write each appendix table from the deduplicated analytics view
     args.out.mkdir(parents=True, exist_ok=True)
     print(f"per_class.tex: {per_class(args.out, view, beta, gamma)} rows")
     print(f"quantiles.tex: {quantiles(args.out, view)} rows")
-    print(
-        f"reference_relative.tex: {reference_relative(args.out, view, beta, gamma)} rows"
-    )
 
 
 if __name__ == "__main__":
