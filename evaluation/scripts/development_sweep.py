@@ -1,6 +1,7 @@
 # Run the development sweep that selects tau and theta on the two development scenes
 
 import argparse
+import copy
 import json
 import re
 from pathlib import Path
@@ -49,6 +50,21 @@ def _units(args):
                 }
             )
     return units
+
+
+def unit_arguments(args, unit):
+    """
+    Return the arguments one unit runs with
+
+    The two development scenes belong to different datasets, and each dataset
+    resolves its scenes under its own root, so the roots cannot be shared. The
+    output root is derived from the data root because evaluation.run requires
+    the output to live inside it.
+    """
+    current = copy.copy(args)
+    current.data_root = args.data_roots[unit["dataset"]]
+    current.output_root = current.data_root / args.output_subdir
+    return current
 
 
 def select_candidate(rows, parameter):
@@ -110,8 +126,12 @@ def _analytics_rows(args, prefix):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[2])
-    parser.add_argument("--data-root", type=Path, required=True)
-    parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument("--replica-data-root", type=Path, required=True,
+                        help="Replica root, holding one directory per scene")
+    parser.add_argument("--scannetpp-data-root", type=Path, required=True,
+                        help="ScanNet++ root, holding validation_data and metadata")
+    parser.add_argument("--output-subdir", default="eval",
+                        help="Run directory created inside each data root")
     parser.add_argument("--analytics", type=Path, default=None)
     parser.add_argument("--selection-output", type=Path, default=None)
     parser.add_argument("--replica-scene", default="office_0")
@@ -136,9 +156,23 @@ def main(argv=None):
 
     if args.mask_source not in {"gt2d", "both"}:
         raise SystemExit("development selection requires annotation-derived gt2d masks")
-    args.analytics = Path(args.analytics or args.data_root.parent / "analytics")
+
+    args.data_roots = {
+        "replica": args.replica_data_root.resolve(),
+        "scannetpp": args.scannetpp_data_root.resolve(),
+    }
+
+    # Both datasets write their metrics into the same store, which is what lets
+    # the rule below compare the two development scenes
+    stores = {root.parent / "analytics" for root in args.data_roots.values()}
+    if args.analytics is None and len(stores) != 1:
+        raise SystemExit(
+            "the two data roots resolve to different analytics stores "
+            f"({sorted(str(store) for store in stores)}); pass --analytics"
+        )
+    args.analytics = Path(args.analytics or stores.pop())
     selection_path = (
-        args.selection_output or args.output_root / "tau_theta_selection.json"
+        args.selection_output or args.analytics / "tau_theta_selection.json"
     )
 
     # Restore a persisted tau so theta variants are labelled consistently
@@ -164,7 +198,7 @@ def main(argv=None):
         )
 
     tau_units = [unit for unit in sweep_units if unit["phase"] == "tau"]
-    run_units(args, tau_units, build_command)
+    run_units(args, tau_units, build_command, resolve=unit_arguments)
 
     # Select tau from analytics unless it was already persisted
     if selection_path.exists():
@@ -195,7 +229,7 @@ def main(argv=None):
     theta_units = [
         unit for unit in _units(args) if unit["phase"] == "theta"
     ]
-    run_units(args, theta_units, build_command)
+    run_units(args, theta_units, build_command, resolve=unit_arguments)
     theta_rows = _analytics_rows(args, "development_theta_")
     theta_selection = select_candidate(theta_rows, "theta")
 

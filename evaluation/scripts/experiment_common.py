@@ -30,17 +30,25 @@ def unit_results(args, unit):
     return [results / f"results_{source}.json" for source in sources(args.mask_source)]
 
 
-def run_units(args, units, command_builder):
-    """ Launch units whose result files do not exist yet """
+def run_units(args, units, command_builder, resolve=None):
+    """
+    Launch units whose result files do not exist yet
+
+    resolve maps one unit to the arguments it runs with, which a driver spanning
+    two datasets needs because each one has its own data and output root. The
+    resolved arguments decide both the skip check and the command, so the two
+    can never disagree about where a unit writes.
+    """
     for unit in units:
-        if all(path.exists() for path in unit_results(args, unit)):
+        current = resolve(args, unit) if resolve is not None else args
+        if all(path.exists() for path in unit_results(current, unit)):
             print(f"skip: {unit['dataset']}/{unit['scene']} ({unit['variant']})")
             continue
 
         # Resolve the experiment path or execute an injected test runner
-        result = command_builder(args, unit)
+        result = command_builder(current, unit)
         if result is not None:
-            subprocess.run(result, check=True, cwd=str(args.repo_root))
+            subprocess.run(result, check=True, cwd=str(current.repo_root))
 
 
 def command(args, unit, *, betas, gamma, split, extra=(), tau=None, theta=None):
