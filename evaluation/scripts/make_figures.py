@@ -1,182 +1,168 @@
-# Create the five manuscript PDFs from analytics with cache tracking
+# Create the manuscript metric PDFs from analytics
 
 import argparse
-import hashlib
-import json
 from collections import defaultdict
 from pathlib import Path
 
 from evaluation.analytics import deduplicate_analytics
-from evaluation.common import atomic_write_text
-from evaluation.scripts.make_tables import (
-    require_complete_state_store,
-    selected_operating_point,
-)
+from evaluation.scripts.make_tables import selected_operating_point
+
 
 FIGURES = (
     "beta_curves.pdf",
     "per_class.pdf",
-    "qualitative_fraction.pdf",
-    "qualitative_prediction.pdf",
-    "qualitative_reference.pdf",
 )
 
 
-def _fingerprint(paths, point):
-    # Hash source files and the selected point
-    digest = hashlib.sha256(json.dumps(point, sort_keys=True).encode())
-    for path in sorted(Path(p) for p in paths if Path(p).exists()):
-        digest.update(str(path).encode())
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
+def _number(value):
+    # Convert an optional analytics cell; None keeps malformed rows out
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _pdf(path, title, draw=None):
+def _is_ablation(row):
+    return (row.get("variant") or "").startswith("contribution_analysis_")
+
+
+def _pdf(path, title, draw):
     # Render one PDF figure
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(7, 4))
     ax.set_title(title)
-    if draw:
-        draw(ax)
-    else:
-        ax.text(0.5, 0.5, "analytics unavailable", ha="center", va="center")
+    draw(ax)
     fig.tight_layout()
-
-    # Load the result rows
     fig.savefig(path, format="pdf")
     plt.close(fig)
 
 
-def _number(value):
-    # Convert optional analytics values
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
 def main(argv=None):
+    import matplotlib.pyplot as plt
+
     # Parse inputs and load the selected operating point
     p = argparse.ArgumentParser()
     p.add_argument("--analytics", type=Path, required=True)
     p.add_argument("--selection", type=Path, required=True)
     p.add_argument("--out", type=Path, default=Path("preprint/figures"))
-    p.add_argument(
-        "--qualitative-input",
-        type=Path,
-        help="prepared qualitative geometry/model input",
-    )
-
-    # Parse optional experiment completeness inputs
-    p.add_argument("--state-store", type=Path)
-    p.add_argument("--experiment")
     args = p.parse_args(argv)
-    require_complete_state_store(args.state_store, args.experiment)
-    point = json.loads(args.selection.read_text(encoding="utf-8"))
+
     beta, gamma, tolerance = selected_operating_point(args.selection)
     view = deduplicate_analytics(args.analytics)
     runs = {r["run_id"]: r for r in view["runs"] if r.get("status") == "completed"}
-
-    # Select the figure data
     metrics = view.get("class_beta_metrics", [])
-    inputs = [
-        args.analytics / "class_beta_metrics.csv",
-        args.analytics / "aggregate_beta_metrics.csv",
-    ]
-    fingerprint = _fingerprint(inputs, point)
     args.out.mkdir(parents=True, exist_ok=True)
-    marker = args.out / ".figures.inputs.json"
-    old = json.loads(marker.read_text(encoding="utf-8")) if marker.exists() else {}
-    qualitative_ready = (
-        args.qualitative_input is not None and args.qualitative_input.exists()
-    )
-    available_figures = FIGURES if qualitative_ready else FIGURES[:2]
 
-    # Build the figure labels
-    if not qualitative_ready:
-        print(
-            "warning: qualitative inputs are unavailable, qualitative PDFs are pending"
-        )
-    if (
-        old.get("fingerprint") == fingerprint
-        and all((args.out / f).exists() for f in available_figures)
-        and old.get("figures") == available_figures
-    ):
-        print("figures unchanged, cache hit")
-        return 0
-
-    # Render the required metric figures
-    # Build the metric plots from completed analytics rows
+    # Figure 1: one line per class under ground-truth masks, with hysteresis
+    # disabled and at the selected gamma, matching the manuscript caption
     def curves(ax):
-        grouped = defaultdict(list)
+        series = defaultdict(lambda: defaultdict(list))
         for row in metrics:
             run = runs.get(row.get("run_id"))
-            b = _number(row.get("beta"))
-            if run and run.get("dataset") == "replica":
-                grouped[(row.get("class_id"), b)].append(_number(row.get("iou")))
-        for cls in sorted({key[0] for key in grouped}):
-            # Add the figure series
-            points = sorted(
-                (b, sum(v) / len(v)) for (c, b), v in grouped.items() if c == cls
+            if not run or run.get("dataset") != "replica":
+                continue
+            if row.get("source") != "gt2d" or _is_ablation(row):
+                continue
+            b, g, iou = (
+                _number(row.get("beta")),
+                _number(row.get("hysteresis_gamma")),
+                _number(row.get("iou")),
             )
+            if b is None or g is None or iou is None:
+                continue
+            if abs(g - gamma) <= tolerance:
+                setting = "hysteresis"
+            elif g == 0.0:
+                setting = "no_hysteresis"
+            else:
+                continue
+            series[(row.get("class_id"), setting)][b].append(iou)
 
-            # Complete the figure series
-
-            # Draw one curve for each class
-            ax.plot([x[0] for x in points], [x[1] for x in points], label=cls)
-        if grouped:
+        # Average the scenes for every beta and draw one color per class,
+        # solid at gammaStar and dashed with hysteresis disabled
+        classes = sorted({cls for cls, _ in series})
+        for index, cls in enumerate(classes):
+            color = plt.cm.tab10(index % 10)
+            for setting, style in (("hysteresis", "-"), ("no_hysteresis", "--")):
+                points = sorted(
+                    (b, sum(v) / len(v))
+                    for b, v in series.get((cls, setting), {}).items()
+                )
+                if points:
+                    ax.plot(
+                        [p[0] for p in points], [p[1] for p in points],
+                        style, color=color,
+                        label=cls if setting == "hysteresis" else None,
+                    )
+        if series:
             ax.legend(fontsize=6, ncol=2)
-        ax.axvline(beta, color="black", linestyle="--")
+        ax.axvline(beta, color="black", linestyle=":")
         ax.set_xlabel("beta")
         ax.set_ylabel("IoU")
 
     _pdf(args.out / FIGURES[0], "Validation beta curves", curves)
 
+    # Figure 2: per-class IoU across the scenes of each dataset against the
+    # number of annotated vertices of the class
     def per_class(ax):
+        counts = {}
+        for row in view.get("scene_classes", []):
+            scene_id, class_id = row.get("scene_id"), row.get("class_id")
+            vertices = _number(row.get("gt_evaluated_vertex_count"))
+            if vertices is not None:
+                counts[(scene_id, class_id)] = vertices
 
-        # Save the figure
+        # Gather the IoU values at the selected operating point
         values = defaultdict(list)
         for row in metrics:
-            if (
-                abs(_number(row.get("beta")) - beta) > tolerance
-                or abs(_number(row.get("hysteresis_gamma")) - gamma) > tolerance
-            ):
-                continue
             run = runs.get(row.get("run_id"))
-            if run:
-                values[row.get("class_id")].append(_number(row.get("iou")))
-        ax.boxplot(
-            list(values.values()),
-            tick_labels=list(values) if values else ["--"],
-        )
+            if not run:
+                continue
+            b, g, iou = (
+                _number(row.get("beta")),
+                _number(row.get("hysteresis_gamma")),
+                _number(row.get("iou")),
+            )
+            if b is None or g is None or iou is None:
+                continue
+            if abs(b - beta) > tolerance or abs(g - gamma) > tolerance:
+                continue
+            values[(run.get("dataset"), row.get("class_id"))].append(iou)
 
-        # Return the figure path
+        def mean_count(class_id):
+            observed = [
+                vertices for (_, cid), vertices in counts.items()
+                if cid == class_id
+            ]
+            return sum(observed) / len(observed) if observed else 0.0
+
+        items = sorted(values.items(), key=lambda kv: mean_count(kv[0][1]))
+        dataset_colors = {"replica": "tab:blue", "scannetpp": "tab:orange"}
+        all_values, positions, tick_labels, box_colors = [], [], [], []
+        for (dataset, class_id), iou_values in items:
+            all_values.append(iou_values)
+            positions.append(mean_count(class_id))
+            tick_labels.append(str(class_id))
+            box_colors.append(dataset_colors.get(dataset, "gray"))
+
+        if all_values:
+            boxes = ax.boxplot(
+                all_values, positions=positions, widths=None,
+                tick_labels=[f"{position:.0f}" for position in positions],
+                patch_artist=True,
+            )
+            for box, color in zip(boxes["boxes"], box_colors):
+                box.set_facecolor(color)
+            handles = [
+                plt.Rectangle((0, 0), 1, 1, facecolor=color, alpha=0.5)
+                for color in dict.fromkeys(box_colors)
+            ]
+            ax.legend(handles, list(dict.fromkeys(box_colors)), fontsize=6)
+        ax.set_xlabel("annotated vertices of the class")
         ax.set_ylabel("IoU")
 
     _pdf(args.out / FIGURES[1], "Per-class IoU at selected point", per_class)
-    # Create optional qualitative placeholders when source geometry exists
-    qualitative = [args.out / name for name in FIGURES[2:]]
-    if qualitative_ready:
-        for name, title in zip(
-            qualitative,
-            ("Qualitative fraction", "Qualitative prediction", "Qualitative reference"),
-        ):
-            _pdf(name, title)
-
-    # Record the figure input fingerprint
-    atomic_write_text(
-        marker,
-        json.dumps(
-            {
-                "fingerprint": fingerprint,
-                "figures": available_figures,
-                "qualitative_pending": not qualitative_ready,
-            },
-            indent=2,
-        )
-        + "\n",
-    )
     return 0
 
 
