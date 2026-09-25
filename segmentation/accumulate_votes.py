@@ -59,32 +59,18 @@ def get_target_class_id(args, classes_json_path):
     return name_to_id[args.target_class]
 
 
-def get_background_mask_and_confidence(detector_label_mask, confidence_mask, target_id, background_mode, background_confidence):
+def get_background_mask_and_confidence(detector_label_mask, confidence_mask, target_id, background_confidence):
     """
-    Return selected nontarget pixels and their background confidence
+    Return the nontarget pixels and the confidence they vote with
 
-    background_confidence is the fallback assigned to explicit background pixels
+    Every pixel outside the target class votes for the background channel. One
+    that belongs to a detection keeps the confidence of that detection, and
+    background_confidence is the fallback for the pixels that no detection
+    claimed, which carry the stored identifier zero.
     """
-    # Identify pixels outside the target class
-    non_target = detector_label_mask != target_id
-
-    # Only the pixels with id 0 are considered background
-    if background_mode == "explicit_background":
-        background_mask = detector_label_mask == 0
-        background_confidence_map = torch.full_like(confidence_mask, background_confidence)
-
-    # Everything that is not the target class is considered background, and all those pixels get the fallback confidence
-    elif background_mode == "all_non_target":
-        background_mask = non_target
-        background_confidence_map = torch.full_like(confidence_mask, background_confidence)
-
-    # Default mode keeps detector confidence for non target pixels
-    elif background_mode == "confidence_weighted":
-        background_mask = non_target
-        background_confidence_map = confidence_mask.clone()
-        background_confidence_map[detector_label_mask == 0] = background_confidence
-    else:
-        raise ValueError(f"Unknown background mode: {background_mode}")
+    background_mask = detector_label_mask != target_id
+    background_confidence_map = confidence_mask.clone()
+    background_confidence_map[detector_label_mask == 0] = background_confidence
 
     # Keep confidence values within the mask contract
     return background_mask, background_confidence_map.clamp(0.0, 1.0)
@@ -201,7 +187,6 @@ def main(args):
             detector_label_mask,
             confidence_mask,
             target_id,
-            args.background_mode,
             args.background_confidence)
 
         # Projection of 3D Gaussians into 2D camera space
@@ -438,7 +423,6 @@ def main(args):
         'num_cameras': len(masked_cameras),
         'num_class_views': class_views,
         'target_id': target_id,
-        'background_mode': args.background_mode,
         'background_confidence': args.background_confidence,
         'background_view_policy': args.background_view_policy,
     }
@@ -513,8 +497,6 @@ if __name__ == "__main__":
     parser.add_argument("--raster_block_size", type=int, default=16, help="Block size for rasterization. Larger blocks are faster but less precise.")
 
     # Background handling parameters
-    parser.add_argument("--background_mode", type=str, default="confidence_weighted", choices=["all_non_target", "explicit_background", "confidence_weighted"],
-        help="How to form the non-target evidence mask")
     parser.add_argument("--background_confidence", type=float, default=0.25, help="Confidence assigned to pixels with stored semantic label zero")
     parser.add_argument("--background_view_policy", type=str, default="target_views", choices=["target_views", "all_views"],
         help="Use only views containing target pixels or every matched view")

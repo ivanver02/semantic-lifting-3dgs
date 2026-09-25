@@ -94,7 +94,7 @@ def main_digest(values, length=12):
 def vote_scope(parameters):
     """ Return settings for a vote artifact """
     keys = (
-        "background_mode", "background_confidence", "background_view_policy",
+        "background_confidence", "background_view_policy",
         "raster_block_size", "vote_data_device",
     )
     return {key: parameters[key] for key in keys}

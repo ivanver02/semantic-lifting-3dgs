@@ -181,7 +181,6 @@ class ReplicaScene:
         )
 
         # Convert main local face labels to main local vertex labels for metrics
-        # Uses face_labels, which are already converted to main local IDs, to identify vertices with a main local label
         semantic = self._vertex_majority(
             len(vertices), faces, face_labels, self.vertex_label_min_fraction,
         )

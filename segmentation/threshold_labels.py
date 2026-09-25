@@ -114,8 +114,7 @@ def apply_threshold(args, gaussians, voting_data, hysteresis_graph, beta,
     # Compute the target evidence fraction
     score[supported] = target_weights[supported] / evidence[supported]
 
-    print(f"beta={beta:.3f} mode={voting_data.get('background_mode', 'unknown')} "
-          f"supported={int(supported.sum().item())}")
+    print(f"beta={beta:.3f} supported={int(supported.sum().item())}")
 
     # Keep supported Gaussians whose target evidence ratio reaches beta
     final_mask = supported & (score >= beta)

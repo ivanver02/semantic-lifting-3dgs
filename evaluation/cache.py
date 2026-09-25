@@ -10,7 +10,7 @@ from .common import atomic_write_text, ensure_dir, vote_id
 VOTE_CACHE_KEYS = [
     "evaluation_scope_version", "dataset", "scene", "data_root",
     "sequence_name", "frame_step",
-    "iterations", "resolution", "background_mode", "background_confidence",
+    "iterations", "resolution", "background_confidence",
     "background_view_policy", "raster_block_size", "vote_data_device",
 ]
 
@@ -36,7 +36,6 @@ YOLO_MASK_METADATA_KEYS = [
 GT_METADATA_KEYS = [
     "evaluation_scope_version",
     "tau", "min_fraction", "mesh_to_gaussian_background_competes",
-    "mesh_to_gaussian_transfer",
 ]
 
 
@@ -86,7 +85,7 @@ def resolve_model_dir(args, data_root, output_root):
 def run_parameters(args, data_root):
     """ Prepare the full parameter record used by every cache contract """
     return {
-        "evaluation_scope_version": 6,
+        "evaluation_scope_version": 7,
         "dataset": args.dataset,
         "scene": args.scene,
         "split": args.split,
@@ -103,13 +102,11 @@ def run_parameters(args, data_root):
         "yolo_conf": args.yolo_conf,
         "hysteresis_gamma": args.hysteresis_gamma,
         "hysteresis_radius": args.hysteresis_radius,
-        "background_mode": args.background_mode,
         "background_confidence": args.background_confidence,
         "background_view_policy": args.background_view_policy,
         "betas": list(args.betas),
         "tau": args.tau,
         "min_fraction": args.min_fraction,
-        "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
         "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
         "min_opacity": args.min_opacity,
         "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,

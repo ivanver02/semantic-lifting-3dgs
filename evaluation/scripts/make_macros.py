@@ -11,6 +11,7 @@ from evaluation.analytics import deduplicate_analytics
 from evaluation.common import atomic_write_text
 from evaluation.scripts.make_tables import selected_operating_point
 
+
 NAMES = """betaStar gammaStar tauStar thetaStar
 replicaGTmIoU replicaYOLOmIoU scannetGTmIoU scannetYOLOmIoU
 replicaGTmIoUSd replicaGTPrec replicaGTRec
@@ -31,7 +32,7 @@ memMasks memVotes memThreshold memTransfer memSweepWarm hardwareDescription qual
 
 REFERENCE_TOLERANCE = 0.005
 
-# The eight ablation rows, in the order of the table
+
 REUSED_ROWS = (("ablFrozen", None), ("ablNoHyst", 0.0))
 ABLATION_VARIANTS = (
     ("ablNoGtoM", "contribution_analysis_no_competition_gtom"),
@@ -42,12 +43,12 @@ ABLATION_VARIANTS = (
     ("ablAllViews", "contribution_analysis_all_views"),
 )
 
-# Ablations and the stability diagnostics are read on the validation split under masks derived from the dataset
+# Ablations and the stability diagnostics are read on the validation split
 ABLATION_DATASET = "replica"
 ABLATION_SOURCE = "gt2d"
 TEST_DATASET = "scannetpp"
 
-# The count the ablation table reports is the number of Gaussians the method selected
+# The count the ablation table reports is the number of Gaussians the method
 PREDICTED_SET = "predicted"
 
 # The stage groups of the cost table
@@ -203,6 +204,7 @@ def measured_costs(values, view, candidate_count):
     if times:
         values["timeMissTotal"] = f"{sum(times.values()):.1f}~s"
 
+    # The equivalent cost of the sweep without a cache is derived
     if "Votes" in times and candidate_count:
         values["timeMissSweepEquivalent"] = f"{times['Votes'] * candidate_count:.1f}~s"
 
@@ -493,7 +495,9 @@ def main(argv=None):
             values[prefix + "mIoUSd"] = f"{statistics.pstdev(miou_values):.2f}"
             miou[dataset_prefix][source_prefix] = statistics.mean(miou_values)
 
-        # Reference-relative mIoU is a mean of ratios over the classes whose reference has positive IoU
+        # Reference-relative mIoU is a mean of ratios over the classes whose
+        # reference has positive IoU, so it is read from the same pass that
+        # produced it rather than recomputed from the class table.
         relative_values = numeric_values(rows, "relative_mIoU")
         if relative_values:
             values[prefix + "rel"] = f"{statistics.mean(relative_values):.3f}"

@@ -22,7 +22,8 @@ def number(value):
 
 
 def is_ablation(row):
-    # Contribution analysis runs share the validation scenes
+    # Contribution analysis runs share the validation scenes, the source and the
+    # selected point, so their rows would overwrite a frozen scene value here
     return (row.get("variant") or "").startswith("contribution_analysis_")
 
 
@@ -61,7 +62,8 @@ def select(rows, expected, tolerance=TOLERANCE):
     """ Return the operating point and the numbers the rule produced with it """
     summaries = summarise(rows, expected)
 
-    # The candidate with the best mean is a row of the manuscript table
+    # The candidate with the best mean is a row of the manuscript table, so it is
+    # resolved with the same tie rule as the selection and not by its deviation
     best_mean = max(item["mean"] for item in summaries)
     best = min(
         (item for item in summaries if item["mean"] >= best_mean - FLOAT_SLACK),

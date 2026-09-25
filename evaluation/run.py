@@ -52,11 +52,9 @@ VARIANT_DEFAULTS = {
     "min_fraction": 0.5,
     "gaussian_to_mesh_background_competes": True,
     "mesh_to_gaussian_background_competes": True,
-    "mesh_to_gaussian_transfer": "radius_vote",
     "gaussian_to_mesh_transfer": "radius_vote",
     "opacity_weighting": True,
     "min_opacity": 0.1,
-    "background_mode": "confidence_weighted",
     "background_confidence": 0.25,
     "background_view_policy": "target_views",
 }
@@ -73,11 +71,9 @@ def _variant_parameters(args):
         "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
 
     # Add transfer and weighting settings
-        "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
         "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
         "opacity_weighting": not args.no_opacity_weighting,
         "min_opacity": args.min_opacity,
-        "background_mode": args.background_mode,
         "background_confidence": args.background_confidence,
         "background_view_policy": args.background_view_policy,
     }
@@ -163,7 +159,7 @@ def _parser():
 
     # Select the source of the 2D masks
     parser.add_argument("--mask-source", choices=["yolo", "gt2d", "both"], default="yolo")
-    parser.add_argument("--split", choices=["train", "validation", "test"], default="validation")
+    parser.add_argument("--split", choices=["validation", "test"], default="validation")
     parser.add_argument("--iterations", type=int, default=30000)
     parser.add_argument("--resolution", type=int, default=None,
         help="training image scale: 1 is original, 2 is half width and height")
@@ -175,12 +171,6 @@ def _parser():
                         default=VARIANT_DEFAULTS["hysteresis_gamma"])
     parser.add_argument("--hysteresis-radius", type=float,
                         default=VARIANT_DEFAULTS["hysteresis_radius"])
-    parser.add_argument(
-        "--background-mode",
-        choices=["all_non_target", "explicit_background", "confidence_weighted"],
-        default=VARIANT_DEFAULTS["background_mode"],
-        help="How 2D non-target evidence is constructed",
-    )
     parser.add_argument("--background-confidence", type=float,
         default=VARIANT_DEFAULTS["background_confidence"],
         help="Confidence assigned to pixels with semantic label zero")
@@ -193,11 +183,6 @@ def _parser():
         help="Beta values to evaluate for every target class")
     parser.add_argument("--tau", type=float, default=VARIANT_DEFAULTS["tau"])
     parser.add_argument("--min-fraction", type=float, default=VARIANT_DEFAULTS["min_fraction"])
-    parser.add_argument(
-        "--mesh-to-gaussian-transfer",
-        choices=["radius_vote", "nearest_neighbor_label"],
-        default=VARIANT_DEFAULTS["mesh_to_gaussian_transfer"],
-    )
     parser.add_argument(
         "--gaussian-to-mesh-transfer",
         choices=["radius_vote", "nearest_neighbor_label"],
@@ -454,7 +439,6 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
 
         runtime.run_lifting(
             "segmentation/accumulate_votes.py", command + [
-                "--background_mode", str(args.background_mode),
                 "--background_confidence", str(args.background_confidence),
                 "--background_view_policy", str(args.background_view_policy),
             ],
@@ -547,7 +531,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         for beta_index, beta in enumerate(betas, start=1):
 
             # A missing labeled file represents an empty prediction for this
-            # class and beta, so its Ground Truth instances still contribute to false negatives
+            # class and beta, so its Ground Truth instances still contribute
+            # false negatives
             path = threshold_path(
                 segmentation_dir, spec, vote_identifier,
                 args.hysteresis_gamma, args.hysteresis_radius, beta,
@@ -606,13 +591,11 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         "parameters": {
             "hysteresis_gamma": args.hysteresis_gamma,
             "hysteresis_radius": args.hysteresis_radius,
-            "background_mode": args.background_mode,
             "background_confidence": args.background_confidence,
             "background_view_policy": args.background_view_policy,
             "betas": betas,
             "tau": args.tau,
             "min_fraction": args.min_fraction,
-            "mesh_to_gaussian_transfer": args.mesh_to_gaussian_transfer,
             "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
             "opacity_weighted": not args.no_opacity_weighting,
             "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
@@ -710,8 +693,9 @@ def main():
     # Prepare metadata contracts and reuse caches within this output root
     cache.prepare_run_metadata(output_root, parameters, args.force, pending_sources)
 
-    # Replica writes its COLMAP model into the run directory, while Scannet++ ignores it and keeps an undistorted one beside the scene
-    # Therefore, the artifact of dataset preparation does not live in the same place for the two
+    # Replica writes its COLMAP model into the run directory, while Scannet++
+    # ignores it and keeps an undistorted one beside the scene, so the artifact
+    # of dataset preparation does not live in the same place for the two.
     dataset_dir = output_root / "dataset"
     prepared_root = (
         dataset_dir if args.dataset == "replica" else scene_instance.prepared_dir
@@ -724,7 +708,8 @@ def main():
     )
     model_dir = cache.resolve_model_dir(args, data_root, output_root)
 
-    # Generate reference masks: they are always produced or hit because they define which instances are observable and therefore evaluable
+    # Generate reference masks; they are always produced or hit because they
+    # define which instances are observable and therefore evaluable
     _measure_stage(
         stage_records, "generate_gt_masks",
         lambda: _generate_gt_masks(args, scene_instance, runtime, masks_gt),
@@ -765,8 +750,7 @@ def main():
         stage_records, "ground_truth_transfer",
         lambda: ground_truth.build(
             scene, model_ply, gt_dir, args.tau, args.min_fraction,
-            args.mesh_to_gaussian_background_competes,
-            args.mesh_to_gaussian_transfer, args.force,
+            args.mesh_to_gaussian_background_competes, args.force,
             evaluation_scope_version=parameters["evaluation_scope_version"],
         ),
         artifact=gt_dir / "gt_gaussian_labels.npz",
@@ -774,7 +758,7 @@ def main():
     )
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
 
-    # The ground truth reference per class is shared by every mask source
+    # The clean-label reference per class is shared by every mask source
     ground_truth_transfer_by_class = {}
     for spec in evaluation_classes:
         reference = metrics.evaluate_class(

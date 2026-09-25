@@ -31,7 +31,7 @@ def _neighborhood_metadata(scene, gaussian_ply, tau, evaluation_scope_version, g
 
 
 def _labels_metadata(neighborhood_metadata, min_fraction,
-                     mesh_to_gaussian_background_competes, mesh_to_gaussian_transfer):
+                     mesh_to_gaussian_background_competes):
     """ Describe labels derived from neighborhood data """
     return {
         **neighborhood_metadata,
@@ -39,7 +39,6 @@ def _labels_metadata(neighborhood_metadata, min_fraction,
         "mesh_to_gaussian_background_competes": bool(
             mesh_to_gaussian_background_competes
         ),
-        "mesh_to_gaussian_transfer": mesh_to_gaussian_transfer,
     }
 
 
@@ -54,13 +53,13 @@ def _needs_rebuild(meta_path, expected, force):
 
 
 def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_background_competes,
-          mesh_to_gaussian_transfer="radius_vote", force=False,
-          evaluation_scope_version=6):
+          force=False, evaluation_scope_version=7):
     """
     Build or reuse the neighborhoods and the Gaussians GT local semantic labels used for evaluation
 
-    - The cache contains both directions of the radius neighborhoods and semantic labels for the Gaussian model
-    - The transfer method chooses between radius voting and nearest-neighbor label assignment
+    The cache contains both directions of the radius neighborhoods and semantic
+    labels for the Gaussian model. The mesh annotation reaches the Gaussians
+    through the same radius vote that carries the prediction back to the mesh.
 
     mesh_to_gaussian_background_competes controls whether non-target mesh labels
     participate when transferring GT labels from the mesh to Gaussians.
@@ -78,7 +77,7 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
     )
     labels_expected = _labels_metadata(
         neighborhood_expected, min_fraction,
-        mesh_to_gaussian_background_competes, mesh_to_gaussian_transfer,
+        mesh_to_gaussian_background_competes,
     )
     neighborhoods_rebuild = _needs_rebuild(
         neighborhood_meta_path, neighborhood_expected, force,
@@ -113,17 +112,12 @@ def build(scene, gaussian_ply, gt_dir, tau, min_fraction, mesh_to_gaussian_backg
         reference_labels = np.where(scene.semantic_labels >= 0, scene.semantic_labels, -1).astype(np.int64)
         classes = np.arange(len(scene.classes), dtype=np.int64)
 
-        if mesh_to_gaussian_transfer == "nearest_neighbor_label":
-            # Find the nearest mesh vertex for every Gaussian center
-            distances, nearest = cKDTree(scene.vertices).query(full_xyz, k=1)
-            gaussian_labels = np.where((distances <= tau) & (reference_labels[nearest] >= 0), reference_labels[nearest], -1,).astype(np.int64)
-
-        else:
-            gaussian_labels = transfer.radius_label_vote(
-                len(full_xyz), vertices_near_a_gaussian, reference_labels,
-                np.ones(len(reference_labels), dtype=np.float64), classes,
-                min_fraction, mesh_to_gaussian_background_competes,
-            )
+        # A vertex has no opacity, so every source votes with weight one
+        gaussian_labels = transfer.radius_label_vote(
+            len(full_xyz), vertices_near_a_gaussian, reference_labels,
+            np.ones(len(reference_labels), dtype=np.float64), classes,
+            min_fraction, mesh_to_gaussian_background_competes,
+        )
 
         # Write the label archive atomically
         fd, temporary_name = tempfile.mkstemp(
