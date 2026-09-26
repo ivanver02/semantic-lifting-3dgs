@@ -128,7 +128,7 @@ def main(args, pipe):
     os.makedirs(args.output_dir, exist_ok=True)
 
     for index, camera in enumerate(cameras[:max(1, args.num_views)]):
-        output = render(camera, gaussians, pipe, background, override_color=colors)
+        output = render(camera, gaussians, pipe, background, override_color=colors)["render"]
         image = output.clamp(0.0, 1.0).permute(1, 2, 0).detach().cpu().numpy()
         stem = os.path.splitext(os.path.basename(camera.image_name))[0]
         image_path = os.path.join(args.output_dir, f"{stem}_qualitative.png")
