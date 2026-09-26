@@ -5,9 +5,9 @@ import sys
 import json
 from argparse import ArgumentParser
 import numpy as np
-from scipy.spatial import cKDTree
-from scipy.sparse import csr_matrix, save_npz, load_npz
+from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import connected_components
+from scipy.spatial import cKDTree
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -25,67 +25,60 @@ def _load_gaussians(args):
     return gaussians
 
 
-def _graph_path(args):
+def target_fraction(target_weights, background_weights):
     """
-    Return the cached radius graph file for this model and radius
+    Compute the target evidence fraction rho = E+ / (E+ + E-) of every Gaussian
 
-    The model PLY size is part of the name, so graphs from different models in
-    the same cache directory can never be confused.
+    The fraction only exists on the support set, the Gaussians with some evidence,
+    and it stays zero outside it. Returns the fractions and the support mask.
     """
-    ply_path = os.path.join(
-        args.model_path, "point_cloud", f"iteration_{args.loaded_iter}",
-        "point_cloud.ply",
-    )
-    token = str(float(args.hysteresis_radius)).replace(".", "_")
-    stat = os.stat(ply_path)
-    cache_dir = getattr(args, "cache_dir", None) or args.output_dir
-    return os.path.join(
-        cache_dir,
-        f"hysteresis_graph_i{args.loaded_iter}_n{stat.st_size}_r{token}.npz",
-    )
+
+    # Combine target and background evidence
+    evidence = target_weights + background_weights
+    score = torch.zeros_like(target_weights)
+    supported = evidence > 0
+
+    # Compute the target evidence fraction
+    score[supported] = target_weights[supported] / evidence[supported]
+    return score, supported
 
 
-def _hysteresis_graph(args, xyz):
-    """ Load or build the radius graph shared by every class and beta in this invocation """
+def hysteresis(xyz, score, supported, beta, gamma, radius):
+    """
+    Select the seeds, whose fraction reaches beta, and every Gaussian above gamma * beta
+    that is connected to a seed through Gaussians closer than radius
 
-    # Reuse a valid graph cache
-    path = _graph_path(args)
-    if os.path.exists(path):
-        graph = load_npz(path).tocsr()
-        if graph.shape == (len(xyz), len(xyz)):
-            return graph
+    Returns a boolean mask over the Gaussians
+    """
 
-    # Build the radius graph when no valid cache exists
-    pairs = cKDTree(xyz).query_pairs(
-        args.hysteresis_radius, output_type="ndarray",
-    )
+    # Keep supported Gaussians whose target evidence ratio reaches beta
+    seeds = supported & (score >= beta)
 
-    # Convert nearby pairs into a sparse adjacency matrix
-    if len(pairs):
-        rows = np.concatenate((pairs[:, 0], pairs[:, 1]))
-        cols = np.concatenate((pairs[:, 1], pairs[:, 0]))
-        graph = csr_matrix((np.ones(len(rows), dtype=np.uint8), (rows, cols)),
-                           shape=(len(xyz), len(xyz)))
-    else:
-        graph = csr_matrix((len(xyz), len(xyz)), dtype=np.uint8)
+    # At gamma = 0 the expansion is skipped, and hysteresis requires at least one seed
+    if gamma == 0 or not seeds.any():
+        return seeds
 
-    # Store the graph atomically so later invocations reuse it
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(
-        dir=os.path.dirname(path), suffix=".tmp.npz",
-    )
-    os.close(fd)
-    try:
-        save_npz(temporary_name, graph)
-        os.replace(temporary_name, path)
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
-    return graph
+    # The low threshold defines candidate bridge Gaussians around the seeds
+    candidates = np.flatnonzero(supported & (score >= beta * gamma))
+
+    # Connect the candidates closer than the radius and group them into spatially connected components
+    pairs = cKDTree(xyz[candidates]).query_pairs(radius, output_type="ndarray")
+    graph = coo_matrix((np.ones(len(pairs)), (pairs[:, 0], pairs[:, 1])),
+                       shape=(len(candidates), len(candidates)))
+    component_labels = connected_components(graph, directed=False)[1]
+
+    # Keep only components containing at least one seed
+    keep_component = np.zeros(component_labels.max() + 1, dtype=bool)
+    keep_component[component_labels[seeds[candidates]]] = True
+
+    # Reconstruct the full Gaussian mask from the retained components
+    selected = np.zeros_like(seeds)
+    selected[candidates] = keep_component[component_labels]
+    print(f"hysteresis: {int(seeds.sum())} seeds -> {int(selected.sum())} gaussians")
+    return selected
 
 
-def apply_threshold(args, gaussians, voting_data, hysteresis_graph, beta,
-                    hysteresis_gamma, target_class, class_output_dir):
+def apply_threshold(args, gaussians, xyz, voting_data, beta, target_class, class_output_dir):
     """ Applies the threshold to the voting weights and saves the resulting segmented PLY file """
 
     # Skip existing outputs before loading votes or computing hysteresis
@@ -96,80 +89,20 @@ def apply_threshold(args, gaussians, voting_data, hysteresis_graph, beta,
         return
 
     # Each tensor contains one accumulated evidence value per Gaussian
-    target_weights = voting_data['target_weights']
-    background_weights = voting_data['background_weights']
-
-    # Stored ID of the target class represented by the selected Gaussians
-    target_id = voting_data['target_id']
-
-    # beta is the minimum target fraction of the total evidence
-    if not 0.0 <= beta <= 1.0:
-        raise ValueError("target evidence beta must be in [0, 1]")
-
-    # Combine target and background evidence
-    evidence = target_weights + background_weights
-    score = torch.zeros_like(target_weights)
-    supported = evidence > 0
-
-    # Compute the target evidence fraction
-    score[supported] = target_weights[supported] / evidence[supported]
-
+    score, supported = target_fraction(voting_data['target_weights'].cpu(), voting_data['background_weights'].cpu())
     print(f"beta={beta:.3f} supported={int(supported.sum().item())}")
 
-    # Keep supported Gaussians whose target evidence ratio reaches beta
-    final_mask = supported & (score >= beta)
+    # Hysteresis expands high confidence seeds through nearby lower score Gaussians
+    final_mask = hysteresis(xyz, score.numpy(), supported.numpy(), beta,
+                            args.hysteresis_gamma, args.hysteresis_radius)
 
-    # Hysteresis expands high confidence seeds through nearby lower score Gaussians on the radius graph
-    gamma = hysteresis_gamma
-    if gamma > 0:
-        xyz = gaussians.get_xyz
-        if torch.is_tensor(xyz):
-            xyz = xyz.detach().cpu().numpy()
-
-        # Work on CPU copies while preserving the original tensors
-        score_cpu = score.detach().cpu()
-        seed = final_mask.detach().cpu()
-
-        # The low threshold defines candidate bridge Gaussians around the seeds
-        low_threshold_mask = supported.detach().cpu() & (score_cpu >= beta * gamma)
-
-        # Hysteresis requires both a nonempty bridge set and at least one seed
-        if low_threshold_mask.sum().item() > 0 and seed.sum().item() > 0:
-
-            # Group bridge Gaussians into spatially connected components
-            low_indices = np.flatnonzero(low_threshold_mask.numpy())
-            component_labels = connected_components(
-                hysteresis_graph[low_indices][:, low_indices],
-                directed=False, return_labels=True,
-            )[1]
-
-            # Keep only components containing at least one seed
-            seed_in_low_threshold_mask = seed[low_threshold_mask].numpy()
-            keep_component = np.zeros(component_labels.max() + 1, dtype=bool)
-            np.logical_or.at(keep_component, component_labels, seed_in_low_threshold_mask)
-            kept = keep_component[component_labels]
-
-            # Reconstruct the full Gaussian mask from the retained components
-            new_mask = torch.zeros_like(seed)
-            new_mask[low_threshold_mask] = torch.from_numpy(kept)
-
-            print(f"hysteresis: {int(seed.sum().item())} seeds -> "
-                  f"{int(new_mask.sum().item())} gaussians")
-
-            # Return the final mask to the original device
-            final_mask = new_mask.to(final_mask.device)
-        else:
-            # Keep the beta mask when hysteresis has no valid seed or bridge set
-            print(f"hysteresis: degenerate set, keeping the seed mask")
-
-    count = final_mask.sum().item()
-    if count == 0:
+    if not final_mask.any():
         # An empty selection is valid and is still saved as an empty PLY
         print(f"Warning: no Gaussians selected for {target_class}, saving an empty PLY")
 
     # Select the Gaussian rows and write the labeled model atomically
     os.makedirs(class_output_dir, exist_ok=True)
-    gaussians.set_mask_index(final_mask.nonzero(as_tuple=True)[0])
+    gaussians.set_mask_index(torch.from_numpy(np.flatnonzero(final_mask)).to(gaussians.get_xyz.device))
     fd, temporary_name = tempfile.mkstemp(
         dir=class_output_dir, suffix=".ply.tmp",
     )
@@ -184,14 +117,11 @@ def apply_threshold(args, gaussians, voting_data, hysteresis_graph, beta,
 
 
 def apply_threshold_batch(args):
-    """ Process every class and beta in this container invocation with one shared graph """
+    """ Process every class and beta in this container invocation """
 
-    # Load shared model and graph data once
+    # Load shared model data once, hysteresis needs the Gaussian centers
     gaussians = _load_gaussians(args)
-    xyz = gaussians.get_xyz
-    if torch.is_tensor(xyz):
-        xyz = xyz.detach().cpu().numpy()
-    graph = _hysteresis_graph(args, xyz)
+    xyz = gaussians.get_xyz.detach().cpu().numpy().astype(np.float64)
 
     voting_paths = list(args.voting_data_path)
     target_classes = list(args.target_class)
@@ -212,11 +142,8 @@ def apply_threshold_batch(args):
         )
         for beta in betas:
             apply_threshold(
-                args, gaussians=gaussians, voting_data=voting_data,
-                hysteresis_graph=graph, beta=beta,
-                hysteresis_gamma=args.hysteresis_gamma,
-                target_class=target_class,
-                class_output_dir=output_dir)
+                args, gaussians=gaussians, xyz=xyz, voting_data=voting_data, beta=beta,
+                target_class=target_class, class_output_dir=output_dir)
 
 
 if __name__ == "__main__":
@@ -233,18 +160,19 @@ if __name__ == "__main__":
 
     # Input and output paths
     parser.add_argument("--output_dir", required=True, help="Directory to save labeled PLY")
-    parser.add_argument("--cache_dir", default=None, help="Directory for derived hysteresis graph cache")
 
     # Threshold configuration
     parser.add_argument("--beta", nargs="+", type=float, default=[0.5], help="Minimum target evidence ratio(s) in [0, 1]")
     parser.add_argument("--device", type=str, default="cuda", help="Device, either cuda or cpu")
-    parser.add_argument("--hysteresis_gamma", type=float, default=0.8, help="Low-threshold factor. 0 disables hysteresis")
+    parser.add_argument("--hysteresis_gamma", type=float, default=0.8, help="Low-threshold factor in [0, 1). 0 disables hysteresis")
     parser.add_argument("--hysteresis_radius", type=float, default=0.05, help="Connectivity radius in meters for the bridge set")
     parser.add_argument("--force", action="store_true", help="Replace existing threshold outputs")
 
     args = parser.parse_args()
-    if args.hysteresis_gamma < 0.0:
-        raise ValueError("--hysteresis_gamma needs to be non-negative")
+    if any(not 0.0 <= beta <= 1.0 for beta in args.beta):
+        raise ValueError("--beta values must be in [0, 1]")
+    if not 0.0 <= args.hysteresis_gamma < 1.0:
+        raise ValueError("--hysteresis_gamma must be in [0, 1)")
     if args.hysteresis_radius <= 0.0:
         raise ValueError("--hysteresis_radius needs to be greater than zero")
 

@@ -478,7 +478,6 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     command = [
         "--model_path", str(model_dir),
         "--output_dir", str(segmentation_dir),
-        "--cache_dir", str(segmentation_dir),
         "--beta", *[str(beta) for beta in betas],
         "--loaded_iter", str(args.iterations),
         "--hysteresis_gamma", str(args.hysteresis_gamma),
@@ -623,8 +622,8 @@ def main():
         raise ValueError("--tau must be greater than zero")
     if not 0.0 <= args.min_fraction <= 1.0:
         raise ValueError("--min-fraction must be in [0, 1]")
-    if args.hysteresis_gamma < 0.0:
-        raise ValueError("--hysteresis-gamma must be non-negative")
+    if not 0.0 <= args.hysteresis_gamma < 1.0:
+        raise ValueError("--hysteresis-gamma must be in [0, 1)")
     if args.hysteresis_radius <= 0.0:
         raise ValueError("--hysteresis-radius must be greater than zero")
 

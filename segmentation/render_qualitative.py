@@ -14,6 +14,7 @@ from scene import Scene, GaussianModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, get_combined_args
 from evaluation.transfer import map_subset_indices
+from segmentation.threshold_labels import target_fraction
 from plyfile import PlyData
 
 
@@ -39,23 +40,19 @@ def _score_colors(target_weights, background_weights, beta):
     Build one RGB row per Gaussian colored by its target fraction rho
 
     Supported Gaussians use the colormap with beta as the boundary of the
-    scale; unsupported Gaussians stay neutral gray. Returns the colors and the
-    supported scores for the legend.
+    scale; unsupported Gaussians stay neutral gray.
     """
     import matplotlib.pyplot as plt
     from matplotlib.colors import TwoSlopeNorm
 
-    evidence = target_weights + background_weights
-    supported = evidence > 0
-    scores = torch.zeros_like(evidence)
-    scores[supported] = target_weights[supported] / evidence[supported]
+    scores, supported = target_fraction(target_weights, background_weights)
 
     # beta splits the colour scale, matching the manuscript description
     norm = TwoSlopeNorm(vmin=0.0, vcenter=float(beta), vmax=1.0)
     rgba = plt.cm.turbo(norm(scores.numpy()))
     colors = torch.from_numpy(np.asarray(rgba[:, :3], dtype=np.float32))
     colors[~supported] = 0.85
-    return colors, scores[supported]
+    return colors
 
 
 def _save_score_legend(output_dir, beta):
@@ -95,7 +92,7 @@ def main(args, pipe):
         colors = _selected_colors(total_gaussians, selected_indices, args.color, args.show_base)
     else:
         voting_data = torch.load(args.voting_data, map_location="cpu")
-        colors, _ = _score_colors(
+        colors = _score_colors(
             voting_data["target_weights"].float(),
             voting_data["background_weights"].float(),
             args.beta,

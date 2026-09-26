@@ -12,6 +12,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scene import Scene, GaussianModel
 from arguments import get_combined_args
 from segmentation.projection import get_covariance_3d, project_gaussians
+from segmentation.threshold_labels import target_fraction
 
 # Quantiles recorded for the target evidence fraction distribution. They are
 # consumed by the analytics CSV and reported in the manuscript appendix.
@@ -364,10 +365,7 @@ def main(args):
 
     # Vote statistics are only written when analytics recording is enabled
     if args.statistics_path:
-        evidence = global_target_weights + global_background_weights
-        supported = evidence > 0
-        scores = torch.zeros_like(evidence)
-        scores[supported] = global_target_weights[supported] / evidence[supported]
+        scores, supported = target_fraction(global_target_weights, global_background_weights)
 
         statistics = {
             'num_cameras': len(masked_cameras),
