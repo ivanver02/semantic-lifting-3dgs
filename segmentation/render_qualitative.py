@@ -17,13 +17,6 @@ from evaluation.transfer import map_subset_indices
 from plyfile import PlyData
 
 
-def _load_iteration_ply(model_path, loaded_iter):
-    """ Return the full model PLY path used by every stage """
-    return os.path.join(
-        model_path, "point_cloud", f"iteration_{loaded_iter}", "point_cloud.ply",
-    )
-
-
 def _selected_colors(num_gaussians, selected_indices, target_color, show_base):
     """
     Build one RGB row per Gaussian for a labeled subset rendering
@@ -88,20 +81,9 @@ def _save_score_legend(output_dir, beta):
 
 
 def main(args, pipe):
-    # Define the gaussians and load the trained model
+    # Define the gaussians and build the camera set from the prepared dataset, Scene loads the trained model
     gaussians = GaussianModel(sh_degree=args.sh_degree, use_labels=True)
-    gaussians.load_ply(_load_iteration_ply(args.model_path, args.loaded_iter))
-
-    # Build the camera set from the prepared dataset
     scene = Scene(args, gaussians, load_iteration=args.loaded_iter, shuffle=False)
-
-    # Source images are never used by the rasterizer, so release them early
-    if getattr(args, "data_device", "cuda") == "cpu":
-        for camera in scene.getTrainCameras():
-            for attribute in ("original_image", "alpha_mask", "gt_alpha_mask"):
-                if hasattr(camera, attribute):
-                    setattr(camera, attribute, None)
-
     total_gaussians = gaussians.get_xyz.shape[0]
     xyz = gaussians.get_xyz.detach().cpu().numpy()
 

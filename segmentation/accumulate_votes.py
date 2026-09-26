@@ -11,31 +11,12 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from scene import Scene, GaussianModel
 from arguments import get_combined_args
-from segmentation.projection import GaussianProjector
-from utils.general_utils import build_scaling_rotation
+from segmentation.projection import get_covariance_3d, project_gaussians
 
 # Quantiles recorded for the target evidence fraction distribution. They are
 # consumed by the analytics CSV and reported in the manuscript appendix.
 QUANTILE_LEVELS = [0.05, 0.25, 0.50, 0.75, 0.90, 0.925, 0.95, 0.975, 0.99, 0.999]
 QUANTILE_NAMES = ["p05", "p25", "median", "p75", "p90", "p92_5", "p95", "p97_5", "p99", "p99_9"]
-
-
-def get_covariance_3d(gaussians, scaling_modifier=1.0) -> torch.Tensor:
-    """
-    Compute the full 3D covariance matrix for each Gaussian
-
-    Returns:
-        torch.Tensor: tensor containing covariance matrices, with shape (N, 3, 3)
-    """
-
-    # Build the scaled rotation matrix
-    scaling = gaussians.get_scaling
-    rotation = gaussians.get_rotation
-    L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-
-    # Form the covariance matrix
-    covariance = L @ L.transpose(1, 2)  # Shape: (N, 3, 3)
-    return covariance
 
 
 def get_target_class_id(args, classes_json_path):
@@ -96,26 +77,11 @@ def _score_summary(scores):
 
 
 def main(args):
-    # Define the gaussians
+    # Define the gaussians, Scene loads the trained model at the requested iteration
+    # Source images stay on args.data_device while Scene builds camera data
     gaussians = GaussianModel(sh_degree=args.sh_degree, use_labels=True)
-    ply_path = os.path.join(args.model_path, "point_cloud", f"iteration_{args.loaded_iter}", "point_cloud.ply")
-    gaussians.load_ply(ply_path)
-
-    cov3D = get_covariance_3d(gaussians)
-
-    # Keep source images on the CPU while Scene builds camera data
-    load_images_on_cpu = getattr(args, "data_device", "cuda") == "cpu"
     scene = Scene(args, gaussians, load_iteration=args.loaded_iter, shuffle=False)
-    if load_images_on_cpu:
-        for camera in scene.getTrainCameras():
-            for attribute in ("original_image", "alpha_mask", "gt_alpha_mask"):
-                if hasattr(camera, attribute):
-                    setattr(camera, attribute, None)
-            camera.data_device = torch.device(args.device)
-
-        # Clear unused CUDA memory
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    cov3D = get_covariance_3d(gaussians)
 
     # Prepare global vote tensors
     total_gaussians = gaussians.get_xyz.shape[0]
@@ -190,10 +156,8 @@ def main(args):
             args.background_confidence)
 
         # Projection of 3D Gaussians into 2D camera space
-        projector = GaussianProjector(cam)
-
         # projection_results is a map with means2D, cov2D, depths, and indices of the Gaussians that are visible in this camera view
-        projection_results = projector.project(gaussians.get_xyz, cov3D)
+        projection_results = project_gaussians(cam, gaussians.get_xyz, cov3D)
 
         means2D = projection_results['means2D']
         cov2D = projection_results['cov2D']  # (M, 2, 2)
