@@ -12,6 +12,10 @@ try:
 except ImportError:
     torch = None
 
+# Running this file as a script only puts evaluation/ on the path, and the
+# stages import the repository packages, so the repository root is added too
+sys.path.append(str(Path(__file__).resolve().parents[1]))
+
 
 def _parser():
     parser = argparse.ArgumentParser()
