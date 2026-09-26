@@ -105,20 +105,20 @@ def vote_id(parameters):
     return "v" + main_digest(vote_scope(parameters))
 
 
-def vote_class_dir(segmentation_dir, spec, identifier):
+def vote_dir(segmentation_dir, spec, identifier):
+    """ Directory holding the votes of one class under one vote configuration """
     return Path(segmentation_dir) / safe_name(spec.name_by_detector) / identifier
 
 
-def threshold_dir(segmentation_dir, spec, identifier, gamma, radius):
-    return vote_class_dir(segmentation_dir, spec, identifier) / (
-        f"g{float_token(gamma)}_r{float_token(radius)}"
-    )
+def selection_path(class_vote_dir, gamma, radius, beta):
+    """
+    Indices of the Gaussians selected for one class at one operating point,
+    written by segmentation/threshold_labels.py next to the votes they come from
 
-
-def threshold_path(segmentation_dir, spec, identifier, gamma, radius, beta):
-    safe = safe_name(spec.name_by_detector)
-    return threshold_dir(segmentation_dir, spec, identifier, gamma, radius) / (
-        f"labeled_gaussians_{safe}_beta{float_token(beta)}.ply"
+    The hysteresis radius is part of the directory name because the graph depends on it
+    """
+    return Path(class_vote_dir) / f"g{float_token(gamma)}_r{float_token(radius)}" / (
+        f"selected_beta{float_token(beta)}.npy"
     )
 
 
@@ -149,3 +149,22 @@ def atomic_write_text(path, text):
 def target_classes_by_detector(classes):
     """ Map detector names to class records """
     return {item.name_by_detector: item for item in classes}
+
+
+def atomic_write(path, save):
+    """
+    Write a file through a temporary name in the same directory
+
+    save receives the temporary path. The final name only appears once the
+    file is complete, so an interrupted run never leaves a partial artifact
+    that a later run would reuse as a cache hit.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name("tmp_" + path.name)
+    try:
+        save(temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()

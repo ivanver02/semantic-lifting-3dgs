@@ -4,7 +4,6 @@ import os
 import tempfile
 
 import numpy as np
-from scipy.spatial import cKDTree
 from plyfile import PlyData
 
 EPS = 1e-10
@@ -38,17 +37,6 @@ def load_gaussian_ply(path):
         # Older PLY files without opacity give every Gaussian equal weight
         opacity = np.ones(len(xyz), dtype=np.float64)
     return xyz, opacity
-
-
-def map_subset_indices(full_xyz, subset_xyz):
-    """ Map a subset of Gaussian centers, the predicted ones, back to their positions in the full Gaussian representation """
-
-    # Labeled PLY files contain a subset of the full model in a new order
-    # Match each labeled center to the full model
-    distance, indices = cKDTree(full_xyz).query(subset_xyz, k=1)
-    if float(distance.max()) > 1e-6:
-        raise ValueError("labeled Gaussian PLY does not match the full model")
-    return indices
 
 
 def build_radius_neighbors(query_points, reference_tree, radius,

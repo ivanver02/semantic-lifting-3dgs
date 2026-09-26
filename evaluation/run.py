@@ -23,8 +23,8 @@ from .common import (
     main_digest,
     safe_name,
     target_classes_by_detector,
-    threshold_path,
-    vote_class_dir,
+    selection_path,
+    vote_dir,
     vote_id,
 )
 from .runtime import Runtime
@@ -373,26 +373,6 @@ def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
     )
 
 
-def _export_gt_gaussians(args, runtime, model_dir, gt_dir,
-                         segmentation_dir, scene, classes):
-    """ Export the reference transferred Gaussians into each source class directory """
-    class_specs = [
-        f"{safe_name(spec.name_by_detector)}:{scene.class_id(spec.name)}"
-        for spec in classes
-    ]
-    if not class_specs:
-        return
-    runtime.run_lifting(
-        "segmentation/export_gt_gaussians.py",
-        [
-            "--model_path", str(model_dir),
-            "--gt_labels_path", str(gt_dir / "gt_gaussian_labels.npz"),
-            "--output_dir", str(segmentation_dir),
-            "--loaded_iter", str(args.iterations),
-        ] + sum((["--class_spec", item] for item in class_specs), []),
-    )
-
-
 def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
                segmentation_dir, classes,
                save_statistics=False, vote_identifier=None):
@@ -409,7 +389,7 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
         # Each selected main class, identified here by its detector name,
         # receives its own vote directory and cache file
         vote_identifier = vote_identifier or vote_id(vars(args))
-        class_dir = vote_class_dir(segmentation_dir, spec, vote_identifier)
+        class_dir = vote_dir(segmentation_dir, spec, vote_identifier)
         safe = safe_name(spec.name_by_detector)
         vote_path = class_dir / f"voting_data_{safe}.pt"
         statistics_path = class_dir / "vote_statistics.json"
@@ -451,10 +431,10 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
 def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
                     vote_identifier=None):
     """
-    Create labeled Gaussian files for every class and beta value
+    Select the Gaussians of every class and beta value in one container
 
     The returned tuple contains the beta values used and container count.
-    Existing labeled files are hit unless args.force is true.
+    Existing selections are hit unless args.force is true.
     """
 
     betas = list(args.betas)
@@ -463,40 +443,25 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
         # Start thresholding after vote accumulation
         vote_identifier = vote_identifier or vote_id(vars(args))
         safe = safe_name(spec.name_by_detector)
-        vote_path = vote_class_dir(segmentation_dir, spec, vote_identifier) / (
+        vote_path = vote_dir(segmentation_dir, spec, vote_identifier) / (
             f"voting_data_{safe}.pt"
         )
         if not vote_path.exists():
             continue
-        if any(not threshold_path(
-                segmentation_dir, spec, vote_identifier,
-                args.hysteresis_gamma, args.hysteresis_radius, beta,
+        if any(not selection_path(
+                vote_path.parent, args.hysteresis_gamma, args.hysteresis_radius, beta,
         ).exists() for beta in betas) or args.force:
-            pending.append((spec, vote_path))
+            pending.append(vote_path)
     if not pending:
         return betas, 0
-    command = [
+    runtime.run_lifting("segmentation/threshold_labels.py", [
         "--model_path", str(model_dir),
-        "--output_dir", str(segmentation_dir),
-        "--beta", *[str(beta) for beta in betas],
         "--loaded_iter", str(args.iterations),
         "--hysteresis_gamma", str(args.hysteresis_gamma),
         "--hysteresis_radius", str(args.hysteresis_radius),
-    ]
-    for spec, vote_path in pending:
-        command += [
-            "--class_spec", json.dumps({
-                "target_class": spec.name_by_detector,
-                "voting_data_path": str(vote_path),
-                "class_output_dir": str(
-                    vote_class_dir(segmentation_dir, spec, vote_identifier)
-                ),
-            }, separators=(",", ":")),
-        ]
-
-    if args.force:
-        command.append("--force")
-    runtime.run_lifting("segmentation/threshold_labels.py", command)
+        "--beta", *[str(beta) for beta in betas],
+        "--votes", *[str(path) for path in pending],
+    ])
     return betas, 1
 
 
@@ -529,24 +494,22 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
         sweep = {}
         for beta_index, beta in enumerate(betas, start=1):
 
-            # A missing labeled file represents an empty prediction for this
-            # class and beta, so its Ground Truth instances still contribute
-            # false negatives
-            path = threshold_path(
-                segmentation_dir, spec, vote_identifier,
+            # A class without votes or a missing selection represents an empty
+            # prediction for this class and beta, so its Ground Truth instances
+            # still contribute false negatives
+            path = selection_path(
+                vote_dir(segmentation_dir, spec, vote_identifier),
                 args.hysteresis_gamma, args.hysteresis_radius, beta,
             )
-
-            if spec.name not in available_names or not path.exists():
-                predicted_xyz = np.empty((0, 3), dtype=np.float64)
-            else:
-                predicted_xyz, _ = transfer.load_gaussian_ply(path)
+            selected = np.zeros(len(full_xyz), dtype=bool)
+            if spec.name in available_names and path.exists():
+                selected[np.load(path)] = True
 
             # Evaluate the predicted Gaussian mesh including empty predictions
             result = metrics.evaluate_class(
                 scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
                 full_opacity, spec,
-                predicted_xyz, args.tau, args.min_fraction,
+                selected, args.tau, args.min_fraction,
                 not args.no_opacity_weighting, args.min_opacity,
                 args.gaussian_to_mesh_background_competes,
                 args.gaussian_to_mesh_transfer, ground_truth_transfer_metrics,
@@ -555,6 +518,7 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
             score = result["iou"]["iou"]
             sweep[str(beta)] = {
                 "beta": beta,
+                "gaussian_count": int(selected.sum()),
                 "iou": result["iou"],
                 "ground_truth_transfer_iou": result["ground_truth_transfer_iou"],
                 "relative_iou": (
@@ -758,8 +722,13 @@ def main():
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
 
     # The clean-label reference per class is shared by every mask source
+    # The reference Gaussians of every class are saved for the qualitative renderer
     ground_truth_transfer_by_class = {}
+    reference_dir = results_dir / "reference"
+    reference_dir.mkdir(parents=True, exist_ok=True)
     for spec in evaluation_classes:
+        np.save(reference_dir / f"{safe_name(spec.name_by_detector)}.npy",
+                np.flatnonzero(gaussian_labels == scene.class_id(spec.name)))
         reference = metrics.evaluate_class(
             scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
             full_opacity, spec, None,
@@ -783,16 +752,6 @@ def main():
 
         # Only source classes absent from its mask metadata are excluded from vote generation
         vote_classes = _mask_classes(mask_dir, evaluation_classes)
-
-        # Export the clean reference transferred Gaussians into prediction directories
-        _measure_stage(
-            stage_records, f"{source}:export_gt_gaussians",
-            lambda: _export_gt_gaussians(
-                args, runtime, model_dir, gt_dir, source_dir, scene,
-                evaluation_classes,
-            ),
-            runtime=runtime,
-        )
 
         # Accumulate votes
         vote_launches = _measure_stage(
@@ -838,7 +797,7 @@ def main():
                 analytics_store, run_id, source, scene,
                 f"{scene.dataset}:{scene.scene}", evaluation_classes, betas,
                 source_dir, scene_results[source],
-                vote_identifier, args.hysteresis_gamma, args.hysteresis_radius,
+                vote_identifier, args.hysteresis_gamma,
             )
 
     # Update the source summary without dropping other results

@@ -33,24 +33,26 @@ def class_iou(predicted, ground_truth, mask, class_id):
     }
 
 
-def evaluate_class(scene, gaussians_near_a_vertex, gaussian_labels, full_xyz, full_opacity, spec, predicted_xyz, tau, min_fraction, opacity_weighted,
+def evaluate_class(scene, gaussians_near_a_vertex, gaussian_labels, full_xyz, full_opacity, spec, selected, tau, min_fraction, opacity_weighted,
                    min_opacity, gaussian_to_mesh_background_competes, gaussian_to_mesh_transfer,
                    ground_truth_transfer_metrics=None):
-    """Evaluate one target class and its GT transfer reference"""
+    """
+    Evaluate one target class and its GT transfer reference
+
+    selected is the boolean mask of the Gaussians predicted for the class, or None when it has no prediction
+    """
 
     # Resolve the local class and evaluation mask
     class_id = scene.class_id(spec.name)
     eval_mask = scene.evaluation_mask
 
     # Evaluate an empty or populated prediction
-    if predicted_xyz is None or len(predicted_xyz) == 0:
+    if selected is None or not selected.any():
 
         prediction = class_iou(np.full(len(scene.vertices), -1, dtype=np.int64), scene.semantic_labels, eval_mask, class_id)
 
     else:
-        indices = transfer.map_subset_indices(full_xyz, predicted_xyz)
-        predicted_labels = np.full(len(full_xyz), -1, dtype=np.int64)
-        predicted_labels[indices] = class_id
+        predicted_labels = np.where(selected, class_id, -1)
 
         vertex_labels = transfer.predict_vertex_labels(
             scene.vertices, gaussians_near_a_vertex, predicted_labels,

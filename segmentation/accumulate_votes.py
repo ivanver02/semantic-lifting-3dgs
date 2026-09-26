@@ -303,7 +303,7 @@ def accumulate_view(cam, gaussians, cov3D, target_confidence, background_confide
 def main(args):
     # Define the gaussians, Scene loads the trained model at the requested iteration
     # Source images stay on args.data_device while Scene builds camera data
-    gaussians = GaussianModel(sh_degree=args.sh_degree, use_labels=True)
+    gaussians = GaussianModel(sh_degree=args.sh_degree)
     scene = Scene(args, gaussians, load_iteration=args.loaded_iter, shuffle=False)
     cov3D = get_covariance_3d(gaussians)
 

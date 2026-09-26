@@ -8,7 +8,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .common import atomic_write_text, safe_name, threshold_path, vote_class_dir
+from .common import atomic_write_text, safe_name, vote_dir
 
 
 # Keep each relation in its own CSV
@@ -164,21 +164,6 @@ class AnalyticsStore:
         keys.add(key)
 
 
-def gaussian_count(path):
-    """ Count Gaussians from the PLY header without loading vertex arrays """
-    path = Path(path)
-    if not path.exists():
-        return 0
-    with path.open("rb") as handle:
-        for line in handle:
-            text = line.strip()
-            if text.startswith(b"element vertex"):
-                return int(text.split()[-1])
-            if text == b"end_header":
-                break
-    raise ValueError(f"PLY file has no vertex element: {path}")
-
-
 def deduplicate_analytics(root):
     """
     Return one analytical view that keeps only the latest completed data
@@ -261,7 +246,7 @@ def record_class_inventory(store, scene, scene_id):
 
 def record_source_analytics(store, run_id, source, scene, scene_id, classes, betas,
                             source_dir, result, vote_identifier,
-                            hysteresis_gamma, hysteresis_radius):
+                            hysteresis_gamma):
     """ Record votes, Gaussian counts and metrics for one mask source """
     for spec in classes:
         class_id = scene.class_id(spec.name)
@@ -270,8 +255,7 @@ def record_source_analytics(store, run_id, source, scene, scene_id, classes, bet
 
         # Vote statistics come from the JSON written by the accumulation container
         class_dir = source_dir / safe
-        vote_dir = vote_class_dir(source_dir, spec, vote_identifier)
-        vote_stats_path = vote_dir / "vote_statistics.json"
+        vote_stats_path = vote_dir(source_dir, spec, vote_identifier) / "vote_statistics.json"
         if vote_stats_path.exists():
             vote_stats = json.loads(vote_stats_path.read_text())
             vote_stats.update({
@@ -289,12 +273,10 @@ def record_source_analytics(store, run_id, source, scene, scene_id, classes, bet
             beta_id = f"{run_id}:{source}:{beta_order}"
             beta_key = str(beta)
             sweep = item.get("sweep", {}).get(beta_key)
+            if sweep is None:
+                continue
 
-            # Number of Gaussians selected by this threshold, read from the PLY header
-            predicted_path = threshold_path(
-                source_dir, spec, vote_identifier,
-                hysteresis_gamma, hysteresis_radius, beta,
-            )
+            # Number of Gaussians selected by this threshold
             store.append("gaussian_statistics", {
                 "run_id": run_id,
                 "variant": result.get("variant"),
@@ -305,10 +287,8 @@ def record_source_analytics(store, run_id, source, scene, scene_id, classes, bet
                 "beta_id": beta_id,
                 "beta": beta,
                 "set_type": "predicted",
-                "gaussian_count": gaussian_count(predicted_path),
+                "gaussian_count": sweep["gaussian_count"],
             })
-            if sweep is None:
-                continue
             prediction = sweep["iou"]
             ground_truth_transfer_metrics = sweep["ground_truth_transfer_iou"]
             store.append("class_beta_metrics", {

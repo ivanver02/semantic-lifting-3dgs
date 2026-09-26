@@ -13,9 +13,7 @@ sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from scene import Scene, GaussianModel
 from gaussian_renderer import render
 from arguments import ModelParams, PipelineParams, get_combined_args
-from evaluation.transfer import map_subset_indices
 from segmentation.threshold_labels import target_fraction
-from plyfile import PlyData
 
 
 def _selected_colors(num_gaussians, selected_indices, target_color, show_base):
@@ -28,10 +26,9 @@ def _selected_colors(num_gaussians, selected_indices, target_color, show_base):
     """
     base_color = 0.8 if show_base else 0.97
     colors = torch.full((num_gaussians, 3), base_color, dtype=torch.float32)
-    if len(selected_indices):
-        colors[torch.as_tensor(selected_indices, dtype=torch.long)] = torch.tensor(
-            target_color, dtype=torch.float32,
-        )
+    colors[torch.as_tensor(selected_indices, dtype=torch.long)] = torch.tensor(
+        target_color, dtype=torch.float32,
+    )
     return colors
 
 
@@ -79,17 +76,14 @@ def _save_score_legend(output_dir, beta):
 
 def main(args, pipe):
     # Define the gaussians and build the camera set from the prepared dataset, Scene loads the trained model
-    gaussians = GaussianModel(sh_degree=args.sh_degree, use_labels=True)
+    gaussians = GaussianModel(sh_degree=args.sh_degree)
     scene = Scene(args, gaussians, load_iteration=args.loaded_iter, shuffle=False)
     total_gaussians = gaussians.get_xyz.shape[0]
-    xyz = gaussians.get_xyz.detach().cpu().numpy()
+    os.makedirs(args.output_dir, exist_ok=True)
 
     # Resolve the per-Gaussian colours for the requested mode
-    if args.labeled_ply is not None:
-        vertex = PlyData.read(str(args.labeled_ply))["vertex"]
-        subset_xyz = np.vstack([vertex["x"], vertex["y"], vertex["z"]]).T.astype(np.float64)
-        selected_indices = map_subset_indices(xyz, subset_xyz)
-        colors = _selected_colors(total_gaussians, selected_indices, args.color, args.show_base)
+    if args.selection is not None:
+        colors = _selected_colors(total_gaussians, np.load(args.selection), args.color, args.show_base)
     else:
         voting_data = torch.load(args.voting_data, map_location="cpu")
         colors = _score_colors(
@@ -104,17 +98,14 @@ def main(args, pipe):
     # Render the requested number of views with white background
     background = torch.tensor([1.0, 1.0, 1.0], dtype=torch.float32, device="cuda")
     cameras = sorted(scene.getTrainCameras(), key=lambda item: item.image_name)
-    os.makedirs(args.output_dir, exist_ok=True)
 
-    for index, camera in enumerate(cameras[:max(1, args.num_views)]):
+    for camera in cameras[:max(1, args.num_views)]:
         output = render(camera, gaussians, pipe, background, override_color=colors)["render"]
         image = output.clamp(0.0, 1.0).permute(1, 2, 0).detach().cpu().numpy()
         stem = os.path.splitext(os.path.basename(camera.image_name))[0]
         image_path = os.path.join(args.output_dir, f"{stem}_qualitative.png")
         cv2.imwrite(image_path, (image * 255.0).astype(np.uint8)[:, :, ::-1])
         print(f"Saved {image_path}")
-
-    torch.cuda.empty_cache()
 
 
 if __name__ == "__main__":
@@ -129,8 +120,8 @@ if __name__ == "__main__":
     parser.add_argument("--num_views", type=int, default=6, help="Number of first train cameras to render, in name order")
 
     # First mode, highlight a labeled Gaussian subset with one solid colour
-    parser.add_argument("--labeled_ply", type=str, default=None,
-        help="Labeled Gaussian PLY (prediction or GT reference subset) to recolour")
+    parser.add_argument("--selection", type=str, default=None,
+        help="NPY file with the indices of the labeled Gaussians (prediction or GT reference subset) to recolour")
     parser.add_argument("--color", type=float, nargs=3, default=[1.0, 0.0, 0.0],
         help="RGB colour in [0, 1] applied to the labeled Gaussians")
     parser.add_argument("--show_base", action="store_true",
@@ -146,8 +137,8 @@ if __name__ == "__main__":
 
     args = get_combined_args(parser)
 
-    if (args.labeled_ply is None) == (args.voting_data is None):
-        raise SystemExit("pass either --labeled_ply (subset highlight) or --voting_data plus --beta (score colours)")
+    if (args.selection is None) == (args.voting_data is None):
+        raise SystemExit("pass either --selection (subset highlight) or --voting_data plus --beta (score colours)")
     if args.voting_data is not None and not 0.0 < args.beta < 1.0:
         raise SystemExit("--beta must lie strictly between 0 and 1 to split the colour scale")
     if any(not 0.0 <= channel <= 1.0 for channel in args.color):
