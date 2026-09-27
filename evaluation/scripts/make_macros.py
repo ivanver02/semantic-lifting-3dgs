@@ -21,12 +21,12 @@ scannetYOLOmIoUSd scannetYOLOPrec scannetYOLORec
 replicaRef scannetRef
 sdBetaNoHyst sdBetaHyst sdClassNoHyst sdClassHyst bestMean bestMeanSd selectedMean selectedSd eligibleCount quantileAtBeta
     replicaDetectorGap replicaLiftingGap replicaRepGap scannetDetectorGap scannetLiftingGap scannetRepGap classIoUmin classIoUmax
-replicaGTrel replicaYOLOrel scannetGTrel scannetYOLOrel replicaRelExcl scannetRelExcl
+replicaGTrel replicaYOLOrel scannetGTrel scannetYOLOrel
 ablFrozenmIoU ablFrozenSd ablFrozenRef ablFrozenCount ablNoHystmIoU ablNoHystSd ablNoHystRef ablNoHystCount
 ablNoGtoMmIoU ablNoGtoMSd ablNoGtoMRef ablNoGtoMCount ablNoMtoGmIoU ablNoMtoGSd ablNoMtoGRef ablNoMtoGCount
 ablNoBothmIoU ablNoBothSd ablNoBothRef ablNoBothCount ablNearestmIoU ablNearestSd ablNearestRef ablNearestCount
 ablNoOpacmIoU ablNoOpacSd ablNoOpacRef ablNoOpacCount ablAllViewsmIoU ablAllViewsSd ablAllViewsRef ablAllViewsCount
-timeMasks timeVotes timeThreshold timeTransfer timeSweepWarm timeMissTotal timeMissSweepEquivalent
+timeMasks timeVotes timeThreshold timeTransfer timeSweepWarm timeMissTotal
 memMasks memVotes memThreshold memTransfer memSweepWarm hardwareDescription qualScene qualClass""".split()
 
 
@@ -190,7 +190,7 @@ def stage_totals(view, run_id):
     return {group: times[group] for group in seen}, memories
 
 
-def measured_costs(values, view, candidate_count):
+def measured_costs(values, view):
     """ Fill the cost table from the miss run and the sweep row from the hit """
     miss, hit = cache_run_ids(view)
     if miss is None:
@@ -203,10 +203,6 @@ def measured_costs(values, view, candidate_count):
             values["mem" + group] = f"{max(observed) / 1e9:.1f}~GB"
     if times:
         values["timeMissTotal"] = f"{sum(times.values()):.1f}~s"
-
-    # The equivalent cost of the sweep without a cache is derived
-    if "Votes" in times and candidate_count:
-        values["timeMissSweepEquivalent"] = f"{times['Votes'] * candidate_count:.1f}~s"
 
     if hit is None:
         return
@@ -473,7 +469,6 @@ def main(argv=None):
     # Quantities that depend on the mask source are written per group
     miou = defaultdict(dict)
     references = defaultdict(dict)
-    excluded = defaultdict(dict)
 
     for (dataset, source), rows in groups.items():
         dataset_prefix = "replica" if dataset == "replica" else "scannet"
@@ -507,11 +502,8 @@ def main(argv=None):
             references[dataset_prefix][source_prefix] = statistics.mean(
                 reference_values
             )
-        excluded_values = numeric_values(rows, "zero_reference_class_count")
-        if excluded_values:
-            excluded[dataset_prefix][source_prefix] = sum(excluded_values)
 
-    # Emit the two mask-source-independent quantities, once per dataset
+    # Emit the mask-source-independent reference, once per dataset
     collapsed_reference = {}
     for dataset_prefix in ("replica", "scannet"):
         reference = collapse_over_sources(
@@ -523,29 +515,13 @@ def main(argv=None):
         if reference is not None:
             collapsed_reference[dataset_prefix] = reference
             values[dataset_prefix + "Ref"] = f"{reference:.2f}"
-        count = collapse_over_sources(
-            excluded.get(dataset_prefix, {}),
-            dataset_prefix,
-            "count of classes without a positive reference",
-            0.0,
-        )
-        if count is not None:
-            values[dataset_prefix + "RelExcl"] = f"{int(round(count))}"
 
     error_decomposition(values, miou, collapsed_reference)
     ablations(values, view, runs, beta, gamma)
     stability(values, view, runs, beta, gamma)
     qualitative_pair(values, view, runs, beta, gamma)
 
-    # The sweep the manuscript compares against would recompute the projection once per candidate
-    candidate_count = len(
-        {
-            num(row.get("beta"))
-            for row in view.get("aggregate_beta_metrics", [])
-            if num(row.get("beta")) is not None
-        }
-    )
-    measured_costs(values, view, candidate_count)
+    measured_costs(values, view)
     hardware(values, view)
 
     # Render the macro file and report missing measurements

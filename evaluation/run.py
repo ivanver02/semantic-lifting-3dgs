@@ -529,25 +529,16 @@ def _evaluate_scene(args, scene, neighbors, full_opacity,
             prediction = metrics.class_iou(
                 _transfer_to_mesh(args, neighbors, scene, selected, full_opacity), scene, class_id,
             )
-            result = {
-                "class": spec.name,
-                "name_by_detector": spec.name_by_detector,
-                "iou": prediction,
-                "ground_truth_transfer_iou": reference,
-            }
-
-            score = prediction["iou"]
             sweep[str(beta)] = {
                 "beta": beta,
                 "gaussian_count": int(selected.sum()),
                 "iou": prediction,
                 "ground_truth_transfer_iou": reference,
                 "relative_iou": (
-                    prediction["iou"] / reference["iou"] if reference["iou"] else 0.0
+                    prediction["iou"] / reference["iou"] if reference["iou"] > 0 else None
                 ),
-                "score": score,
             }
-            per_class_by_beta.setdefault(str(beta), {})[spec.name] = result
+            per_class_by_beta.setdefault(str(beta), {})[spec.name] = sweep[str(beta)]
 
         # Store the complete beta sweep for this class
         per_class[spec.name] = {
