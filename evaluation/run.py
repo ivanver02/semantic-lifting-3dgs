@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import metrics, reporting, transfer
+from . import metrics, transfer
 from .analytics import (
     AnalyticsStore,
     collect_run_metadata,
@@ -19,7 +19,7 @@ from .analytics import (
     utc_now,
 )
 from .common import (
-    atomic_write_text,
+    atomic_write,
     digest,
     safe_name,
     target_classes_by_detector,
@@ -46,6 +46,7 @@ SCANNETPP_MASK_BANDS = 4
 YOLO_CONF = 0.75
 RASTER_BLOCK_SIZE = 16
 
+# The configuration fields whose results belong to one variant
 VARIANT_DEFAULTS = {
     "hysteresis_gamma": 0.8,
     "hysteresis_radius": 0.05,
@@ -59,37 +60,6 @@ VARIANT_DEFAULTS = {
     "background_confidence": 0.25,
     "background_view_policy": "target_views",
 }
-
-
-def _variant_parameters(args):
-    """ Return the configuration fields whose results belong to one variant """
-    return {
-        "hysteresis_gamma": args.hysteresis_gamma,
-        "hysteresis_radius": args.hysteresis_radius,
-        "tau": args.tau,
-        "min_fraction": args.min_fraction,
-        "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
-        "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
-
-    # Add transfer and weighting settings
-        "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
-        "opacity_weighting": not args.no_opacity_weighting,
-        "min_opacity": args.min_opacity,
-        "background_confidence": args.background_confidence,
-        "background_view_policy": args.background_view_policy,
-    }
-
-
-def _resolve_variant(args):
-    """
-    Resolve the result variant label
-
-    A readable label such as frozen_g0_8 can be passed explicitly, otherwise
-    the configuration digest identifies the variant on its own.
-    """
-    if args.variant is not None:
-        return args.variant
-    return "v" + digest(_variant_parameters(args))
 
 
 def _progress(message):
@@ -132,8 +102,6 @@ def _parser():
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--variant", default=None,
                         help="Result variant identity, defaults to a configuration digest")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Print the source plan without initializing evaluation")
     parser.add_argument("--model-root", type=Path, default=None, help="Gaussian model directory to reuse, if exists")
 
     # Select the source of the 2D masks
@@ -253,30 +221,24 @@ def _source_names(mask_source):
     return [mask_source]
 
 
-def _pending_sources(results_dir, sources, force):
-    """ Return sources whose result JSON does not exist yet """
-    return [
-        source for source in sources
-        if force or not (results_dir / f"results_{source}.json").exists()
-    ]
+def _pending_sources(results_dir, sources, parameters, force):
+    """
+    Return sources whose result JSON does not exist yet
 
-
-def _validate_existing_beta_grids(results_dir, sources, betas, force):
-    """ Reject an overwrite with a different beta sweep """
-    if force:
-        return
+    Existing results are only reused when they were computed with the same
+    parameters, so one variant never mixes two configurations
+    """
+    pending = []
     for source in sources:
         path = results_dir / f"results_{source}.json"
-        if not path.exists():
-            continue
-        previous = json.loads(path.read_text())
-        previous_betas = previous.get("parameters", {}).get("betas")
-        if previous_betas != list(betas):
+        if force or not path.exists():
+            pending.append(source)
+        elif json.loads(path.read_text())["parameters"] != parameters:
             raise RuntimeError(
-                f"{path} already contains results for betas {previous_betas!r}, "
-                f"while this invocation uses {list(betas)!r}. The caller must "
-                "read the existing results or pass --force to discard them."
+                f"{path} was computed with other parameters. Use another "
+                "--variant, or pass --force to discard those results."
             )
+    return pending
 
 
 def _resolve_model_dir(args, data_root, output_root):
@@ -483,45 +445,30 @@ def _ground_truth_transfer(args, scene, classes, full_xyz, full_opacity, referen
     return neighbors, references
 
 
-def _evaluate_scene(args, scene, neighbors, full_opacity,
-                      classes,
-                       available_classes,
-                       ground_truth_transfer_by_class,
-                       vote_identifier,
-                       variant,
-                       segmentation_dir, betas, results_dir, source):
+def _evaluate_source(args, scene, classes, vote_classes, neighbors, full_opacity,
+                     references, segmentation_dir, identifier):
     """
-    Evaluate one mask source and write its JSON results
+    Evaluate one mask source for every class and beta
 
-    betas is the beta threshold grid
+    Returns the per class sweeps and the aggregate metrics of each beta
     """
-
     per_class = {}
-    per_class_by_beta = {}
-    scene_started = time.perf_counter()
-    _progress(
-        f"Evaluation {source}: {len(classes)} classes, "
-        f"{len(betas)} beta value(s)"
-    )
-    available_names = {spec.name for spec in available_classes}
-
     for spec in classes:
         class_id = scene.class_id(spec.name)
-        reference = ground_truth_transfer_by_class[spec.name]
+        reference = references[spec.name]
 
         sweep = {}
-        for beta_index, beta in enumerate(betas, start=1):
+        for beta in args.betas:
 
-            # A class without votes or a missing selection represents an empty
-            # prediction for this class and beta, so its Ground Truth instances
-            # still contribute false negatives
-            path = selection_path(
-                vote_dir(segmentation_dir, spec, vote_identifier),
-                args.hysteresis_gamma, args.hysteresis_radius, beta,
-            )
+            # A class without votes represents an empty prediction for this
+            # class and beta, so its Ground Truth instances still contribute
+            # false negatives
             selected = np.zeros(len(full_opacity), dtype=bool)
-            if spec.name in available_names and path.exists():
-                selected[np.load(path)] = True
+            if spec in vote_classes:
+                selected[np.load(selection_path(
+                    vote_dir(segmentation_dir, spec, identifier),
+                    args.hysteresis_gamma, args.hysteresis_radius, beta,
+                ))] = True
 
             # Evaluate the predicted Gaussian mesh including empty predictions
             prediction = metrics.class_iou(
@@ -536,7 +483,6 @@ def _evaluate_scene(args, scene, neighbors, full_opacity,
                     prediction["iou"] / reference["iou"] if reference["iou"] > 0 else None
                 ),
             }
-            per_class_by_beta.setdefault(str(beta), {})[spec.name] = sweep[str(beta)]
 
         # Store the complete beta sweep for this class
         per_class[spec.name] = {
@@ -546,41 +492,12 @@ def _evaluate_scene(args, scene, neighbors, full_opacity,
 
     # Aggregate each requested beta independently
     metrics_by_beta = {
-        beta: metrics.aggregate(beta_classes)
-        for beta, beta_classes in per_class_by_beta.items()
+        str(beta): metrics.aggregate({
+            name: item["sweep"][str(beta)] for name, item in per_class.items()
+        })
+        for beta in args.betas
     }
-
-    # Save the scene name, evaluation masks, parameters and metrics to JSON
-    result = {
-        "dataset": scene.dataset,
-        "scene": scene.scene,
-        "mask_source": source,
-        "variant": variant,
-        "support": {
-            "vertices_evaluated": int(scene.evaluation_mask.sum()),
-        },
-        "parameters": {
-            "hysteresis_gamma": args.hysteresis_gamma,
-            "hysteresis_radius": args.hysteresis_radius,
-            "background_confidence": args.background_confidence,
-            "background_view_policy": args.background_view_policy,
-            "betas": betas,
-            "tau": args.tau,
-            "min_fraction": args.min_fraction,
-            "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
-            "opacity_weighted": not args.no_opacity_weighting,
-            "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
-            "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
-        },
-        "metrics_by_beta": metrics_by_beta,
-        "per_class": per_class,
-    }
-    reporting.write_result(results_dir, result)
-    _progress(
-        f"Evaluation {source} finished in "
-        f"{time.perf_counter() - scene_started:.1f}s"
-    )
-    return result
+    return per_class, metrics_by_beta
 
 
 def main():
@@ -624,22 +541,15 @@ def main():
     if args.train_data_device is None:
         args.train_data_device = "cpu" if args.dataset == "scannetpp" else "cuda"
 
-    variant = _resolve_variant(args)
-    results_dir = output_root / "results" / variant
     parameters = run_parameters(args, data_root)
+    variant = args.variant or "v" + digest({key: parameters[key] for key in VARIANT_DEFAULTS})
     vote_identifier = vote_id(parameters)
-    requested_sources = _source_names(args.mask_source)
-    _validate_existing_beta_grids(
-        results_dir, requested_sources, args.betas, args.force,
-    )
+    results_dir = output_root / "results" / variant
 
     # Decide which mask sources still need a run
-    pending_sources = _pending_sources(results_dir, requested_sources, args.force)
-    if args.dry_run:
-        skipped = [source for source in requested_sources if source not in pending_sources]
-        print(json.dumps({"run": False, "pending": pending_sources, "skipped": skipped}))
-        return
-
+    pending_sources = _pending_sources(
+        results_dir, _source_names(args.mask_source), parameters, args.force,
+    )
     if not pending_sources:
         print("skip: All requested sources already have results")
         return
@@ -717,11 +627,10 @@ def main():
     )
 
     # Process every source that still needs results
-    scene_results = {}
-    results_dir_for = {
-        source: results_dir for source in pending_sources
-    }
+    results = {}
     for source in pending_sources:
+        _progress(f"Evaluation {source}: {len(evaluation_classes)} classes, {len(args.betas)} beta value(s)")
+
         # Select the mask directory and the segmentation directory for this mask source
         mask_dir = output_root / ("masks_yolo" if source == "yolo" else "masks_gt2d")
         source_dir = segmentation_root / source
@@ -765,34 +674,34 @@ def main():
         )
 
         # Evaluate every beta for the selected source
-        scene_results[source] = _measure_stage(
+        per_class, metrics_by_beta = _measure_stage(
             stage_records, runtime, f"{source}:evaluation_transfer",
-            lambda: _evaluate_scene(
-                args, scene, neighbors, full_opacity, evaluation_classes, vote_classes,
-                ground_truth_transfer_by_class, vote_identifier, variant,
-                source_dir, args.betas, results_dir_for[source], source,
+            lambda: _evaluate_source(
+                args, scene, evaluation_classes, vote_classes, neighbors,
+                full_opacity, ground_truth_transfer_by_class, source_dir, vote_identifier,
             ),
         )
-        if analytics_store is not None:
-            record_source_analytics(
-                analytics_store, run_id, source, scene,
-                f"{scene.dataset}:{scene.scene}", evaluation_classes, args.betas,
-                source_dir, scene_results[source],
-                vote_identifier, args.hysteresis_gamma,
-            )
 
-    # Update the source summary without dropping other results
-    summary_path = results_dir / "results.json"
-    previous_results = {}
-    if summary_path.exists():
-        previous_results = json.loads(summary_path.read_text())
-    previous_results.update(scene_results)
-    atomic_write_text(
-        summary_path, json.dumps(previous_results, indent=2, default=str) + "\n",
-    )
+        # Save the scene name, parameters and metrics
+        results[source] = {
+            "dataset": scene.dataset,
+            "scene": scene.scene,
+            "mask_source": source,
+            "variant": variant,
+            "parameters": parameters,
+            "metrics_by_beta": metrics_by_beta,
+            "per_class": per_class,
+        }
 
     # Record the completed run, its parameters and its stages
     if analytics_store is not None:
+        for source, result in results.items():
+            record_source_analytics(
+                analytics_store, run_id, source, scene,
+                f"{scene.dataset}:{scene.scene}", evaluation_classes, args.betas,
+                output_root / "segmentation" / source, result,
+                vote_identifier, args.hysteresis_gamma,
+            )
         elapsed_seconds = time.perf_counter() - run_started
         peak_memory_values = [
             record["peak_cuda_memory_bytes"]
@@ -841,9 +750,16 @@ def main():
                     "peak_cuda_memory_reserved_bytes"
                 ],
             })
+
+    # The results are written last, so a unit with results is always a complete one
+    for source, result in results.items():
+        atomic_write(
+            results_dir / f"results_{source}.json",
+            lambda path: path.write_text(json.dumps(result, indent=2) + "\n"),
+        )
     _progress(f"Run finished in {time.perf_counter() - run_started:.1f}s")
-    print(json.dumps({name: value["metrics_by_beta"]
-                      for name, value in scene_results.items()}, indent=2))
+    print(json.dumps({source: result["metrics_by_beta"]
+                      for source, result in results.items()}, indent=2))
 
 
 def _make_scene(args, data_root, support_dir):
