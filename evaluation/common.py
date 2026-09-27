@@ -110,6 +110,13 @@ def vote_dir(segmentation_dir, spec, identifier):
     return Path(segmentation_dir) / safe_name(spec.name_by_detector) / identifier
 
 
+def vote_path(segmentation_dir, spec, identifier):
+    """ Votes of one class, written by segmentation/accumulate_votes.py """
+    return vote_dir(segmentation_dir, spec, identifier) / (
+        f"voting_data_{safe_name(spec.name_by_detector)}.pt"
+    )
+
+
 def selection_path(class_vote_dir, gamma, radius, beta):
     """
     Indices of the Gaussians selected for one class at one operating point,

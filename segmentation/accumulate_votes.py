@@ -1,9 +1,9 @@
 import torch
 import os
-import tempfile
 import sys
 import cv2
 import json
+import numpy as np
 from argparse import ArgumentParser
 
 # Add project root to path
@@ -13,11 +13,8 @@ from scene import Scene, GaussianModel
 from arguments import get_combined_args
 from segmentation.projection import get_covariance_3d, project_gaussians
 from segmentation.threshold_labels import target_fraction
-
-# Quantiles recorded for the target evidence fraction distribution. They are
-# consumed by the analytics CSV and reported in the manuscript appendix.
-QUANTILE_LEVELS = [0.05, 0.25, 0.50, 0.75, 0.90, 0.925, 0.95, 0.975, 0.99, 0.999]
-QUANTILE_NAMES = ["p05", "p25", "median", "p75", "p90", "p92_5", "p95", "p97_5", "p99", "p99_9"]
+from evaluation.analytics import QUANTILES
+from evaluation.common import atomic_write
 
 # Camera matrices are always stored on the GPU by the Camera class
 DEVICE = "cuda"
@@ -78,25 +75,6 @@ def get_pixel_confidence(detector_label_mask, confidence_mask, background_confid
     pixel_confidence = confidence_mask.clone()
     pixel_confidence[detector_label_mask == 0] = background_confidence
     return pixel_confidence
-
-
-def _score_summary(scores):
-    """ Summarize the target evidence fraction over supported Gaussians """
-    values = scores.detach().float().cpu()
-    if values.numel() == 0:
-        summary = {"min": None, "mean": None, "std": None, "max": None}
-        summary.update({name: None for name in QUANTILE_NAMES})
-        return summary
-
-    quantiles = torch.quantile(values, torch.tensor(QUANTILE_LEVELS, dtype=values.dtype))
-    summary = {
-        "min": float(values.min().item()),
-        "mean": float(values.mean().item()),
-        "std": float(values.std(unbiased=False).item()),
-        "max": float(values.max().item()),
-    }
-    summary.update(dict(zip(QUANTILE_NAMES, (float(item.item()) for item in quantiles))))
-    return summary
 
 
 def accumulate_view(cam, gaussians, cov3D, target_confidence, background_confidence, block_size):
@@ -347,67 +325,31 @@ def main(args):
         global_target_weights[indices] += target_votes
         global_background_weights[indices] += background_votes
 
-    # Save the global votes and weights for later use in thresholding
-    safe_class_name = args.target_class.replace(" ", "_")
-    class_output_dir = os.path.join(args.output_dir, safe_class_name, args.vote_id)
-    os.makedirs(class_output_dir, exist_ok=True)
-    voting_data_path = os.path.join(class_output_dir, f"voting_data_{safe_class_name}.pt")
-
-    voting_data = {
-        'target_weights': global_target_weights,
-        'background_weights': global_background_weights,
+    # Summarize the target evidence fraction over supported Gaussians, the distribution that beta cuts
+    scores, supported = target_fraction(global_target_weights, global_background_weights)
+    values = scores[supported].cpu().numpy()
+    quantiles = np.quantile(values, list(QUANTILES.values())) if len(values) else [None] * len(QUANTILES)
+    statistics = {
         'num_cameras': len(masked_cameras),
         'num_class_views': class_views,
-        'target_id': target_id,
-        'background_confidence': args.background_confidence,
-        'background_view_policy': args.background_view_policy,
+        'num_gaussians': total_gaussians,
+        'supported_gaussians': int(supported.sum().item()),
+        'supported_fraction': float(supported.float().mean().item()),
+        **{f'target_score_{name}': None if value is None else float(value)
+           for name, value in zip(QUANTILES, quantiles)},
     }
 
-    # Vote statistics are only written when analytics recording is enabled
-    if args.statistics_path:
-        scores, supported = target_fraction(global_target_weights, global_background_weights)
-
-        statistics = {
-            'num_cameras': len(masked_cameras),
-            'num_class_views': class_views,
-            'num_gaussians': int(global_target_weights.numel()),
-            'target_weight_sum': float(global_target_weights.sum().item()),
-            'background_weight_sum': float(global_background_weights.sum().item()),
-            'supported_gaussians': int(supported.sum().item()),
-            **{f'target_score_{name}': value
-               for name, value in _score_summary(scores[supported]).items()},
-            'supported_fraction': float(supported.float().mean().item()),
-        }
-
-        # Write statistics atomically
-        os.makedirs(os.path.dirname(args.statistics_path), exist_ok=True)
-        fd, temporary_name = tempfile.mkstemp(
-            dir=os.path.dirname(args.statistics_path), suffix=".tmp",
-        )
-        try:
-            with os.fdopen(fd, 'w') as handle:
-                json.dump(statistics, handle, indent=2)
-                handle.write("\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary_name, args.statistics_path)
-        finally:
-            if os.path.exists(temporary_name):
-                os.unlink(temporary_name)
-
-    # Persist the voting data atomically
-    fd, temporary_name = tempfile.mkstemp(
-        dir=class_output_dir, suffix=".pt.tmp",
-    )
-    os.close(fd)
-    try:
-        torch.save(voting_data, temporary_name)
-        os.replace(temporary_name, voting_data_path)
-    finally:
-        # Remove an incomplete vote file
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
-    print(f"Saved voting weights to {voting_data_path}")
+    # Save the global votes for later use in thresholding, with their statistics beside them
+    voting_data = {
+        'target_weights': global_target_weights.cpu(),
+        'background_weights': global_background_weights.cpu(),
+        'num_cameras': len(masked_cameras),
+        'num_class_views': class_views,
+    }
+    statistics_path = os.path.join(os.path.dirname(args.output_path), "vote_statistics.json")
+    atomic_write(statistics_path, lambda path: path.write_text(json.dumps(statistics, indent=2) + "\n"))
+    atomic_write(args.output_path, lambda path: torch.save(voting_data, path))
+    print(f"Saved voting weights to {args.output_path}")
 
 
 if __name__ == "__main__":
@@ -417,12 +359,10 @@ if __name__ == "__main__":
     parser.add_argument("--model_path", required=True, help="Path to trained 3DGS model output")
     parser.add_argument("--source_path", required=True, help="Prepared dataset directory used by Scene")
     parser.add_argument("--mask_dir", required=True, help="Directory containing semantic and confidence masks")
-    parser.add_argument("--output_dir", required=True, help="Directory to save outputs")
+    parser.add_argument("--output_path", required=True, help="Voting data PT file to write, vote_statistics.json is written beside it")
     parser.add_argument("--target_class", required=True, help="Detector name of the segmented class; only one object at a time")
     parser.add_argument("--sh_degree", type=int, default=3)  # Spherical Harmonics degree for the Gaussian model
     parser.add_argument("--loaded_iter", type=int, default=30000, help="Iteration number to load from the model")
-    parser.add_argument("--vote_id", type=str, default="default", help="Identity of the vote configuration")
-    parser.add_argument("--statistics_path", type=str, default=None, help="Optional JSON path for vote statistics")
 
     # Device configuration and performance
     parser.add_argument("--data_device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device for source images, camera matrices remain on the GPU")

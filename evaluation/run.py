@@ -26,6 +26,7 @@ from .common import (
     selection_path,
     vote_dir,
     vote_id,
+    vote_path,
 )
 from .runtime import Runtime
 from .replica.scene import ReplicaScene
@@ -374,51 +375,37 @@ def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
 
 
 def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
-               segmentation_dir, classes,
-               save_statistics=False, vote_identifier=None):
+               segmentation_dir, classes, vote_identifier):
     """
     Accumulate 2D votes for every target class present in the source masks.
 
     classes contains only classes that the source can represent in its mask
     metadata. Classes absent from the source are handled as empty predictions
-    by the evaluation stage. Existing vote files are hit unless args.force
-    is true.
+    by the evaluation stage. Existing votes and their statistics are hit unless
+    args.force is true.
     """
     launched = 0
     for spec in classes:
         # Each selected main class, identified here by its detector name,
         # receives its own vote directory and cache file
-        vote_identifier = vote_identifier or vote_id(vars(args))
-        class_dir = vote_dir(segmentation_dir, spec, vote_identifier)
-        safe = safe_name(spec.name_by_detector)
-        vote_path = class_dir / f"voting_data_{safe}.pt"
-        statistics_path = class_dir / "vote_statistics.json"
-        if (vote_path.exists() and
-                not args.force and
-                (not save_statistics or statistics_path.exists())):
+        output_path = vote_path(segmentation_dir, spec, vote_identifier)
+        statistics_path = output_path.parent / "vote_statistics.json"
+        if output_path.exists() and statistics_path.exists() and not args.force:
             continue
 
         # Accumulate votes for this main class using masks whose pixels contain
         # stored detector IDs
-        command = [
-            "--model_path", str(model_dir),
-            "--mask_dir", str(mask_dir),
-            "--output_dir", str(segmentation_dir),
-            "--vote_id", vote_identifier,
-            "--target_class", spec.name_by_detector,
-            "--loaded_iter", str(args.iterations),
-            "--raster_block_size", str(args.raster_block_size),
-            "--source_path", str(dataset_dir),
-            "--data_device", str(args.vote_data_device),
-        ]
-        if save_statistics:
-            command += [
-                "--statistics_path",
-                str(statistics_path),
-            ]
-
         runtime.run_lifting(
-            "segmentation/accumulate_votes.py", command + [
+            "segmentation/accumulate_votes.py",
+            [
+                "--model_path", str(model_dir),
+                "--source_path", str(dataset_dir),
+                "--mask_dir", str(mask_dir),
+                "--output_path", str(output_path),
+                "--target_class", spec.name_by_detector,
+                "--loaded_iter", str(args.iterations),
+                "--raster_block_size", str(args.raster_block_size),
+                "--data_device", str(args.vote_data_device),
                 "--background_confidence", str(args.background_confidence),
                 "--background_view_policy", str(args.background_view_policy),
             ],
@@ -442,16 +429,13 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     for spec in classes:
         # Start thresholding after vote accumulation
         vote_identifier = vote_identifier or vote_id(vars(args))
-        safe = safe_name(spec.name_by_detector)
-        vote_path = vote_dir(segmentation_dir, spec, vote_identifier) / (
-            f"voting_data_{safe}.pt"
-        )
-        if not vote_path.exists():
+        path = vote_path(segmentation_dir, spec, vote_identifier)
+        if not path.exists():
             continue
         if any(not selection_path(
-                vote_path.parent, args.hysteresis_gamma, args.hysteresis_radius, beta,
+                path.parent, args.hysteresis_gamma, args.hysteresis_radius, beta,
         ).exists() for beta in betas) or args.force:
-            pending.append(vote_path)
+            pending.append(path)
     if not pending:
         return betas, 0
     runtime.run_lifting("segmentation/threshold_labels.py", [
@@ -758,9 +742,7 @@ def main():
             stage_records, f"{source}:votes",
             lambda: _run_votes(
                 args, runtime, dataset_dir, model_dir, mask_dir, source_dir,
-                vote_classes,
-                analytics_store is not None,
-                vote_identifier,
+                vote_classes, vote_identifier,
             ),
             runtime=runtime,
         )

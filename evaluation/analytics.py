@@ -11,6 +11,13 @@ from pathlib import Path
 from .common import atomic_write_text, safe_name, vote_dir
 
 
+# Quantiles recorded for the target evidence fraction distribution, from P05 to P99.9.
+# They are consumed by the analytics CSV and reported in the manuscript appendix.
+QUANTILES = {
+    "p05": 0.05, "p25": 0.25, "median": 0.50, "p75": 0.75, "p90": 0.90,
+    "p92_5": 0.925, "p95": 0.95, "p97_5": 0.975, "p99": 0.99, "p99_9": 0.999,
+}
+
 # Keep each relation in its own CSV
 SCHEMA = {
     "runs": [
@@ -51,15 +58,10 @@ SCHEMA = {
     ],
 
     "vote_statistics": [
-        "run_id", "variant", "scene_id", "source", "vote_id", "class_id", "num_cameras", "num_class_views",
-        "num_gaussians", "target_weight_sum", "background_weight_sum",
-        "supported_gaussians", "target_score_mean", "target_score_std",
-        "target_score_min", "target_score_p05", "target_score_p25",
-        "target_score_median", "target_score_p75", "target_score_p90",
-        "target_score_p92_5", "target_score_p95", "target_score_p97_5",
-        "target_score_p99", "target_score_p99_9",
-        "target_score_max", "supported_fraction",
-    ],
+        "run_id", "variant", "scene_id", "source", "vote_id", "class_id",
+        "num_cameras", "num_class_views", "num_gaussians",
+        "supported_gaussians", "supported_fraction",
+    ] + [f"target_score_{name}" for name in QUANTILES],
 
     # One row per class and beta with the number of selected Gaussians
     "gaussian_statistics": [
