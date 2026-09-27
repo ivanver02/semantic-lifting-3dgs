@@ -124,6 +124,7 @@ if __name__ == "__main__":
      In classes.json, the keys are stored detector IDs and the values are
      detector names returned by YOLO. The keys are detector model IDs shifted
      by one (stored_id = cls_id + 1), so zero remains the background ID.
+     classes.json is written last, so its presence marks the masks as complete.
     '''
 
     serializable_map = {str(k): v for k, v in global_names.items()}

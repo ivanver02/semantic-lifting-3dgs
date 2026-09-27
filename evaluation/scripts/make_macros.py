@@ -140,34 +140,23 @@ def cache_run_ids(view):
     """
     Return the run identified as a cache miss and the one identified as a hit.
 
-    The vote container count is the signal that does not depend on cache_mode:
-    a miss launches one vote container per class and source, a hit launches none
-    because the vote artifact is already on disk. When cache_mode is populated
-    it is preferred, since it states the condition directly.
+    A miss computed the votes of every class and source, and a hit read all of
+    them from the cache, as the cache_mode of the vote stages states
     """
     completed = {
         row.get("run_id")
         for row in view.get("runs", [])
         if row.get("status") == "completed"
     }
-    containers = defaultdict(int)
     modes = defaultdict(set)
     for row in view.get("run_stages", []):
         run_id = row.get("run_id")
         if run_id not in completed or not row.get("stage", "").endswith(":votes"):
             continue
-        containers[run_id] += int(row.get("container_count") or 0)
-        if row.get("cache_mode"):
-            modes[run_id].add(row["cache_mode"])
-    if not containers:
-        return None, None
-    miss = max(containers, key=lambda run_id: (containers[run_id], run_id or ""))
-    hits = [
-        run_id
-        for run_id, count in containers.items()
-        if modes.get(run_id) == {"hit"} or (count == 0 and run_id != miss)
-    ]
-    return miss, (min(hits, key=lambda run_id: run_id or "") if hits else None)
+        modes[run_id].add(row.get("cache_mode"))
+    misses = sorted(run_id for run_id, mode in modes.items() if mode == {"miss"})
+    hits = sorted(run_id for run_id, mode in modes.items() if mode == {"hit"})
+    return (misses[0] if misses else None), (hits[0] if hits else None)
 
 
 def stage_totals(view, run_id):

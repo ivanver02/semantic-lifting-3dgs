@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from plyfile import PlyData
 
-from ..common import SceneData, TargetClassInfo, atomic_write_text, ensure_dir
+from ..common import SceneData, TargetClassInfo, ensure_dir
 
 
 CLASSES = [
@@ -282,11 +282,6 @@ class ReplicaScene:
         # Training expects an images directory and a COLMAP model
         images_dir = output_dir / "images"
         sparse_dir = output_dir / "sparse" / "0"
-
-        # Reuse the prepared dataset when all three COLMAP text files exist
-        if all((output_dir / item).exists() for item in
-               ["sparse/0/cameras.txt", "sparse/0/images.txt", "sparse/0/points3D.txt"]):
-            return output_dir
         ensure_dir(images_dir)
         ensure_dir(sparse_dir)
 
@@ -352,7 +347,7 @@ class ReplicaScene:
             selected = rng.choice(len(points), MAX_POINTS, replace=False)
             points, colors = points[selected], colors[selected]
 
-        # Save sampled points for COLMAP
+        # Save sampled points for COLMAP, the last file, whose presence marks the dataset as prepared
         with open(sparse_dir / "points3D.txt", "w") as output:
             output.write("# Point list\n")
             for point_id, (point, color) in enumerate(zip(points, colors), start=1):
@@ -360,30 +355,9 @@ class ReplicaScene:
                     f"{point_id} {point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
                     f"{int(color[0])} {int(color[1])} {int(color[2])} 1.0\n"
                 )
-        return output_dir
 
-    def generate_gt_masks(self, output_dir, force=False, resolution=None):
-        """
-        Generate or reuse binary 2D GT masks from Replica semantic images
-
-        force regenerates the masks when enabled
-        """
-
-        # The metadata contract decides whether existing masks can be reused
-        metadata = {
-            "version": 1,
-            "sequence_name": self.sequence.name,
-            "frame_step": self.frame_step,
-            "vertex_label_min_fraction": self.vertex_label_min_fraction,
-            "visibility_slop": self.visibility_slop,
-            "resolution": resolution,
-        }
-        metadata_path = output_dir / "mask_metadata.json"
-        previous = None
-        if metadata_path.exists():
-            previous = json.loads(metadata_path.read_text())
-        if (output_dir / "classes.json").exists() and previous == metadata and not force:
-            return output_dir
+    def generate_gt_masks(self, output_dir):
+        """ Generate binary 2D GT masks from Replica semantic images """
         ensure_dir(output_dir / "semantic")
         ensure_dir(output_dir / "confidence")
 
@@ -411,7 +385,6 @@ class ReplicaScene:
             cv2.imwrite(str(output_dir / "confidence" / f"{name}.png"),
                         (mapped > 0).astype(np.uint8) * 255)
 
+        # classes.json is written last, so its presence marks the masks as complete
         classes = {str(item.detector_stored_id): item.name_by_detector for item in CLASSES}
         (output_dir / "classes.json").write_text(json.dumps(classes, indent=2))
-        atomic_write_text(metadata_path, json.dumps(metadata, indent=2) + "\n")
-        return output_dir

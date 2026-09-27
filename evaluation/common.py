@@ -85,24 +85,23 @@ def float_token(value):
     return str(value).replace(".", "_")
 
 
-def main_digest(values, length=12):
+def digest(values, length=12):
     """ Return a digest for a configuration mapping """
     payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
 
 
-def vote_scope(parameters):
-    """ Return settings for a vote artifact """
-    keys = (
-        "background_confidence", "background_view_policy",
-        "raster_block_size", "vote_data_device",
-    )
-    return {key: parameters[key] for key in keys}
+# Settings that change the accumulated votes, so votes computed with other
+# values are stored under another identifier and never reused by mistake
+VOTE_KEYS = (
+    "background_confidence", "background_view_policy",
+    "raster_block_size", "vote_data_device",
+)
 
 
 def vote_id(parameters):
     """ Return the id of a vote configuration """
-    return "v" + main_digest(vote_scope(parameters))
+    return "v" + digest({key: parameters[key] for key in VOTE_KEYS})
 
 
 def vote_dir(segmentation_dir, spec, identifier):

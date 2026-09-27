@@ -28,11 +28,11 @@ SCHEMA = {
     ],
 
     "run_parameters": [
-        "run_id", "variant", "vote_id", "evaluation_scope_version", "dataset",
+        "run_id", "variant", "vote_id", "dataset",
         "scene", "split", "data_root", "sequence_name", "frame_step",
         "iterations", "resolution", "train_data_device", "vote_data_device",
         "replica_vertex_label_min_fraction", "replica_visibility_slop",
-        "scannetpp_mask_version", "scannetpp_mask_bands",
+        "scannetpp_mask_bands",
         "yolo_conf", "hysteresis_gamma", "hysteresis_radius",
         "background_confidence", "background_view_policy",
         "betas", "tau", "min_fraction",
@@ -52,7 +52,6 @@ SCHEMA = {
 
     "run_stages": [
         "run_id", "dataset", "scene_id", "stage", "cache_mode",
-        "container_count",
         "elapsed_seconds", "peak_cuda_memory_bytes",
         "peak_cuda_memory_reserved_bytes",
     ],

@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import cache, metrics, reporting, transfer
+from . import metrics, reporting, transfer
 from .analytics import (
     AnalyticsStore,
     collect_run_metadata,
@@ -20,7 +20,7 @@ from .analytics import (
 )
 from .common import (
     atomic_write_text,
-    main_digest,
+    digest,
     safe_name,
     target_classes_by_detector,
     selection_path,
@@ -30,7 +30,7 @@ from .common import (
 )
 from .runtime import Runtime
 from .replica.scene import ReplicaScene
-from .scannetpp.scene import MASKS_CACHE_VERSION, ScannetScene
+from .scannetpp.scene import ScannetScene
 
 
 DEFAULT_DATA_ROOT = Path("/mnt/hddb/dataTFGIvanVerdugo")
@@ -89,7 +89,7 @@ def _resolve_variant(args):
     """
     if args.variant is not None:
         return args.variant
-    return "v" + main_digest(_variant_parameters(args))
+    return "v" + digest(_variant_parameters(args))
 
 
 def _progress(message):
@@ -97,47 +97,25 @@ def _progress(message):
     print(f"progress: {message}", flush=True)
 
 
-def _artifact_stamp(path):
+def _measure_stage(stage_records, runtime, name, function, computed=True):
     """
-    Identify the current state of a stage artifact.
+    Run one stage and retain elapsed time plus container CUDA peak memory
 
-    A stage that reuses its output leaves the file alone, so an unchanged stamp
-    across the call means the work came from the cache. Reading the state
-    instead of restating each reuse condition keeps the label and the caching
-    rule from drifting apart, and it is the only thing that works for the
-    stages whose real work happens inside a container and returns nothing.
+    computed is False when every output of the stage is already in the cache,
+    and then the stage is recorded as a cache hit without running
     """
-    try:
-        status = path.stat()
-    except OSError:
-        return None
-    return status.st_mtime_ns, status.st_size, status.st_ino
-
-
-def _measure_stage(stage_records, name, function, artifact=None, runtime=None):
-    """ Run one stage and retain elapsed time plus container CUDA peak memory """
-    if runtime is not None:
-        runtime.begin_stage()
-    before = _artifact_stamp(artifact) if artifact is not None else None
+    runtime.begin_stage()
     started = time.perf_counter()
-    try:
-        return function()
-    finally:
-        memory = runtime.end_stage() if runtime is not None else {
-            "allocated": None,
-            "reserved": None,
-        }
-        after = _artifact_stamp(artifact) if artifact is not None else None
-        stage_records.append({
-            "stage": name,
-            "cache_mode": (
-                "hit" if before is not None and after == before else "miss"
-            ),
-            "container_count": None,
-            "elapsed_seconds": time.perf_counter() - started,
-            "peak_cuda_memory_bytes": memory["allocated"],
-            "peak_cuda_memory_reserved_bytes": memory["reserved"],
-        })
+    result = function() if computed else None
+    memory = runtime.end_stage()
+    stage_records.append({
+        "stage": name,
+        "cache_mode": "miss" if computed else "hit",
+        "elapsed_seconds": time.perf_counter() - started,
+        "peak_cuda_memory_bytes": memory["allocated"],
+        "peak_cuda_memory_reserved_bytes": memory["reserved"],
+    })
+    return result
 
 
 def _parser():
@@ -228,12 +206,44 @@ def _parser():
         frame_step=FRAME_STEP,
         replica_vertex_label_min_fraction=REPLICA_VERTEX_LABEL_MIN_FRACTION,
         replica_visibility_slop=REPLICA_VISIBILITY_SLOP,
-        scannetpp_mask_version=MASKS_CACHE_VERSION,
         scannetpp_mask_bands=SCANNETPP_MASK_BANDS,
         yolo_conf=YOLO_CONF,
         raster_block_size=RASTER_BLOCK_SIZE,
     )
     return parser
+
+
+def run_parameters(args, data_root):
+    """ Prepare the full parameter record stored with the results and the analytics """
+    return {
+        "dataset": args.dataset,
+        "scene": args.scene,
+        "split": args.split,
+        "data_root": str(data_root),
+        "sequence_name": args.sequence_name,
+        "frame_step": args.frame_step,
+        "replica_vertex_label_min_fraction": args.replica_vertex_label_min_fraction,
+        "replica_visibility_slop": args.replica_visibility_slop,
+        "scannetpp_mask_bands": args.scannetpp_mask_bands,
+        "iterations": args.iterations,
+        "resolution": args.resolution,
+        "train_data_device": args.train_data_device,
+        "yolo_conf": args.yolo_conf,
+        "hysteresis_gamma": args.hysteresis_gamma,
+        "hysteresis_radius": args.hysteresis_radius,
+        "background_confidence": args.background_confidence,
+        "background_view_policy": args.background_view_policy,
+        "betas": list(args.betas),
+        "tau": args.tau,
+        "min_fraction": args.min_fraction,
+        "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
+        "min_opacity": args.min_opacity,
+        "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
+        "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
+        "opacity_weighting": not args.no_opacity_weighting,
+        "raster_block_size": args.raster_block_size,
+        "vote_data_device": args.vote_data_device,
+    }
 
 
 def _source_names(mask_source):
@@ -267,6 +277,42 @@ def _validate_existing_beta_grids(results_dir, sources, betas, force):
                 f"while this invocation uses {list(betas)!r}. The caller must "
                 "read the existing results or pass --force to discard them."
             )
+
+
+def _resolve_model_dir(args, data_root, output_root):
+    """
+    Determine the Gaussian model directory to use for evaluation
+
+    --model-root reuses an explicit model; otherwise an already trained model
+    is reused when it exists, and only then does training write into the run's
+    own output directory.
+    """
+    def has_model(model_dir):
+        return (model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply").exists()
+
+    if args.model_root is not None:
+        if not has_model(args.model_root.resolve()):
+            raise FileNotFoundError(
+                f"Gaussian model missing for iteration {args.iterations}: {args.model_root}"
+            )
+        return args.model_root.resolve()
+
+    # Reuse an existing Gaussian model from earlier training when it exists
+    if args.dataset == "replica":
+        conventional_model = data_root / args.scene / "eval_output" / "gs_model"
+    else:
+        conventional_model = args.repo_root / "output" / args.scene
+    output_model = output_root / "model"
+    if not has_model(output_model) and has_model(conventional_model):
+        print(f"model: Using existing Gaussian model: {conventional_model}")
+        return conventional_model
+    return output_model
+
+
+def _is_prepared(dataset_dir):
+    """ A prepared dataset holds a COLMAP model in sparse/0, in binary or text form """
+    sparse = dataset_dir / "sparse" / "0"
+    return (sparse / "points3D.bin").exists() or (sparse / "points3D.txt").exists()
 
 
 def _mask_classes(mask_dir, classes):
@@ -317,22 +363,17 @@ def _prepare_scene(args, scene, runtime, dataset_dir):
     """ Prepare the dataset in the format expected by training and projection """
     # Replica prepares its images and COLMAP text files locally
     if args.dataset == "replica":
-        return scene.prepare_dataset(dataset_dir)
+        scene.prepare_dataset(dataset_dir)
 
     # Scannet++ prepares its COLMAP model in the container
     elif args.dataset == "scannetpp":
-        return scene.prepare_dataset(runtime)
+        scene.prepare_dataset(runtime)
 
 
 def _generate_gt_masks(args, scene, runtime, output_dir):
-    """
-    Generate or reuse the dataset specific 2D masks.
-
-    args.force controls whether existing masks are regenerated.
-    """
+    """ Generate the dataset specific 2D masks """
 
     # Replica can generate its actual GT masks directly from the semantic image sequence
-    force = args.force
     if args.dataset == "replica":
         runtime.run_lifting_module(
             "evaluation.replica.gt_masks",
@@ -343,26 +384,17 @@ def _generate_gt_masks(args, scene, runtime, output_dir):
                 "--frame_step", str(scene.frame_step),
                 "--vertex_label_min_fraction", str(scene.vertex_label_min_fraction),
                 "--visibility_slop", str(scene.visibility_slop),
-                "--resolution", str(args.resolution),
                 "--output_dir", str(output_dir),
-            ] + (["--force"] if force else []),
+            ],
         )
 
     # Scannet++ renders its masks from the mesh through the lifting container, they will be considered our "GT"
     elif args.dataset == "scannetpp":
-        scene.generate_gt_masks(
-            runtime, output_dir, bands=args.scannetpp_mask_bands, force=force,
-            resolution=args.resolution, mask_version=args.scannetpp_mask_version,
-        )
+        scene.generate_gt_masks(runtime, output_dir, bands=args.scannetpp_mask_bands)
 
 
 def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
-    """ Generate or reuse YOLO masks for the prepared dataset images """
-    # The classes file says whether the mask directory exists
-    if (output_dir / "classes.json").exists() and not args.force:
-        return
-
-    # Run the detector in the lifting container
+    """ Run the detector in the lifting container on the prepared dataset images """
     runtime.run_lifting(
         "segmentation/generate_mask.py",
         [
@@ -380,28 +412,19 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
     Accumulate 2D votes for every target class present in the source masks.
 
     classes contains only classes that the source can represent in its mask
-    metadata. Classes absent from the source are handled as empty predictions
-    by the evaluation stage. Existing votes and their statistics are hit unless
-    args.force is true.
+    metadata and whose votes are not cached yet. Classes absent from the source
+    are handled as empty predictions by the evaluation stage.
     """
-    launched = 0
     for spec in classes:
         # Each selected main class, identified here by its detector name,
         # receives its own vote directory and cache file
-        output_path = vote_path(segmentation_dir, spec, vote_identifier)
-        statistics_path = output_path.parent / "vote_statistics.json"
-        if output_path.exists() and statistics_path.exists() and not args.force:
-            continue
-
-        # Accumulate votes for this main class using masks whose pixels contain
-        # stored detector IDs
         runtime.run_lifting(
             "segmentation/accumulate_votes.py",
             [
                 "--model_path", str(model_dir),
                 "--source_path", str(dataset_dir),
                 "--mask_dir", str(mask_dir),
-                "--output_path", str(output_path),
+                "--output_path", str(vote_path(segmentation_dir, spec, vote_identifier)),
                 "--target_class", spec.name_by_detector,
                 "--loaded_iter", str(args.iterations),
                 "--raster_block_size", str(args.raster_block_size),
@@ -410,43 +433,18 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
                 "--background_view_policy", str(args.background_view_policy),
             ],
         )
-        launched += 1
-
-    return launched
 
 
-def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
-                    vote_identifier=None):
-    """
-    Select the Gaussians of every class and beta value in one container
-
-    The returned tuple contains the beta values used and container count.
-    Existing selections are hit unless args.force is true.
-    """
-
-    betas = list(args.betas)
-    pending = []
-    for spec in classes:
-        # Start thresholding after vote accumulation
-        vote_identifier = vote_identifier or vote_id(vars(args))
-        path = vote_path(segmentation_dir, spec, vote_identifier)
-        if not path.exists():
-            continue
-        if any(not selection_path(
-                path.parent, args.hysteresis_gamma, args.hysteresis_radius, beta,
-        ).exists() for beta in betas) or args.force:
-            pending.append(path)
-    if not pending:
-        return betas, 0
+def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes, vote_identifier):
+    """ Select the Gaussians of every class and beta value in one container """
     runtime.run_lifting("segmentation/threshold_labels.py", [
         "--model_path", str(model_dir),
         "--loaded_iter", str(args.iterations),
         "--hysteresis_gamma", str(args.hysteresis_gamma),
         "--hysteresis_radius", str(args.hysteresis_radius),
-        "--beta", *[str(beta) for beta in betas],
-        "--votes", *[str(path) for path in pending],
+        "--beta", *[str(beta) for beta in args.betas],
+        "--votes", *[str(vote_path(segmentation_dir, spec, vote_identifier)) for spec in classes],
     ])
-    return betas, 1
 
 
 def _transfer_to_mesh(args, neighbors, scene, selected, opacity):
@@ -628,7 +626,7 @@ def main():
 
     variant = _resolve_variant(args)
     results_dir = output_root / "results" / variant
-    parameters = cache.run_parameters(args, data_root)
+    parameters = run_parameters(args, data_root)
     vote_identifier = vote_id(parameters)
     requested_sources = _source_names(args.mask_source)
     _validate_existing_beta_grids(
@@ -663,39 +661,32 @@ def main():
     masks_gt = output_root / "masks_gt2d"
     scene_instance = _make_scene(args, data_root, masks_gt)
 
-    # Prepare metadata contracts and reuse caches within this output root
-    cache.prepare_run_metadata(output_root, parameters, args.force, pending_sources)
-
     # Replica writes its COLMAP model into the run directory, while Scannet++
-    # ignores it and keeps an undistorted one beside the scene, so the artifact
-    # of dataset preparation does not live in the same place for the two.
-    dataset_dir = output_root / "dataset"
-    prepared_root = (
-        dataset_dir if args.dataset == "replica" else scene_instance.prepared_dir
+    # keeps an undistorted one beside the scene
+    dataset_dir = (
+        output_root / "dataset" if args.dataset == "replica" else scene_instance.prepared_dir
     )
-    dataset_dir = _measure_stage(
-        stage_records, "prepare_dataset",
+    _measure_stage(
+        stage_records, runtime, "prepare_dataset",
         lambda: _prepare_scene(args, scene_instance, runtime, dataset_dir),
-        artifact=prepared_root / "sparse" / "0",
-        runtime=runtime,
+        computed=not _is_prepared(dataset_dir),
     )
-    model_dir = cache.resolve_model_dir(args, data_root, output_root)
+    model_dir = _resolve_model_dir(args, data_root, output_root)
 
     # Generate reference masks; they are always produced or hit because they
     # define which instances are observable and therefore evaluable
+    # Every mask stage writes classes.json last, so it marks complete masks
     _measure_stage(
-        stage_records, "generate_gt_masks",
+        stage_records, runtime, "generate_gt_masks",
         lambda: _generate_gt_masks(args, scene_instance, runtime, masks_gt),
-        artifact=masks_gt / "classes.json",
-        runtime=runtime,
+        computed=args.force or not (masks_gt / "classes.json").exists(),
     )
     if "yolo" in pending_sources:
         masks_yolo = output_root / "masks_yolo"
         _measure_stage(
-            stage_records, "generate_yolo_masks",
+            stage_records, runtime, "generate_yolo_masks",
             lambda: _generate_yolo_masks(args, runtime, dataset_dir, masks_yolo),
-            artifact=masks_yolo / "classes.json",
-            runtime=runtime,
+            computed=args.force or not (masks_yolo / "classes.json").exists(),
         )
 
     # Load scene data and train when no model exists
@@ -706,12 +697,11 @@ def main():
     model_ply = model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply"
     if not model_ply.exists():
         _measure_stage(
-            stage_records, "train_gaussians",
+            stage_records, runtime, "train_gaussians",
             lambda: runtime.run_train(
                 dataset_dir, model_dir, args.iterations,
                 args.resolution, args.train_data_device,
             ),
-            runtime=runtime,
         )
     if not model_ply.exists():
         raise FileNotFoundError(f"trained Gaussian model missing: {model_ply}")
@@ -720,11 +710,10 @@ def main():
     segmentation_root = output_root / "segmentation"
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
     neighbors, ground_truth_transfer_by_class = _measure_stage(
-        stage_records, "ground_truth_transfer",
+        stage_records, runtime, "ground_truth_transfer",
         lambda: _ground_truth_transfer(
             args, scene, evaluation_classes, full_xyz, full_opacity, results_dir / "reference",
         ),
-        runtime=runtime,
     )
 
     # Process every source that still needs results
@@ -740,46 +729,54 @@ def main():
         # Only source classes absent from its mask metadata are excluded from vote generation
         vote_classes = _mask_classes(mask_dir, evaluation_classes)
 
-        # Accumulate votes
-        vote_launches = _measure_stage(
-            stage_records, f"{source}:votes",
+        # Accumulate votes for the classes whose votes are not cached yet
+        missing_votes = [
+            spec for spec in vote_classes
+            if args.force
+            or not vote_path(source_dir, spec, vote_identifier).exists()
+            or not (vote_dir(source_dir, spec, vote_identifier) / "vote_statistics.json").exists()
+        ]
+        _measure_stage(
+            stage_records, runtime, f"{source}:votes",
             lambda: _run_votes(
                 args, runtime, dataset_dir, model_dir, mask_dir, source_dir,
-                vote_classes, vote_identifier,
+                missing_votes, vote_identifier,
             ),
-            runtime=runtime,
+            computed=bool(missing_votes),
         )
-        stage_records[-1]["container_count"] = vote_launches
-        stage_records[-1]["cache_mode"] = "hit" if vote_launches == 0 else "miss"
 
-        # Threshold the votes and produce labeled Gaussian files
-        betas, threshold_containers = _measure_stage(
-            stage_records, f"{source}:threshold_hysteresis",
+        # Threshold the votes and select the Gaussians of every beta
+        missing_selections = [
+            spec for spec in vote_classes
+            if args.force or not all(
+                selection_path(
+                    vote_dir(source_dir, spec, vote_identifier),
+                    args.hysteresis_gamma, args.hysteresis_radius, beta,
+                ).exists()
+                for beta in args.betas
+            )
+        ]
+        _measure_stage(
+            stage_records, runtime, f"{source}:threshold_hysteresis",
             lambda: _run_thresholds(
-                args, runtime, model_dir, source_dir, vote_classes,
-                vote_identifier,
+                args, runtime, model_dir, source_dir, missing_selections, vote_identifier,
             ),
-            runtime=runtime,
-        )
-        stage_records[-1]["container_count"] = threshold_containers
-        stage_records[-1]["cache_mode"] = (
-            "hit" if threshold_containers == 0 else "miss"
+            computed=bool(missing_selections),
         )
 
         # Evaluate every beta for the selected source
         scene_results[source] = _measure_stage(
-            stage_records, f"{source}:evaluation_transfer",
+            stage_records, runtime, f"{source}:evaluation_transfer",
             lambda: _evaluate_scene(
                 args, scene, neighbors, full_opacity, evaluation_classes, vote_classes,
                 ground_truth_transfer_by_class, vote_identifier, variant,
-                source_dir, betas, results_dir_for[source], source,
+                source_dir, args.betas, results_dir_for[source], source,
             ),
-            runtime=runtime,
         )
         if analytics_store is not None:
             record_source_analytics(
                 analytics_store, run_id, source, scene,
-                f"{scene.dataset}:{scene.scene}", evaluation_classes, betas,
+                f"{scene.dataset}:{scene.scene}", evaluation_classes, args.betas,
                 source_dir, scene_results[source],
                 vote_identifier, args.hysteresis_gamma,
             )
@@ -838,7 +835,6 @@ def main():
                 "scene_id": f"{scene.dataset}:{scene.scene}",
                 "stage": record["stage"],
                 "cache_mode": record["cache_mode"],
-                "container_count": record["container_count"],
                 "elapsed_seconds": record["elapsed_seconds"],
                 "peak_cuda_memory_bytes": record["peak_cuda_memory_bytes"],
                 "peak_cuda_memory_reserved_bytes": record[

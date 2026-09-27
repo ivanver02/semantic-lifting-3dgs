@@ -10,8 +10,8 @@ import numpy as np
 import torch
 import nvdiffrast.torch as dr
 
-from ..common import atomic_write_text, ensure_dir
-from .scene import CLASSES, DATASET_LABELS, MASKS_CACHE_VERSION
+from ..common import ensure_dir
+from .scene import CLASSES, DATASET_LABELS
 from plyfile import PlyData
 
 '''
@@ -224,32 +224,17 @@ def _load_mesh(scene_root, metadata_path):
     return vertices, faces, tri_stored
 
 
-def generate(scene_root, repo_root, metadata_path, output_dir, bands=4,
-             force=False, mask_version=MASKS_CACHE_VERSION, resolution=None):
+def generate(scene_root, repo_root, metadata_path, output_dir, bands=4):
     """
     Render reference masks and save visible vertex support data
 
     - bands: number of horizontal bands used to limit GPU memory
-    - force: ignore existing masks and support data when enabled
 
     Each output semantic PNG contains detector stored IDs, not local class IDs
     The global evaluator consumes this format for detector predictions and dataset reference masks
     """
     if bands < 1:
         raise ValueError("bands must be at least 1")
-
-    # Reuse the completed output unless the caller requests a rebuild
-    cache_info_path = output_dir / "render_metadata.json"
-    cache_info = None
-    if cache_info_path.exists():
-        cache_info = json.loads(cache_info_path.read_text())
-
-    if ((output_dir / "classes.json").exists() and (output_dir / "support.npz").exists() and
-            (output_dir / "camera_intrinsics.json").exists() and cache_info is not None and
-            cache_info.get("version") == mask_version and
-            cache_info.get("bands") == bands and
-            cache_info.get("resolution") == resolution and not force):
-        return output_dir
 
     # nvdiffrast renders these masks on CUDA rather than through the host CPU
     if not torch.cuda.is_available():
@@ -348,40 +333,16 @@ def generate(scene_root, repo_root, metadata_path, output_dir, bands=4,
         cv2.imwrite(str(output_dir / "semantic" / f"{stem}.png"), semantic)
         cv2.imwrite(str(output_dir / "confidence" / f"{stem}.png"), confidence)
 
-    # Save detector names keyed by stored IDs for the evaluator and vote stage
-    classes = {str(item.detector_stored_id): item.name_by_detector for item in CLASSES}
-    (output_dir / "classes.json").write_text(json.dumps(classes, indent=2))
-
-    # Save the rendered COLMAP intrinsics
-    (output_dir / "camera_intrinsics.json").write_text(json.dumps([
-        {
-            "name": camera["name"],
-            "width": camera["width"],
-            "height": camera["height"],
-            "fx": float(camera["K"][0, 0]),
-            "fy": float(camera["K"][1, 1]),
-            "cx": float(camera["K"][0, 2]),
-            "cy": float(camera["K"][1, 2]),
-        }
-        for camera in cameras
-    ], indent=2))
-
     # Save visibility in scene vertex order
     np.savez_compressed(
         output_dir / "support.npz",
         visible_vertices=visible_vertices,
     )
 
-    # Record the conversion contract so later runs can reject stale outputs
-    atomic_write_text(cache_info_path, json.dumps({
-        "version": int(mask_version),
-        "mesh": "mesh_aligned_0.05.ply",
-        "annotations": ["segments.json", "segments_anno.json"],
-        "bands": int(bands),
-        "resolution": resolution,
-        "source": str(metadata_path),
-    }, indent=2) + "\n")
-    return output_dir
+    # Save detector names keyed by stored IDs for the evaluator and vote stage
+    # classes.json is written last, so its presence marks the masks as complete
+    classes = {str(item.detector_stored_id): item.name_by_detector for item in CLASSES}
+    (output_dir / "classes.json").write_text(json.dumps(classes, indent=2))
 
 
 def main():
@@ -400,15 +361,9 @@ def main():
     parser.add_argument("--metadata", required=True, type=Path)
     parser.add_argument("--output_dir", required=True, type=Path)
     parser.add_argument("--bands", type=int, default=4)
-    parser.add_argument("--mask_version", type=int, default=MASKS_CACHE_VERSION)
-    parser.add_argument("--resolution", type=int, default=None)
-
-    # Render masks and support data again when completion files already exist
-    parser.add_argument("--force", action="store_true")
     args = parser.parse_args()
 
-    generate(args.scene_root, args.repo_root, args.metadata, args.output_dir,
-             args.bands, args.force, args.mask_version, args.resolution)
+    generate(args.scene_root, args.repo_root, args.metadata, args.output_dir, args.bands)
 
 
 if __name__ == "__main__":
