@@ -463,7 +463,7 @@ def main():
 
     parameters = run_parameters(args, data_root)
     variant = args.variant or "v" + digest({key: parameters[key] for key in VARIANT_DEFAULTS})
-    vote_identifier = vote_id(parameters)
+    identifier = vote_id(parameters)
     results_dir = output_root / "results" / variant
 
     # Decide which mask sources still need a run
@@ -519,8 +519,6 @@ def main():
 
     # Load scene data and train when no model exists
     scene = scene_instance.load_data()
-    if analytics_store is not None:
-        record_class_inventory(analytics_store, scene, f"{scene.dataset}:{scene.scene}")
     evaluation_classes = _classes_with_gt2d_views(mask_dirs["gt2d"], scene.classes)
     model_ply = model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply"
     if not model_ply.exists():
@@ -535,9 +533,8 @@ def main():
         raise FileNotFoundError(f"trained Gaussian model missing: {model_ply}")
 
     # The clean-label reference per class is shared by every mask source
-    segmentation_root = output_root / "segmentation"
     full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
-    neighbors, ground_truth_transfer_by_class = _measure_stage(
+    neighbors, references = _measure_stage(
         stage_records, runtime, "ground_truth_transfer",
         lambda: _ground_truth_transfer(
             args, scene, evaluation_classes, full_xyz, full_opacity, results_dir / "reference",
@@ -548,26 +545,23 @@ def main():
     results = {}
     for source in pending_sources:
         _progress(f"Evaluation {source}: {len(evaluation_classes)} classes, {len(args.betas)} beta value(s)")
-
-        # Select the mask directory and the segmentation directory for this mask source
-        mask_dir = mask_dirs[source]
-        source_dir = segmentation_root / source
+        segmentation_dir = output_root / "segmentation" / source
 
         # Only source classes absent from its mask metadata are excluded from vote generation
-        vote_classes = _mask_classes(mask_dir, evaluation_classes)
+        vote_classes = _mask_classes(mask_dirs[source], evaluation_classes)
 
         # Accumulate votes for the classes whose votes are not cached yet
         missing_votes = [
             spec for spec in vote_classes
             if args.force
-            or not vote_path(source_dir, spec, vote_identifier).exists()
-            or not (vote_dir(source_dir, spec, vote_identifier) / "vote_statistics.json").exists()
+            or not vote_path(segmentation_dir, spec, identifier).exists()
+            or not (vote_dir(segmentation_dir, spec, identifier) / "vote_statistics.json").exists()
         ]
         _measure_stage(
             stage_records, runtime, f"{source}:votes",
             lambda: _run_votes(
-                args, runtime, dataset_dir, model_dir, mask_dir, source_dir,
-                missing_votes, vote_identifier,
+                args, runtime, dataset_dir, model_dir, mask_dirs[source],
+                segmentation_dir, missing_votes, identifier,
             ),
             computed=bool(missing_votes),
         )
@@ -577,7 +571,7 @@ def main():
             spec for spec in vote_classes
             if args.force or not all(
                 selection_path(
-                    vote_dir(source_dir, spec, vote_identifier),
+                    vote_dir(segmentation_dir, spec, identifier),
                     args.hysteresis_gamma, args.hysteresis_radius, beta,
                 ).exists()
                 for beta in args.betas
@@ -586,7 +580,7 @@ def main():
         _measure_stage(
             stage_records, runtime, f"{source}:threshold_hysteresis",
             lambda: _run_thresholds(
-                args, runtime, model_dir, source_dir, missing_selections, vote_identifier,
+                args, runtime, model_dir, segmentation_dir, missing_selections, identifier,
             ),
             computed=bool(missing_selections),
         )
@@ -596,62 +590,59 @@ def main():
             stage_records, runtime, f"{source}:evaluation_transfer",
             lambda: _evaluate_source(
                 args, scene, evaluation_classes, vote_classes, neighbors,
-                full_opacity, ground_truth_transfer_by_class, source_dir, vote_identifier,
+                full_opacity, references, segmentation_dir, identifier,
             ),
         )
 
-        # Save the scene name, parameters and metrics
+        # Save the scene name, parameters, vote statistics and metrics
         results[source] = {
             "dataset": scene.dataset,
             "scene": scene.scene,
             "mask_source": source,
             "variant": variant,
+            "vote_id": identifier,
             "parameters": parameters,
+            "vote_statistics": {
+                spec.name: json.loads(
+                    (vote_dir(segmentation_dir, spec, identifier) / "vote_statistics.json").read_text()
+                )
+                for spec in vote_classes
+            },
             "metrics_by_beta": metrics_by_beta,
             "per_class": per_class,
         }
 
     # Record the completed run, its parameters and its stages
     if analytics_store is not None:
-        for source, result in results.items():
-            record_source_analytics(
-                analytics_store, run_id, source, scene,
-                f"{scene.dataset}:{scene.scene}", evaluation_classes, args.betas,
-                output_root / "segmentation" / source, result,
-                vote_identifier, args.hysteresis_gamma,
-            )
-        elapsed_seconds = time.perf_counter() - run_started
-        peak_memory_values = [
-            record["peak_cuda_memory_bytes"]
-            for record in stage_records
-            if record["peak_cuda_memory_bytes"] is not None
-        ]
-        peak_reserved_memory_values = [
-            record["peak_cuda_memory_reserved_bytes"]
-            for record in stage_records
-            if record["peak_cuda_memory_reserved_bytes"] is not None
-        ]
+        record_class_inventory(analytics_store, scene)
+        for result in results.values():
+            record_source_analytics(analytics_store, run_id, scene, result)
         analytics_store.append("runs", {
             "run_id": run_id,
             "created_at": utc_now(),
-            "status": "completed",
             "dataset": scene.dataset,
-            "scene_id": f"{scene.dataset}:{scene.scene}",
+            "scene_id": scene.scene_id,
             "scene_name": scene.scene,
             "split": args.split,
             "source": args.mask_source,
             "output_root": str(output_root),
             "model_root": str(model_dir),
-            "elapsed_seconds": elapsed_seconds,
-            "peak_cuda_memory_bytes": max(peak_memory_values, default=None),
+            "elapsed_seconds": time.perf_counter() - run_started,
+            "peak_cuda_memory_bytes": max(
+                (record["peak_cuda_memory_bytes"] for record in stage_records
+                 if record["peak_cuda_memory_bytes"] is not None),
+                default=None,
+            ),
             "peak_cuda_memory_reserved_bytes": max(
-                peak_reserved_memory_values, default=None,
+                (record["peak_cuda_memory_reserved_bytes"] for record in stage_records
+                 if record["peak_cuda_memory_reserved_bytes"] is not None),
+                default=None,
             ),
         })
         analytics_store.append("run_parameters", {
             "run_id": run_id,
             "variant": variant,
-            "vote_id": vote_identifier,
+            "vote_id": identifier,
             **parameters,
             **run_metadata,
         })
@@ -659,14 +650,8 @@ def main():
             analytics_store.append("run_stages", {
                 "run_id": run_id,
                 "dataset": scene.dataset,
-                "scene_id": f"{scene.dataset}:{scene.scene}",
-                "stage": record["stage"],
-                "cache_mode": record["cache_mode"],
-                "elapsed_seconds": record["elapsed_seconds"],
-                "peak_cuda_memory_bytes": record["peak_cuda_memory_bytes"],
-                "peak_cuda_memory_reserved_bytes": record[
-                    "peak_cuda_memory_reserved_bytes"
-                ],
+                "scene_id": scene.scene_id,
+                **record,
             })
 
     # The results are written last, so a unit with results is always a complete one

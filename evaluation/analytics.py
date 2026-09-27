@@ -2,13 +2,10 @@
 
 import csv
 import json
-import os
 import shlex
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
-
-from .common import atomic_write_text, safe_name, vote_dir
 
 
 # Quantiles recorded for the target evidence fraction distribution, from P05 to P99.9.
@@ -21,23 +18,21 @@ QUANTILES = {
 # Keep each relation in its own CSV
 SCHEMA = {
     "runs": [
-        "run_id", "created_at", "status", "dataset", "scene_id",
-        "scene_name", "split", "source", "output_root", "model_root",
-        "elapsed_seconds", "peak_cuda_memory_bytes",
-        "peak_cuda_memory_reserved_bytes",
+        "run_id", "created_at", "dataset", "scene_id", "scene_name", "split",
+        "source", "output_root", "model_root", "elapsed_seconds",
+        "peak_cuda_memory_bytes", "peak_cuda_memory_reserved_bytes",
     ],
 
     "run_parameters": [
-        "run_id", "variant", "vote_id", "dataset",
-        "scene", "split", "data_root",
+        "run_id", "variant", "vote_id", "dataset", "scene", "split", "data_root",
         "iterations", "resolution", "train_data_device", "vote_data_device",
-        "hysteresis_gamma", "hysteresis_radius",
+        "raster_block_size", "hysteresis_gamma", "hysteresis_radius",
         "background_confidence", "background_view_policy",
         "betas", "tau", "min_fraction",
-        "gaussian_to_mesh_transfer", "min_opacity",
+        "gaussian_to_mesh_transfer", "min_opacity", "opacity_weighting",
         "gaussian_to_mesh_background_competes",
-        "mesh_to_gaussian_background_competes", "opacity_weighting",
-        "raster_block_size", "code_commit", "gpu_name", "command",
+        "mesh_to_gaussian_background_competes",
+        "code_commit", "gpu_name", "command",
     ],
 
     "classes": ["class_id", "dataset", "class_name", "detector_name", "detector_stored_id"],
@@ -60,25 +55,29 @@ SCHEMA = {
         "supported_gaussians", "supported_fraction",
     ] + [f"target_score_{name}" for name in QUANTILES],
 
-    # One row per class and beta with the number of selected Gaussians
-    "gaussian_statistics": [
-        "run_id", "variant", "scene_id", "source", "vote_id", "class_id",
-        "beta_id", "beta", "set_type", "gaussian_count",
-    ],
-
+    # One row per class and beta, with the number of selected Gaussians
     "class_beta_metrics": [
-        "run_id", "variant", "scene_id", "source", "vote_id", "class_id", "beta_id", "beta", "hysteresis_gamma",
-        "tp", "fp", "fn", "precision", "recall", "iou",
+        "run_id", "variant", "scene_id", "source", "class_id", "beta", "hysteresis_gamma",
+        "gaussian_count", "tp", "fp", "fn", "precision", "recall", "iou",
         "ground_truth_transfer_tp", "ground_truth_transfer_fp",
         "ground_truth_transfer_fn", "ground_truth_transfer_precision",
         "ground_truth_transfer_recall", "ground_truth_transfer_iou", "relative_iou",
     ],
 
     "aggregate_beta_metrics": [
-        "run_id", "variant", "scene_id", "source", "beta_id", "beta", "hysteresis_gamma",
+        "run_id", "variant", "scene_id", "source", "beta", "hysteresis_gamma",
         "mIoU", "macro_precision", "macro_recall",
         "ground_truth_transfer_mIoU", "relative_mIoU",
     ],
+}
+
+# A scene may be evaluated repeatedly over time, so these tables keep the latest row per key
+KEYS = {
+    "classes": ("class_id",),
+    "scene_classes": ("scene_id", "class_id"),
+    "vote_statistics": ("scene_id", "variant", "source", "vote_id", "class_id"),
+    "class_beta_metrics": ("scene_id", "variant", "source", "class_id", "beta", "hysteresis_gamma"),
+    "aggregate_beta_metrics": ("scene_id", "variant", "source", "beta", "hysteresis_gamma"),
 }
 
 
@@ -124,13 +123,18 @@ class AnalyticsStore:
         """ Create the analytics directory and table headers """
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
-        self._unique_keys = {}
 
         for table, fields in SCHEMA.items():
             path = self.root / f"{table}.csv"
-            if not path.exists() or path.stat().st_size == 0:
+            if not path.exists():
                 with path.open("w", newline="", encoding="utf-8") as handle:
                     csv.DictWriter(handle, fieldnames=fields).writeheader()
+                continue
+
+            # Rows are written by position, so a table with other columns cannot receive them
+            with path.open("r", newline="", encoding="utf-8") as handle:
+                if next(csv.reader(handle), None) != fields:
+                    raise RuntimeError(f"{path} has other columns, use a new analytics directory")
 
     def append(self, table, row):
         """Append one row using the table schema"""
@@ -139,182 +143,126 @@ class AnalyticsStore:
         with (self.root / f"{table}.csv").open("a", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=fields).writerow(values)
 
-    def append_unique(self, table, row, key_fields):
-        """Append a row when its key is new"""
-        path = self.root / f"{table}.csv"
-        key = tuple(str(row.get(field, "")) for field in key_fields)
-        cache_key = (table, tuple(key_fields))
-        keys = self._unique_keys.setdefault(cache_key, set())
-        if not keys and path.exists():
-            with path.open("r", newline="", encoding="utf-8") as handle:
-                keys.update(
-                    tuple(existing.get(field, "") for field in key_fields)
-                    for existing in csv.DictReader(handle)
-                )
-        if key in keys:
-            return
-        self.append(table, row)
-        keys.add(key)
 
-
-def deduplicate_analytics(root):
+def load_analytics(root):
     """
-    Return one analytical view that keeps only the latest completed data
+    Return one analytical view that keeps only the latest data of recorded runs
 
-    Scenes may be evaluated repeatedly over time, so metric tables can hold
-    several rows per key. Rows from completed runs win, and among them the
-    latest created_at wins.
+    A run is recorded in runs.csv when it completes, so rows written by an
+    interrupted run are dropped. Among rows with the same key, the one from the
+    latest run wins.
     """
     root = Path(root)
     view = {}
     for table in SCHEMA:
         path = root / f"{table}.csv"
-        if path.exists():
-            with path.open("r", newline="", encoding="utf-8") as handle:
-                view[table] = list(csv.DictReader(handle))
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            view[table] = list(csv.DictReader(handle))
 
-    # Represent missing tables as empty lists
-        else:
-            view[table] = []
+    runs = {row["run_id"]: row for row in view["runs"]}
+    view["runs"] = runs
+    for table in SCHEMA:
+        if table != "runs" and "run_id" in SCHEMA[table]:
+            view[table] = [row for row in view[table] if row["run_id"] in runs]
 
-    # One row per run is written, at completion; last occurrence wins
-    runs = {}
-    for row in view["runs"]:
-        runs[row.get("run_id")] = row
-    view["runs"] = list(runs.values())
-    completed = {
-        run_id: row.get("created_at", "")
-        for run_id, row in runs.items()
-        if row.get("status") == "completed"
-    }
-
-    keys = {
-        "aggregate_beta_metrics": (
-            "scene_id", "variant", "source", "beta", "hysteresis_gamma",
-        ),
-        "class_beta_metrics": (
-            "scene_id", "variant", "source", "beta", "hysteresis_gamma", "class_id",
-        ),
-        "vote_statistics": ("scene_id", "variant", "source", "vote_id", "class_id"),
-        "gaussian_statistics": (
-            "scene_id", "variant", "source", "vote_id", "class_id",
-            "beta", "set_type",
-        ),
-        "scene_classes": ("scene_id", "class_id"),
-    }
-    for table, key_fields in keys.items():
+    for table, key_fields in KEYS.items():
         selected = {}
-        for row in view.get(table, []):
-            key = tuple(row.get(field, "") for field in key_fields)
-            rank = completed.get(row.get("run_id", ""), "")
-            previous = selected.get(key)
-            if previous is None or rank >= previous[0]:
+        for row in view[table]:
+            key = tuple(row[field] for field in key_fields)
+            rank = runs[row["run_id"]]["created_at"] if "run_id" in row else ""
+            if key not in selected or rank >= selected[key][0]:
                 selected[key] = (rank, row)
         view[table] = [item[1] for item in selected.values()]
     return view
 
 
-def record_class_inventory(store, scene, scene_id):
-    """ Record once the target classes and their ground-truth support per scene """
+def number(value):
+    """ Convert an optional analytics cell; None keeps empty cells out """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def close(left, right, tolerance=1e-9):
+    """ Compare two optional operating-point coordinates """
+    return left is not None and right is not None and abs(left - right) <= tolerance
+
+
+def dataset_of(row):
+    """ Return the dataset of a row from its scene ID """
+    return row["scene_id"].split(":")[0]
+
+
+def selected_operating_point(path):
+    """ Load the (beta, gamma) pair selected on the validation scenes """
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    return float(data["beta_star"]), float(data["gamma_star"])
+
+
+def record_class_inventory(store, scene):
+    """ Record the target classes and their ground-truth support per scene """
     evaluation_mask = scene.evaluation_mask
     for class_id, spec in enumerate(scene.classes):
-        store.append_unique("classes", {
+        store.append("classes", {
             "class_id": f"{scene.dataset}:{class_id}",
             "dataset": scene.dataset,
             "class_name": spec.name,
             "detector_name": spec.name_by_detector,
             "detector_stored_id": spec.detector_stored_id,
-        }, ["class_id"])
+        })
 
         # Ground-truth vertex support of this class in this scene
         class_mask = scene.semantic_labels == class_id
-        store.append_unique("scene_classes", {
-            "scene_id": scene_id,
+        store.append("scene_classes", {
+            "scene_id": scene.scene_id,
             "class_id": f"{scene.dataset}:{class_id}",
             "gt_vertex_count": int(class_mask.sum()),
             "gt_visible_vertex_count": int((class_mask & scene.visible).sum()),
             "gt_evaluated_vertex_count": int((class_mask & evaluation_mask).sum()),
-        }, ["scene_id", "class_id"])
+        })
 
 
-def record_source_analytics(store, run_id, source, scene, scene_id, classes, betas,
-                            source_dir, result, vote_identifier,
-                            hysteresis_gamma):
-    """ Record votes, Gaussian counts and metrics for one mask source """
-    for spec in classes:
-        class_id = scene.class_id(spec.name)
-        analytics_class_id = f"{scene.dataset}:{class_id}"
-        safe = safe_name(spec.name_by_detector)
+def record_source_analytics(store, run_id, scene, result):
+    """
+    Record votes, Gaussian counts and metrics for one mask source
 
-        # Vote statistics come from the JSON written by the accumulation container
-        class_dir = source_dir / safe
-        vote_stats_path = vote_dir(source_dir, spec, vote_identifier) / "vote_statistics.json"
-        if vote_stats_path.exists():
-            vote_stats = json.loads(vote_stats_path.read_text())
-            vote_stats.update({
-                "run_id": run_id,
-                "variant": result.get("variant"),
-                "scene_id": scene_id,
-                "source": source,
-                "vote_id": vote_identifier,
-                "class_id": analytics_class_id,
-            })
-            store.append("vote_statistics", vote_stats)
+    The vote statistics of the result come from the JSON written by the accumulation container
+    """
+    common = {
+        "run_id": run_id,
+        "variant": result["variant"],
+        "scene_id": scene.scene_id,
+        "source": result["mask_source"],
+    }
+    gamma = result["parameters"]["hysteresis_gamma"]
 
-        item = result["per_class"].get(spec.name, {})
-        for beta_order, beta in enumerate(betas, start=1):
-            beta_id = f"{run_id}:{source}:{beta_order}"
-            beta_key = str(beta)
-            sweep = item.get("sweep", {}).get(beta_key)
-            if sweep is None:
-                continue
+    for name, statistics in result["vote_statistics"].items():
+        store.append("vote_statistics", {
+            **common, **statistics,
+            "vote_id": result["vote_id"],
+            "class_id": f"{scene.dataset}:{scene.class_id(name)}",
+        })
 
-            # Number of Gaussians selected by this threshold
-            store.append("gaussian_statistics", {
-                "run_id": run_id,
-                "variant": result.get("variant"),
-                "scene_id": scene_id,
-                "source": source,
-                "vote_id": vote_identifier,
-                "class_id": analytics_class_id,
-                "beta_id": beta_id,
-                "beta": beta,
-                "set_type": "predicted",
-                "gaussian_count": sweep["gaussian_count"],
-            })
+    for name, item in result["per_class"].items():
+        for sweep in item["sweep"].values():
             prediction = sweep["iou"]
-            ground_truth_transfer_metrics = sweep["ground_truth_transfer_iou"]
+            reference = sweep["ground_truth_transfer_iou"]
             store.append("class_beta_metrics", {
-                "run_id": run_id,
-                "variant": result.get("variant"),
-                "scene_id": scene_id,
-                "source": source,
-                "vote_id": vote_identifier,
-                "class_id": analytics_class_id,
-                "beta_id": beta_id,
-                "beta": beta,
-                "hysteresis_gamma": hysteresis_gamma,
+                **common,
+                "class_id": f"{scene.dataset}:{scene.class_id(name)}",
+                "beta": sweep["beta"],
+                "hysteresis_gamma": gamma,
+                "gaussian_count": sweep["gaussian_count"],
                 **prediction,
-                "ground_truth_transfer_tp": ground_truth_transfer_metrics["tp"],
-                "ground_truth_transfer_fp": ground_truth_transfer_metrics["fp"],
-                "ground_truth_transfer_fn": ground_truth_transfer_metrics["fn"],
-                "ground_truth_transfer_precision": ground_truth_transfer_metrics["precision"],
-                "ground_truth_transfer_recall": ground_truth_transfer_metrics["recall"],
-                "ground_truth_transfer_iou": ground_truth_transfer_metrics["iou"],
+                **{f"ground_truth_transfer_{key}": value for key, value in reference.items()},
                 "relative_iou": sweep["relative_iou"],
             })
 
-    for beta_order, beta in enumerate(betas, start=1):
-        aggregate = result["metrics_by_beta"].get(str(beta))
-        if aggregate is None:
-            continue
+    for beta_key, aggregate in result["metrics_by_beta"].items():
         store.append("aggregate_beta_metrics", {
-            "run_id": run_id,
-            "variant": result.get("variant"),
-            "scene_id": scene_id,
-            "source": source,
-            "beta_id": f"{run_id}:{source}:{beta_order}",
-            "beta": beta,
-            "hysteresis_gamma": hysteresis_gamma,
+            **common,
+            "beta": float(beta_key),
+            "hysteresis_gamma": gamma,
             **aggregate,
         })

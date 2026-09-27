@@ -6,7 +6,7 @@ import json
 import re
 from pathlib import Path
 
-from evaluation.analytics import deduplicate_analytics
+from evaluation.analytics import load_analytics
 from evaluation.common import atomic_write_text
 from evaluation.scripts.experiment_common import command, dump_plan, run_units, token
 
@@ -101,7 +101,7 @@ def select_candidate(rows, parameter):
 def _analytics_rows(args, prefix):
 
     # Filter completed analytics rows for one sweep phase and decode its parameter
-    view = deduplicate_analytics(args.analytics)
+    view = load_analytics(args.analytics)
     rows = []
     for row in view.get("aggregate_beta_metrics", []):
         if not row.get("variant", "").startswith(prefix):

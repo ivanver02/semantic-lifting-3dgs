@@ -4,22 +4,13 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 
-from evaluation.analytics import deduplicate_analytics
-from evaluation.scripts.make_tables import selected_operating_point
+from evaluation.analytics import close, load_analytics, number, selected_operating_point
 
 
 FIGURES = (
     "beta_curves.pdf",
     "per_class.pdf",
 )
-
-
-def _number(value):
-    # Convert an optional analytics cell; None keeps malformed rows out
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def _is_ablation(row):
@@ -48,9 +39,9 @@ def main(argv=None):
     p.add_argument("--out", type=Path, default=Path("preprint/figures"))
     args = p.parse_args(argv)
 
-    beta, gamma, tolerance = selected_operating_point(args.selection)
-    view = deduplicate_analytics(args.analytics)
-    runs = {r["run_id"]: r for r in view["runs"] if r.get("status") == "completed"}
+    beta, gamma = selected_operating_point(args.selection)
+    view = load_analytics(args.analytics)
+    runs = view["runs"]
     metrics = view.get("class_beta_metrics", [])
     args.out.mkdir(parents=True, exist_ok=True)
 
@@ -65,13 +56,13 @@ def main(argv=None):
             if row.get("source") != "gt2d" or _is_ablation(row):
                 continue
             b, g, iou = (
-                _number(row.get("beta")),
-                _number(row.get("hysteresis_gamma")),
-                _number(row.get("iou")),
+                number(row.get("beta")),
+                number(row.get("hysteresis_gamma")),
+                number(row.get("iou")),
             )
             if b is None or g is None or iou is None:
                 continue
-            if abs(g - gamma) <= tolerance:
+            if close(g, gamma):
                 setting = "hysteresis"
             elif g == 0.0:
                 setting = "no_hysteresis"
@@ -109,7 +100,7 @@ def main(argv=None):
         counts = {}
         for row in view.get("scene_classes", []):
             scene_id, class_id = row.get("scene_id"), row.get("class_id")
-            vertices = _number(row.get("gt_evaluated_vertex_count"))
+            vertices = number(row.get("gt_evaluated_vertex_count"))
             if vertices is not None:
                 counts[(scene_id, class_id)] = vertices
 
@@ -120,13 +111,13 @@ def main(argv=None):
             if not run:
                 continue
             b, g, iou = (
-                _number(row.get("beta")),
-                _number(row.get("hysteresis_gamma")),
-                _number(row.get("iou")),
+                number(row.get("beta")),
+                number(row.get("hysteresis_gamma")),
+                number(row.get("iou")),
             )
             if b is None or g is None or iou is None:
                 continue
-            if abs(b - beta) > tolerance or abs(g - gamma) > tolerance:
+            if not (close(b, beta) and close(g, gamma)):
                 continue
             values[(run.get("dataset"), row.get("class_id"))].append(iou)
 

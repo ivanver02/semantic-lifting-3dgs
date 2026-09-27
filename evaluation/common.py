@@ -1,3 +1,4 @@
+# Unified evaluation workflow for Replica and Scannet++ scenes
 # Data structures for metrics evaluation
 
 import hashlib
@@ -53,9 +54,9 @@ class SceneData:  # Created when loading data in the scene files
         self.classes = classes
 
     @property
-    def class_ids(self):
-        """ Map each main class name to its local scene ID """
-        return {item.name: local_id for local_id, item in enumerate(self.classes)}
+    def scene_id(self):
+        """ Identify the scene in the analytics tables """
+        return f"{self.dataset}:{self.scene}"
 
     @property
     def evaluation_mask(self):
@@ -72,7 +73,7 @@ class SceneData:  # Created when loading data in the scene files
 
     def class_id(self, name):
         """ Return the local ID for a main class name """
-        return self.class_ids[name]
+        return [item.name for item in self.classes].index(name)
 
 
 def safe_name(name):

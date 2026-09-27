@@ -5,20 +5,12 @@ import json
 import statistics
 from pathlib import Path
 
-from evaluation.analytics import deduplicate_analytics
+from evaluation.analytics import load_analytics, number
 from evaluation.common import atomic_write_text
 
 TOLERANCE = 0.01
 
 FLOAT_SLACK = 1e-12
-
-
-def number(value):
-    # Convert an optional analytics cell
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
 
 
 def is_ablation(row):
@@ -113,17 +105,11 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     # Select only completed rows from the requested validation scenes and source
-    view = deduplicate_analytics(args.analytics)
-    completed = {
-        row.get("run_id")
-        for row in view["runs"]
-        if row.get("status") == "completed"
-    }
+    view = load_analytics(args.analytics)
     allowed = set(args.scene)
     rows = [
         row for row in view["aggregate_beta_metrics"]
         if row.get("source") == args.source
-        and row.get("run_id") in completed
         and not is_ablation(row)
         and row.get("scene_id", "").split(":")[-1] in allowed
     ]
