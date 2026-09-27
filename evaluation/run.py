@@ -135,32 +135,19 @@ def _parser():
 
     # Background competition and opacity weighting switches used by ablations
     parser.add_argument(
-        "--gaussian-to-mesh-background-competes",
-        dest="gaussian_to_mesh_background_competes",
-        action="store_true",
-        default=VARIANT_DEFAULTS["gaussian_to_mesh_background_competes"],
-        help="Include background votes in predicted mesh labels",
-    )
-    parser.add_argument(
         "--no-gaussian-to-mesh-background-competes",
         dest="gaussian_to_mesh_background_competes",
         action="store_false",
         help="Disable background competition in predicted mesh labels",
     )
-    parser.add_argument(
-        "--mesh-to-gaussian-background-competes",
-        dest="mesh_to_gaussian_background_competes", action="store_true",
-        default=VARIANT_DEFAULTS["mesh_to_gaussian_background_competes"],
-        help="Use background votes when assigning GT labels to Gaussians",
-    )
     parser.add_argument("--no-mesh-to-gaussian-background-competes", dest="mesh_to_gaussian_background_competes", action="store_false",
         help="Do not use background votes when assigning GT labels to Gaussians")
-    parser.add_argument("--no-opacity-weighting", action="store_true")
+    parser.add_argument("--no-opacity-weighting", dest="opacity_weighting", action="store_false")
 
     # Rebuild cached data instead of reusing files from an earlier run
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--save_results_to_csv", action="store_true", default=False,
-        help="Append validation results and summaries to dataTFGIvanVerdugo/analytics")
+        help="Append validation results and summaries to the analytics directory beside the data root")
     return parser
 
 
@@ -174,20 +161,10 @@ def run_parameters(args, data_root):
         "iterations": args.iterations,
         "resolution": args.resolution,
         "train_data_device": args.train_data_device,
-        "hysteresis_gamma": args.hysteresis_gamma,
-        "hysteresis_radius": args.hysteresis_radius,
-        "background_confidence": args.background_confidence,
-        "background_view_policy": args.background_view_policy,
-        "betas": list(args.betas),
-        "tau": args.tau,
-        "min_fraction": args.min_fraction,
-        "gaussian_to_mesh_transfer": args.gaussian_to_mesh_transfer,
-        "min_opacity": args.min_opacity,
-        "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
-        "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
-        "opacity_weighting": not args.no_opacity_weighting,
-        "raster_block_size": RASTER_BLOCK_SIZE,
         "vote_data_device": args.vote_data_device,
+        "raster_block_size": RASTER_BLOCK_SIZE,
+        "betas": list(args.betas),
+        **{key: getattr(args, key) for key in VARIANT_DEFAULTS},
     }
 
 
@@ -356,7 +333,7 @@ def _transfer_to_mesh(args, neighbors, scene, selected, opacity):
     """ Transfer a binary Gaussian selection to the mesh vertices with the configured operator """
     return transfer.predict_vertex_labels(
         neighbors, len(scene.vertices), selected, opacity, args.min_fraction,
-        not args.no_opacity_weighting, args.min_opacity,
+        args.opacity_weighting, args.min_opacity,
         args.gaussian_to_mesh_background_competes, args.gaussian_to_mesh_transfer,
     )
 
