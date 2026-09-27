@@ -35,34 +35,35 @@ DATASET_LABELS = {
     "clock": {"clock", "wall clock", "table clock", "alarm clock"},
 }
 
+# The undistorted DSLR images keep at most this many pixels on the long side
+MAX_IMAGE_SIZE = 1600
+
 
 class ScannetScene:
     """ Load Scannet++ data and convert it to the common evaluation format """
 
-    def __init__(self, data_root, scene, support_dir):
+    def __init__(self, data_root, scene, output_root):
         """
         Store the scene paths and the directory containing generated GT
 
         - data_root: the root directory of the Scannet++ dataset
         - scene: the name of the scene to process
-        - support_dir: the directory containing rasterized masks and visible vertices
+        - output_root: the run directory, whose masks_gt2d holds the rasterized masks and visible vertices
         """
         self.data_root = Path(data_root)
         self.scene = scene
         self.scene_root = self.data_root / "validation_data" / scene
         self.scans = self.scene_root / "scans"
-        self.support_dir = Path(support_dir)
+        self.masks_dir = Path(output_root) / "masks_gt2d"
+
+        # The prepared COLMAP model is kept beside the scene, not in the run directory
+        self.prepared_dir = self.scene_root / "dslr" / "undistorted_colmap"
 
     @property
     def metadata_path(self):
         """ Return the semantic class metadata file for Scannet++ """
         # Each line position in this file is the dataset semantic ID used by the mesh labels
         return self.data_root / "metadata" / "semantic_classes.txt"
-
-    @property
-    def prepared_dir(self):
-        """ Return the directory containing the prepared COLMAP model """
-        return self.scene_root / "dslr" / "undistorted_colmap"
 
     def _load_mesh(self):
         """ Load vertex positions and Scannet++ dataset IDs """
@@ -105,7 +106,7 @@ class ScannetScene:
         semantic = np.asarray([dataset_ids_to_local_ids.get(int(label), -1) for label in dataset_labels], dtype=np.int64)
 
         # The GT mask stage records the vertices observed by the rendered camera views, which indicates which vertices are visible
-        visible = np.load(self.support_dir / "support.npz")["visible_vertices"].astype(bool)
+        visible = np.load(self.masks_dir / "support.npz")["visible_vertices"].astype(bool)
         if visible.shape != (len(vertices),):
             raise ValueError("Scannet++ GT support and semantic mesh use different vertex counts")
 
@@ -119,11 +120,10 @@ class ScannetScene:
             classes=CLASSES,
         )
 
-    def prepare_dataset(self, runtime, max_image_size=1600):
+    def prepare_dataset(self, runtime):
         """
         Prepare Scannet++ DSLR (which have distortion, and we want undistorted ones) images and create a COLMAP model
         """
-        output = self.prepared_dir
 
         # Prefer the dataset resized images, but if not available, use the original images
         images = self.scene_root / "dslr" / "resized_images"
@@ -131,13 +131,14 @@ class ScannetScene:
             images = self.scene_root / "dslr" / "images"
 
         # Undistort the images and write an output directory ready for COLMAP using the existing COLMAP reconstruction
+        output = self.prepared_dir
         runtime.run_colmap([
             "image_undistorter",
-            "--image_path", str(images),
-            "--input_path", str(self.scene_root / "dslr" / "colmap"),
-            "--output_path", str(output),
+            "--image_path", images,
+            "--input_path", self.scene_root / "dslr" / "colmap",
+            "--output_path", output,
             "--output_type", "COLMAP",
-            "--max_image_size", str(max_image_size),
+            "--max_image_size", MAX_IMAGE_SIZE,
         ])
 
         # Normalize COLMAP sparse output so we can always use sparse/0
@@ -151,21 +152,15 @@ class ScannetScene:
                 if item.is_file() and item.suffix in {".bin", ".txt"}:
                     shutil.move(str(item), str(sparse_zero / item.name))  # shutil.move can move across filesystems
 
-    def generate_gt_masks(self, runtime, output_dir, bands=4):
-        """
-        Generate rasterized Scannet++ GT masks and visibility support
-
-        - bands: number of horizontal image bands used to reduce GPU memory
-        """
+    def generate_gt_masks(self, runtime):
+        """ Generate rasterized Scannet++ GT masks and visibility support """
 
         # Rasterize the mesh inside the lifting container because nvdiffrast requires CUDA
         runtime.run_lifting_module(
             "evaluation.scannetpp.gt_masks",
             [
-                "--scene_root", str(self.scene_root),
-                "--repo_root", str(runtime.repo_root),
-                "--metadata", str(self.metadata_path),
-                "--output_dir", str(output_dir),
-                "--bands", str(bands),
+                "--scene_root", self.scene_root,
+                "--metadata", self.metadata_path,
+                "--output_dir", self.masks_dir,
             ],
         )

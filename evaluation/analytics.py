@@ -29,11 +29,9 @@ SCHEMA = {
 
     "run_parameters": [
         "run_id", "variant", "vote_id", "dataset",
-        "scene", "split", "data_root", "sequence_name", "frame_step",
+        "scene", "split", "data_root",
         "iterations", "resolution", "train_data_device", "vote_data_device",
-        "replica_vertex_label_min_fraction", "replica_visibility_slop",
-        "scannetpp_mask_bands",
-        "yolo_conf", "hysteresis_gamma", "hysteresis_radius",
+        "hysteresis_gamma", "hysteresis_radius",
         "background_confidence", "background_view_policy",
         "betas", "tau", "min_fraction",
         "gaussian_to_mesh_transfer", "min_opacity",

@@ -1,7 +1,6 @@
 # CLI entry point for Scannet++ reference masks and visible vertex support in the lifting container
 
 import argparse
-import importlib.util
 import json
 from pathlib import Path
 
@@ -10,7 +9,10 @@ import numpy as np
 import torch
 import nvdiffrast.torch as dr
 
-from ..common import ensure_dir
+from scene.colmap_loader import (
+    qvec2rotmat, read_extrinsics_binary, read_extrinsics_text,
+    read_intrinsics_binary, read_intrinsics_text,
+)
 from .scene import CLASSES, DATASET_LABELS
 from plyfile import PlyData
 
@@ -22,18 +24,8 @@ the opposite z direction before the perspective divide
 '''
 CV_TO_GL = np.diag([1.0, -1.0, -1.0, 1.0])
 
-
-def _load_colmap_loader(repo_root):
-    """
-    Load the repository COLMAP reader
-    """
-
-    # Import only the reader module because the full training package has extra dependencies
-    path = repo_root / "scene" / "colmap_loader.py"
-    spec = importlib.util.spec_from_file_location("unified_colmap_loader", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+# Number of horizontal image bands rendered separately to limit GPU memory
+BANDS = 4
 
 
 def _projection(fx, fy, cx, cy, width, height, near, far):
@@ -66,7 +58,7 @@ def _projection(fx, fy, cx, cy, width, height, near, far):
     return matrix
 
 
-def _load_cameras(repo_root, sparse_dir):
+def _load_cameras(sparse_dir):
     """
     Load pinhole camera records from the prepared COLMAP model
 
@@ -76,13 +68,12 @@ def _load_cameras(repo_root, sparse_dir):
     # Read binary COLMAP files when available and otherwise use their text versions
     # Both files describe the same sparse model: cameras provide intrinsics
     # while images provide the pose and filename for every rendered view
-    loader = _load_colmap_loader(repo_root)
     if (sparse_dir / "cameras.bin").exists():
-        cameras = loader.read_intrinsics_binary(str(sparse_dir / "cameras.bin"))
-        images = loader.read_extrinsics_binary(str(sparse_dir / "images.bin"))
+        cameras = read_intrinsics_binary(str(sparse_dir / "cameras.bin"))
+        images = read_extrinsics_binary(str(sparse_dir / "images.bin"))
     else:
-        cameras = loader.read_intrinsics_text(str(sparse_dir / "cameras.txt"))
-        images = loader.read_extrinsics_text(str(sparse_dir / "images.txt"))
+        cameras = read_intrinsics_text(str(sparse_dir / "cameras.txt"))
+        images = read_extrinsics_text(str(sparse_dir / "images.txt"))
 
     # Normalize both COLMAP formats into the camera records used by nvdiffrast,
     # sorting image names for deterministic output without changing camera poses
@@ -102,7 +93,7 @@ def _load_cameras(repo_root, sparse_dir):
 
         # COLMAP stores a quaternion and translation from world coordinates to camera coordinates
         transform = np.eye(4)
-        transform[:3, :3] = loader.qvec2rotmat(image.qvec)
+        transform[:3, :3] = qvec2rotmat(image.qvec)
         transform[:3, 3] = np.asarray(image.tvec)
         result.append({
             "name": image.name,
@@ -224,17 +215,13 @@ def _load_mesh(scene_root, metadata_path):
     return vertices, faces, tri_stored
 
 
-def generate(scene_root, repo_root, metadata_path, output_dir, bands=4):
+def generate(scene_root, metadata_path, output_dir):
     """
     Render reference masks and save visible vertex support data
-
-    - bands: number of horizontal bands used to limit GPU memory
 
     Each output semantic PNG contains detector stored IDs, not local class IDs
     The global evaluator consumes this format for detector predictions and dataset reference masks
     """
-    if bands < 1:
-        raise ValueError("bands must be at least 1")
 
     # nvdiffrast renders these masks on CUDA rather than through the host CPU
     if not torch.cuda.is_available():
@@ -246,10 +233,10 @@ def generate(scene_root, repo_root, metadata_path, output_dir, bands=4):
         raise FileNotFoundError(f"prepared COLMAP model not found: {sparse_dir}")
 
     vertices, faces, tri_stored = _load_mesh(scene_root, metadata_path)
-    cameras = _load_cameras(repo_root, sparse_dir)
+    cameras = _load_cameras(sparse_dir)
 
-    ensure_dir(output_dir / "semantic")
-    ensure_dir(output_dir / "confidence")
+    (output_dir / "semantic").mkdir(parents=True, exist_ok=True)
+    (output_dir / "confidence").mkdir(parents=True, exist_ok=True)
     device = torch.device("cuda")
 
     # Homogeneous vertices allow one matrix multiplication per camera and band
@@ -282,9 +269,9 @@ def generate(scene_root, repo_root, metadata_path, output_dir, bands=4):
         far = max(near + 1.0, float(positive_depth.max()))
 
         # Split the image height into equally sized bands so intermediate CUDA buffers stay bounded
-        edges = np.linspace(0, height, bands + 1).astype(int)
+        edges = np.linspace(0, height, BANDS + 1).astype(int)
         rendered_bands = []
-        for band in range(bands):
+        for band in range(BANDS):
 
             # Shift the principal point for the current vertical image band because the band has its own image origin
             y0, y1 = int(edges[band]), int(edges[band + 1])
@@ -355,15 +342,13 @@ def main():
     """
     parser = argparse.ArgumentParser()
 
-    # Identify the scene, repository reader, metadata and output directory for rendering
+    # Identify the scene, metadata and output directory for rendering
     parser.add_argument("--scene_root", required=True, type=Path)
-    parser.add_argument("--repo_root", required=True, type=Path)
     parser.add_argument("--metadata", required=True, type=Path)
     parser.add_argument("--output_dir", required=True, type=Path)
-    parser.add_argument("--bands", type=int, default=4)
     args = parser.parse_args()
 
-    generate(args.scene_root, args.repo_root, args.metadata, args.output_dir, args.bands)
+    generate(args.scene_root, args.metadata, args.output_dir)
 
 
 if __name__ == "__main__":

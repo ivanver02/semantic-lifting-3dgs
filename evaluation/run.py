@@ -38,11 +38,6 @@ DEFAULT_DATA_ROOT = Path("/mnt/hddb/dataTFGIvanVerdugo")
 # Protocol values frozen in the manuscript configuration (Table of the
 # experimental design). They are not command line options on purpose: changing
 # them means changing the documented experiment.
-SEQUENCE_NAME = "Sequence_2"
-FRAME_STEP = 5
-REPLICA_VERTEX_LABEL_MIN_FRACTION = 0.6
-REPLICA_VISIBILITY_SLOP = 0.05
-SCANNETPP_MASK_BANDS = 4
 YOLO_CONF = 0.75
 RASTER_BLOCK_SIZE = 16
 
@@ -166,18 +161,6 @@ def _parser():
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--save_results_to_csv", action="store_true", default=False,
         help="Append validation results and summaries to dataTFGIvanVerdugo/analytics")
-
-    # Frozen protocol values; they are part of the documented experiment and
-    # therefore not exposed as options
-    parser.set_defaults(
-        sequence_name=SEQUENCE_NAME,
-        frame_step=FRAME_STEP,
-        replica_vertex_label_min_fraction=REPLICA_VERTEX_LABEL_MIN_FRACTION,
-        replica_visibility_slop=REPLICA_VISIBILITY_SLOP,
-        scannetpp_mask_bands=SCANNETPP_MASK_BANDS,
-        yolo_conf=YOLO_CONF,
-        raster_block_size=RASTER_BLOCK_SIZE,
-    )
     return parser
 
 
@@ -188,15 +171,9 @@ def run_parameters(args, data_root):
         "scene": args.scene,
         "split": args.split,
         "data_root": str(data_root),
-        "sequence_name": args.sequence_name,
-        "frame_step": args.frame_step,
-        "replica_vertex_label_min_fraction": args.replica_vertex_label_min_fraction,
-        "replica_visibility_slop": args.replica_visibility_slop,
-        "scannetpp_mask_bands": args.scannetpp_mask_bands,
         "iterations": args.iterations,
         "resolution": args.resolution,
         "train_data_device": args.train_data_device,
-        "yolo_conf": args.yolo_conf,
         "hysteresis_gamma": args.hysteresis_gamma,
         "hysteresis_radius": args.hysteresis_radius,
         "background_confidence": args.background_confidence,
@@ -209,7 +186,7 @@ def run_parameters(args, data_root):
         "gaussian_to_mesh_background_competes": args.gaussian_to_mesh_background_competes,
         "mesh_to_gaussian_background_competes": args.mesh_to_gaussian_background_competes,
         "opacity_weighting": not args.no_opacity_weighting,
-        "raster_block_size": args.raster_block_size,
+        "raster_block_size": RASTER_BLOCK_SIZE,
         "vote_data_device": args.vote_data_device,
     }
 
@@ -321,40 +298,6 @@ def _classes_with_gt2d_views(mask_dir, classes):
     ]
 
 
-def _prepare_scene(args, scene, runtime, dataset_dir):
-    """ Prepare the dataset in the format expected by training and projection """
-    # Replica prepares its images and COLMAP text files locally
-    if args.dataset == "replica":
-        scene.prepare_dataset(dataset_dir)
-
-    # Scannet++ prepares its COLMAP model in the container
-    elif args.dataset == "scannetpp":
-        scene.prepare_dataset(runtime)
-
-
-def _generate_gt_masks(args, scene, runtime, output_dir):
-    """ Generate the dataset specific 2D masks """
-
-    # Replica can generate its actual GT masks directly from the semantic image sequence
-    if args.dataset == "replica":
-        runtime.run_lifting_module(
-            "evaluation.replica.gt_masks",
-            [
-                "--data_root", str(scene.data_root),
-                "--scene", scene.scene,
-                "--sequence_name", scene.sequence.name,
-                "--frame_step", str(scene.frame_step),
-                "--vertex_label_min_fraction", str(scene.vertex_label_min_fraction),
-                "--visibility_slop", str(scene.visibility_slop),
-                "--output_dir", str(output_dir),
-            ],
-        )
-
-    # Scannet++ renders its masks from the mesh through the lifting container, they will be considered our "GT"
-    elif args.dataset == "scannetpp":
-        scene.generate_gt_masks(runtime, output_dir, bands=args.scannetpp_mask_bands)
-
-
 def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
     """ Run the detector in the lifting container on the prepared dataset images """
     runtime.run_lifting(
@@ -363,7 +306,7 @@ def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
             "--images_dir", str(dataset_dir / "images"),
             "--output_root", str(output_dir),
             "--model", str(runtime.repo_root / "yolo26x-seg.pt"),
-            "--conf", str(args.yolo_conf),
+            "--conf", str(YOLO_CONF),
         ],
     )
 
@@ -389,7 +332,7 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
                 "--output_path", str(vote_path(segmentation_dir, spec, vote_identifier)),
                 "--target_class", spec.name_by_detector,
                 "--loaded_iter", str(args.iterations),
-                "--raster_block_size", str(args.raster_block_size),
+                "--raster_block_size", str(RASTER_BLOCK_SIZE),
                 "--data_device", str(args.vote_data_device),
                 "--background_confidence", str(args.background_confidence),
                 "--background_view_policy", str(args.background_view_policy),
@@ -568,17 +511,15 @@ def main():
 
     # Initialize the Docker runtime and create the selected dataset scene
     runtime = Runtime(args.repo_root, data_root)
-    masks_gt = output_root / "masks_gt2d"
-    scene_instance = _make_scene(args, data_root, masks_gt)
+    scene_type = ReplicaScene if args.dataset == "replica" else ScannetScene
+    scene_instance = scene_type(data_root, args.scene, output_root)
 
     # Replica writes its COLMAP model into the run directory, while Scannet++
     # keeps an undistorted one beside the scene
-    dataset_dir = (
-        output_root / "dataset" if args.dataset == "replica" else scene_instance.prepared_dir
-    )
+    dataset_dir = scene_instance.prepared_dir
     _measure_stage(
         stage_records, runtime, "prepare_dataset",
-        lambda: _prepare_scene(args, scene_instance, runtime, dataset_dir),
+        lambda: scene_instance.prepare_dataset(runtime),
         computed=not _is_prepared(dataset_dir),
     )
     model_dir = _resolve_model_dir(args, data_root, output_root)
@@ -586,24 +527,24 @@ def main():
     # Generate reference masks; they are always produced or hit because they
     # define which instances are observable and therefore evaluable
     # Every mask stage writes classes.json last, so it marks complete masks
+    mask_dirs = {"gt2d": scene_instance.masks_dir, "yolo": output_root / "masks_yolo"}
     _measure_stage(
         stage_records, runtime, "generate_gt_masks",
-        lambda: _generate_gt_masks(args, scene_instance, runtime, masks_gt),
-        computed=args.force or not (masks_gt / "classes.json").exists(),
+        lambda: scene_instance.generate_gt_masks(runtime),
+        computed=args.force or not (mask_dirs["gt2d"] / "classes.json").exists(),
     )
     if "yolo" in pending_sources:
-        masks_yolo = output_root / "masks_yolo"
         _measure_stage(
             stage_records, runtime, "generate_yolo_masks",
-            lambda: _generate_yolo_masks(args, runtime, dataset_dir, masks_yolo),
-            computed=args.force or not (masks_yolo / "classes.json").exists(),
+            lambda: _generate_yolo_masks(args, runtime, dataset_dir, mask_dirs["yolo"]),
+            computed=args.force or not (mask_dirs["yolo"] / "classes.json").exists(),
         )
 
     # Load scene data and train when no model exists
     scene = scene_instance.load_data()
     if analytics_store is not None:
         record_class_inventory(analytics_store, scene, f"{scene.dataset}:{scene.scene}")
-    evaluation_classes = _classes_with_gt2d_views(masks_gt, scene.classes)
+    evaluation_classes = _classes_with_gt2d_views(mask_dirs["gt2d"], scene.classes)
     model_ply = model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply"
     if not model_ply.exists():
         _measure_stage(
@@ -632,7 +573,7 @@ def main():
         _progress(f"Evaluation {source}: {len(evaluation_classes)} classes, {len(args.betas)} beta value(s)")
 
         # Select the mask directory and the segmentation directory for this mask source
-        mask_dir = output_root / ("masks_yolo" if source == "yolo" else "masks_gt2d")
+        mask_dir = mask_dirs[source]
         source_dir = segmentation_root / source
 
         # Only source classes absent from its mask metadata are excluded from vote generation
@@ -760,23 +701,6 @@ def main():
     _progress(f"Run finished in {time.perf_counter() - run_started:.1f}s")
     print(json.dumps({source: result["metrics_by_beta"]
                       for source, result in results.items()}, indent=2))
-
-
-def _make_scene(args, data_root, support_dir):
-    """
-    Create a scene instance based on the dataset type and provided arguments
-
-    The returned instance loads the dataset specific mesh, labels and visibility
-    information into the common scene representation
-    """
-    if args.dataset == "replica":
-        return ReplicaScene(
-            data_root, args.scene, args.sequence_name, args.frame_step, seed=3,
-            vertex_label_min_fraction=args.replica_vertex_label_min_fraction,
-            visibility_slop=args.replica_visibility_slop,
-        )
-    elif args.dataset == "scannetpp":
-        return ScannetScene(data_root, args.scene, support_dir)
 
 
 if __name__ == "__main__":
