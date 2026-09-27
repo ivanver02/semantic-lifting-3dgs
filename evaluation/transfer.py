@@ -1,21 +1,13 @@
 # Transfer labels between mesh vertices and Gaussians using radius votes
 
-import os
-import tempfile
+import itertools
 
 import numpy as np
+from scipy.spatial import cKDTree
 from plyfile import PlyData
 
 EPS = 1e-10
 RADIUS_NEIGHBOR_CHUNK_SIZE = 100000
-
-
-def sigmoid(values):
-    """ Convert opacity into values between zero and one """
-
-    # Gaussian PLY files store opacity before the sigmoid conversion
-    values = np.asarray(values, dtype=np.float64)
-    return 1.0 / (1.0 + np.exp(-values))
 
 
 def load_gaussian_ply(path):
@@ -27,160 +19,72 @@ def load_gaussian_ply(path):
 
     vertex = PlyData.read(str(path))["vertex"]
     xyz = np.vstack([vertex["x"], vertex["y"], vertex["z"]]).T.astype(np.float64)
-    names = vertex.data.dtype.names or ()
 
-    if "opacity" in names:
-        # Convert stored opacity into alpha values used as vote weights
-        opacity = sigmoid(np.asarray(vertex["opacity"], dtype=np.float64))
-
-    else:
-        # Older PLY files without opacity give every Gaussian equal weight
-        opacity = np.ones(len(xyz), dtype=np.float64)
+    # Gaussian PLY files store opacity before the sigmoid conversion
+    opacity = 1.0 / (1.0 + np.exp(-np.asarray(vertex["opacity"], dtype=np.float64)))
     return xyz, opacity
 
 
-def build_radius_neighbors(query_points, reference_tree, radius,
-                           chunk_size=RADIUS_NEIGHBOR_CHUNK_SIZE):
+def build_radius_neighbors(vertices, gaussians, radius):
     """
-    Build radius neighborhoods (points from reference_tree in a radius) for every query point
+    Build every pair of a mesh vertex and a Gaussian center closer than radius
 
-    The result contains row offsets, neighbor indices and distances
-    Rows correspond to query points and the indices refer to points in the search tree
+    The result contains three arrays of the same length: vertex indices, Gaussian indices and distances.
+    The pairs are symmetric, so they serve both transfer directions
     """
 
-    # Store each chunk separately so large scenes do not require one huge query
-    index_chunks = []
-    distance_chunks = []
-    count_chunks = []
+    tree = cKDTree(gaussians)
+    vertex_chunks, gaussian_chunks, distance_chunks = [], [], []
 
-    # Query the reference KD tree in chunks
-    for start in range(0, len(query_points), chunk_size):
-        end = min(start + chunk_size, len(query_points))
+    # Query the Gaussian KD tree in chunks so large scenes do not require one huge query
+    for start in range(0, len(vertices), RADIUS_NEIGHBOR_CHUNK_SIZE):
+        lists = tree.query_ball_point(vertices[start:start + RADIUS_NEIGHBOR_CHUNK_SIZE], r=radius)
 
-        # Query points in this chunk against the reference KD tree
-        lists = reference_tree.query_ball_point(query_points[start:end], r=radius)
-
-        # CSR row counts allow the variable length neighbor lists to be flattened
+        # Flatten the variable length neighbor lists, repeating each vertex once per neighbor
         counts = np.fromiter((len(item) for item in lists), dtype=np.int64, count=len(lists))
-        count_chunks.append(counts)
-        chunk_indices = np.empty(int(counts.sum()), dtype=np.int32)
-        chunk_distances = np.empty(int(counts.sum()), dtype=np.float32)
-        position = 0
+        vertex_index = np.repeat(np.arange(start, start + len(lists), dtype=np.int32), counts)
+        gaussian_index = np.fromiter(itertools.chain.from_iterable(lists), dtype=np.int32, count=int(counts.sum()))
 
-        # For every query point in this chunk, store the neighbor indices and distances in flat arrays
-        for query_index, neighbors in enumerate(lists):
-            count = len(neighbors)
+        vertex_chunks.append(vertex_index)
+        gaussian_chunks.append(gaussian_index)
+        distance_chunks.append(np.linalg.norm(
+            gaussians[gaussian_index] - vertices[vertex_index], axis=1).astype(np.float32))
 
-            if count:
-                # Save neighbor indices and their distances in flat arrays
-                neighbor_indices = np.asarray(neighbors, dtype=np.int32)
-                chunk_indices[position:position + count] = neighbor_indices
-                chunk_distances[position:position + count] = np.linalg.norm(
-                    reference_tree.data[neighbor_indices] - query_points[start + query_index], axis=1)
-            position += count
-        index_chunks.append(chunk_indices)
-        distance_chunks.append(chunk_distances)
-
-    # Join all chunks and build the CSR array
-    counts = np.concatenate(count_chunks) if count_chunks else np.empty(0, dtype=np.int64)
-    indptr = np.zeros(len(query_points) + 1, dtype=np.int64)
-    np.cumsum(counts, out=indptr[1:])
-    indices = np.concatenate(index_chunks) if index_chunks else np.empty(0, dtype=np.int32)
-    distances = (np.concatenate(distance_chunks) if distance_chunks else np.empty(0, dtype=np.float32))
-    return indptr, indices, distances
+    return (np.concatenate(vertex_chunks), np.concatenate(gaussian_chunks),
+            np.concatenate(distance_chunks))
 
 
-def save_neighbors(path, csr):
-    """ Save a neighborhood structure"""
-
-    # Store the three CSR components for later reuse
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temporary_name = tempfile.mkstemp(dir=path.parent, suffix=".npz")
-
-    # Write the neighborhood archive atomically
-    try:
-        with os.fdopen(fd, "wb") as temporary:
-            np.savez_compressed(
-                temporary, indptr=csr[0], indices=csr[1], dist=csr[2],
-            )
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temporary_name, path)
-
-    # Remove incomplete neighborhood archives
-    finally:
-        if os.path.exists(temporary_name):
-            os.unlink(temporary_name)
-
-
-def load_neighbors(path):
-    """ Load row offsets, neighbor indices and distances from disk """
-
-    # Return the same tuple shape produced by build_radius_neighbors
-    data = np.load(path)
-    return data["indptr"], data["indices"], data["dist"]
-
-
-def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes, min_fraction, background_labels_compete):
+def radius_label_vote(n_query, query, reference, distances, reference_labels, reference_weights,
+                      n_classes, min_fraction, background_labels_compete):
     """
-    Assign local labels to a vertex with a weighted radius vote from Gaussians and optional abstention
+    Assign local labels to query points with a weighted radius vote and optional abstention
 
-     This function works in both directions, from mesh vertices to Gaussians and from Gaussians to mesh vertices
+    This function works in both directions, from mesh vertices to Gaussians and from Gaussians to mesh vertices
     When Gaussians to mesh, the reference labels are the local IDs of the Gaussians and the query points are mesh vertices
 
     More precisely, for each query point (mesh vertex), we have a set of neighboring reference points (Gaussians) with known local labels and weights
     We want to assign a local label to each query point based on the weighted votes of its neighbors
 
-    n_query is the number of query points
-    csr contains one neighborhood row per query point 
-    Reference labels and weights use the order of the referenced points
+    query, reference and distances hold one entry per neighboring pair
+    Reference labels are local IDs in [0, n_classes) or -1 for the background, and they use the order of the referenced points, as the weights
     background_labels_compete decides whether non-target labels, including -1, contribute to the vote denominator
     """
 
-    # Expand the CSR structure
-    indptr, indices, distances = csr
-    if len(indices) == 0:
-        return np.full(n_query, -1, dtype=np.int64)
-
-    '''
-    Suppose:
-
-    indptr = [0, 3, 5]
-    indices = [3, 7, 10, 2, 4]
-    distances = [0.01, 0.02, 0.04, 0.03, 0.01]
-    
-    Then:
-        Query 0:
-            Reference 3  → 0.01
-            Reference 7  → 0.02
-            Reference 10 → 0.04
-
-        Query 1:
-            Reference 2  → 0.03
-            Reference 4  → 0.01
-
-    indptr = [0, 3, 5] produces [3, 2], as
-        Query 0 → 3 neighbors
-        Query 1 → 2 neighbors
-
-    And np.repeat produces [0, 0, 0, 1, 1], which is the query index for each edge
-
-    '''
-
     # Expand edges into one row per neighboring reference point
-    edge_query = np.repeat(np.arange(n_query, dtype=np.int64), np.diff(indptr))
-    edge_labels = reference_labels[indices]
-    edge_weights = (reference_weights[indices].astype(np.float64) / (distances.astype(np.float64) ** 2 + EPS)) # Closer neighbors have more influence
+    edge_labels = reference_labels[reference]
+    edge_weights = reference_weights[reference] / (distances.astype(np.float64) ** 2 + EPS) # Closer neighbors have more influence
+    if not background_labels_compete:
+        edge_weights = np.where(edge_labels >= 0, edge_weights, 0.0)
 
     '''
     Imagine:
-      Edge   Query   Reference   Label   Weight 
-                                                
-         0       0           3       0      100 
-         1       0           7       0       25 
-         2       0          10       1     6.25 
-         3       1           2       1    11.11 
-         4       1           4       0      100 
+      Edge   Query   Reference   Label   Weight
+
+         0       0           3       0      100
+         1       0           7       0       25
+         2       0          10       1     6.25
+         3       1           2       1    11.11
+         4       1           4       0      100
 
     For query 0, the total weight is 100 + 25 + 6.25 = 131.25
     Then, total[0] = 131.25
@@ -188,10 +92,7 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
     '''
 
     # Compute the competing evidence denominator
-    if background_labels_compete:
-        total = np.bincount(edge_query, weights=edge_weights, minlength=n_query) # Weighted sum per binning query vertex
-    else:
-        total = np.bincount(edge_query, weights=np.where(edge_labels >= 0, edge_weights, 0.0), minlength=n_query)
+    total = np.bincount(query, weights=edge_weights, minlength=n_query) # Weighted sum per binning query vertex
 
     '''
     For query 0: (one cell in the bincount)
@@ -201,81 +102,81 @@ def radius_label_vote(n_query, csr, reference_labels, reference_weights, classes
         The fraction for label 1 is 6.25 / 131.25 = 0.048
         If min_fraction = 0.5, then label 0 is accepted and label 1 is rejected. The query vertex receives label 0
         If min_fraction = 0.99, then both labels are rejected and the query vertex receives -1
-
-    # Finish the vote example
     '''
 
-    # Select the strongest class score for each query
-    best_score = np.zeros(n_query, dtype=np.float64)
-    best_label = np.full(n_query, -1, dtype=np.int64)
+    # Sum the weights per query and label, the last column (label -1) holds the background
+    columns = n_classes + 1
+    scores = np.bincount(query.astype(np.int64) * columns + edge_labels % columns,
+                         weights=edge_weights, minlength=n_query * columns).reshape(n_query, columns)
 
-    if background_labels_compete:
-        best_score = np.bincount(
-            edge_query,
-            weights=np.where(edge_labels < 0, edge_weights, 0.0),
-            minlength=n_query,
-        )
-
-    for label in classes:
-        score = np.bincount(
-            edge_query,
-            weights=np.where(edge_labels == label, edge_weights, 0.0),
-            minlength=n_query,
-        )
-        better = score > best_score
-        best_score[better] = score[better]
-
-    # Store the winning class label
-        best_label[better] = label
+    # Select the strongest class score for each query, which has to beat the background
+    best_label = scores[:, :n_classes].argmax(axis=1)
+    best_score = scores[np.arange(n_query), best_label]
 
     # Reject scores below the required fraction
     fraction = np.divide(best_score, total, out=np.zeros_like(best_score), where=total > 0)
-    accepted = ((total > 0) & (best_score > 0) & (fraction >= min_fraction))
+    accepted = (best_score > scores[:, -1]) & (fraction >= min_fraction)
+    return np.where(accepted, best_label, -1)
+
+
+def nearest_neighbor_label(n_query, query, reference, distances, reference_labels):
+    """ Assign each query point the label of its nearest reference point within the radius """
+
+    # Sort the pairs by query and then by distance, so the first pair of each query is its nearest reference
+    order = np.lexsort((distances, query))
+    _, first = np.unique(query[order], return_index=True)
+    nearest = order[first]
+
     output = np.full(n_query, -1, dtype=np.int64)
-    output[accepted] = best_label[accepted]
-    return output
-
-def nearest_neighbor_label(n_query, csr, reference_labels, tau):
-    """ Assign each query point the label of its nearest reference point """
-
-    # Expand the CSR structure
-    indptr, indices, distances = csr
-    output = np.full(n_query, -1, dtype=np.int64)
-
-    # Assign the nearest valid reference label to each query
-    for query_index in range(n_query):
-        start, end = int(indptr[query_index]), int(indptr[query_index + 1])
-
-        if start == end:
-            continue
-        nearest_offset = start + int(np.argmin(distances[start:end]))
-
-        if distances[nearest_offset] <= tau:
-            output[query_index] = reference_labels[indices[nearest_offset]]
+    output[query[nearest]] = reference_labels[reference[nearest]]
     return output
 
 
-def predict_vertex_labels(mesh_xyz, mesh_gaussian_csr, gaussian_labels, gaussian_opacity, tau, min_fraction,
+def predict_vertex_labels(neighbors, n_vertices, selected, gaussian_opacity, min_fraction,
                           opacity_weighted, min_opacity, gaussian_to_mesh_background_competes,
                           gaussian_to_mesh_transfer):
     """
-    Transfer Gaussian local labels to mesh vertices with the selected method
+    Transfer a binary Gaussian selection to mesh vertices with the selected method
 
     opacity_weighted decides whether Gaussian opacity affects the vote weights
     gaussian_to_mesh_background_competes decides whether background neighbors compete with target labels
     gaussian_to_mesh_transfer selects radius voting or assignment to the nearest point
-    Vertices without an accepted label receive the invalid label value
+    Returns a boolean mask of the vertices that receive the class
     """
 
+    vertex_index, gaussian_index, distances = neighbors
+
+    # The selected Gaussians carry the class (label 0), the rest are background
+    labels = np.where(selected, 0, -1)
     if gaussian_to_mesh_transfer == "nearest_neighbor_label":
-        return nearest_neighbor_label(len(mesh_xyz), mesh_gaussian_csr, gaussian_labels, tau)
+        return nearest_neighbor_label(n_vertices, vertex_index, gaussian_index, distances, labels) == 0
 
     # Select opacity weight or uniform weights before running the vote
     if opacity_weighted:
-        weights = np.clip(gaussian_opacity, min_opacity, 1.0)
+        weights = np.maximum(gaussian_opacity, min_opacity)
     else:
-        weights = np.ones(len(gaussian_labels), dtype=np.float64)
+        weights = np.ones(len(labels), dtype=np.float64)
 
-    # Only valid local labels can participate as target classes
-    classes = np.unique(gaussian_labels[gaussian_labels >= 0])
-    return radius_label_vote(len(mesh_xyz), mesh_gaussian_csr, gaussian_labels, weights, classes, min_fraction, gaussian_to_mesh_background_competes)
+    return radius_label_vote(
+        n_vertices, vertex_index, gaussian_index, distances, labels, weights, 1,
+        min_fraction, gaussian_to_mesh_background_competes,
+    ) == 0
+
+
+def ground_truth_gaussian_labels(neighbors, n_gaussians, scene, min_fraction,
+                                 mesh_to_gaussian_background_competes):
+    """
+    Transfer the mesh annotation to the Gaussians through the same radius vote that carries the prediction back to the mesh
+
+    mesh_to_gaussian_background_competes controls whether non-target mesh labels
+    participate when transferring GT labels from the mesh to Gaussians.
+    """
+
+    vertex_index, gaussian_index, distances = neighbors
+
+    # A vertex has no opacity, so every source votes with weight one
+    return radius_label_vote(
+        n_gaussians, gaussian_index, vertex_index, distances, scene.semantic_labels,
+        np.ones(len(scene.vertices), dtype=np.float64), len(scene.classes),
+        min_fraction, mesh_to_gaussian_background_competes,
+    )

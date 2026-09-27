@@ -10,7 +10,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from . import cache, ground_truth, metrics, reporting, transfer
+from . import cache, metrics, reporting, transfer
 from .analytics import (
     AnalyticsStore,
     collect_run_metadata,
@@ -449,8 +449,43 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes,
     return betas, 1
 
 
-def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
-                      full_xyz, full_opacity,
+def _transfer_to_mesh(args, neighbors, scene, selected, opacity):
+    """ Transfer a binary Gaussian selection to the mesh vertices with the configured operator """
+    return transfer.predict_vertex_labels(
+        neighbors, len(scene.vertices), selected, opacity, args.min_fraction,
+        not args.no_opacity_weighting, args.min_opacity,
+        args.gaussian_to_mesh_background_competes, args.gaussian_to_mesh_transfer,
+    )
+
+
+def _ground_truth_transfer(args, scene, classes, full_xyz, full_opacity, reference_dir):
+    """
+    Build the ground-truth transfer reference of every class
+
+    The mesh annotation reaches the Gaussians through the same radius vote that
+    carries the prediction back to the mesh, and then travels back to the mesh.
+    The reference Gaussians of every class are saved for the qualitative renderer.
+    Returns the vertex and Gaussian neighborhoods and the reference metrics by class.
+    """
+    neighbors = transfer.build_radius_neighbors(scene.vertices, full_xyz, args.tau)
+    gaussian_labels = transfer.ground_truth_gaussian_labels(
+        neighbors, len(full_xyz), scene, args.min_fraction,
+        args.mesh_to_gaussian_background_competes,
+    )
+
+    references = {}
+    reference_dir.mkdir(parents=True, exist_ok=True)
+    for spec in classes:
+        class_id = scene.class_id(spec.name)
+        selected = gaussian_labels == class_id
+        np.save(reference_dir / f"{safe_name(spec.name_by_detector)}.npy", np.flatnonzero(selected))
+        references[spec.name] = metrics.class_iou(
+            _transfer_to_mesh(args, neighbors, scene, selected, full_opacity), scene, class_id,
+        )
+    return neighbors, references
+
+
+def _evaluate_scene(args, scene, neighbors, full_opacity,
                       classes,
                        available_classes,
                        ground_truth_transfer_by_class,
@@ -473,7 +508,8 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
     available_names = {spec.name for spec in available_classes}
 
     for spec in classes:
-        ground_truth_transfer_metrics = ground_truth_transfer_by_class[spec.name]
+        class_id = scene.class_id(spec.name)
+        reference = ground_truth_transfer_by_class[spec.name]
 
         sweep = {}
         for beta_index, beta in enumerate(betas, start=1):
@@ -485,30 +521,29 @@ def _evaluate_scene(args, scene, gaussians_near_a_vertex, gaussian_labels,
                 vote_dir(segmentation_dir, spec, vote_identifier),
                 args.hysteresis_gamma, args.hysteresis_radius, beta,
             )
-            selected = np.zeros(len(full_xyz), dtype=bool)
+            selected = np.zeros(len(full_opacity), dtype=bool)
             if spec.name in available_names and path.exists():
                 selected[np.load(path)] = True
 
             # Evaluate the predicted Gaussian mesh including empty predictions
-            result = metrics.evaluate_class(
-                scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
-                full_opacity, spec,
-                selected, args.tau, args.min_fraction,
-                not args.no_opacity_weighting, args.min_opacity,
-                args.gaussian_to_mesh_background_competes,
-                args.gaussian_to_mesh_transfer, ground_truth_transfer_metrics,
+            prediction = metrics.class_iou(
+                _transfer_to_mesh(args, neighbors, scene, selected, full_opacity), scene, class_id,
             )
+            result = {
+                "class": spec.name,
+                "name_by_detector": spec.name_by_detector,
+                "iou": prediction,
+                "ground_truth_transfer_iou": reference,
+            }
 
-            score = result["iou"]["iou"]
+            score = prediction["iou"]
             sweep[str(beta)] = {
                 "beta": beta,
                 "gaussian_count": int(selected.sum()),
-                "iou": result["iou"],
-                "ground_truth_transfer_iou": result["ground_truth_transfer_iou"],
+                "iou": prediction,
+                "ground_truth_transfer_iou": reference,
                 "relative_iou": (
-                    result["iou"]["iou"] /
-                    result["ground_truth_transfer_iou"]["iou"]
-                    if result["ground_truth_transfer_iou"]["iou"] else 0.0
+                    prediction["iou"] / reference["iou"] if reference["iou"] else 0.0
                 ),
                 "score": score,
             }
@@ -690,39 +725,16 @@ def main():
     if not model_ply.exists():
         raise FileNotFoundError(f"trained Gaussian model missing: {model_ply}")
 
-    # Build or reuse transfer neighborhoods and labels
+    # The clean-label reference per class is shared by every mask source
     segmentation_root = output_root / "segmentation"
-    gt_dir = output_root / "gt"
-    gaussians_near_a_vertex, gaussian_labels = _measure_stage(
+    full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
+    neighbors, ground_truth_transfer_by_class = _measure_stage(
         stage_records, "ground_truth_transfer",
-        lambda: ground_truth.build(
-            scene, model_ply, gt_dir, args.tau, args.min_fraction,
-            args.mesh_to_gaussian_background_competes, args.force,
-            evaluation_scope_version=parameters["evaluation_scope_version"],
+        lambda: _ground_truth_transfer(
+            args, scene, evaluation_classes, full_xyz, full_opacity, results_dir / "reference",
         ),
-        artifact=gt_dir / "gt_gaussian_labels.npz",
         runtime=runtime,
     )
-    full_xyz, full_opacity = transfer.load_gaussian_ply(model_ply)
-
-    # The clean-label reference per class is shared by every mask source
-    # The reference Gaussians of every class are saved for the qualitative renderer
-    ground_truth_transfer_by_class = {}
-    reference_dir = results_dir / "reference"
-    reference_dir.mkdir(parents=True, exist_ok=True)
-    for spec in evaluation_classes:
-        np.save(reference_dir / f"{safe_name(spec.name_by_detector)}.npy",
-                np.flatnonzero(gaussian_labels == scene.class_id(spec.name)))
-        reference = metrics.evaluate_class(
-            scene, gaussians_near_a_vertex, gaussian_labels, full_xyz,
-            full_opacity, spec, None,
-            args.tau, args.min_fraction, not args.no_opacity_weighting,
-            args.min_opacity, args.gaussian_to_mesh_background_competes,
-            args.gaussian_to_mesh_transfer,
-        )
-        ground_truth_transfer_by_class[spec.name] = reference[
-            "ground_truth_transfer_iou"
-        ]
 
     # Process every source that still needs results
     scene_results = {}
@@ -767,8 +779,7 @@ def main():
         scene_results[source] = _measure_stage(
             stage_records, f"{source}:evaluation_transfer",
             lambda: _evaluate_scene(
-                args, scene, gaussians_near_a_vertex, gaussian_labels,
-                full_xyz, full_opacity, evaluation_classes, vote_classes,
+                args, scene, neighbors, full_opacity, evaluation_classes, vote_classes,
                 ground_truth_transfer_by_class, vote_identifier, variant,
                 source_dir, betas, results_dir_for[source], source,
             ),

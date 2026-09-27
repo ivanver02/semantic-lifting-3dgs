@@ -2,15 +2,14 @@
 
 import numpy as np
 
-from . import transfer
 
-
-def class_iou(predicted, ground_truth, mask, class_id):
-    """ Compute metrics for a target class """
+def class_iou(predicted, scene, class_id):
+    """ Compute metrics for a target class from the boolean vertex prediction """
 
     # Identify target vertices
-    predicted_positive = predicted[mask] == class_id
-    ground_truth_positive = ground_truth[mask] == class_id
+    mask = scene.evaluation_mask
+    predicted_positive = predicted[mask]
+    ground_truth_positive = scene.semantic_labels[mask] == class_id
 
     # Count error matrix entries
     tp = int((predicted_positive & ground_truth_positive).sum())
@@ -30,75 +29,6 @@ def class_iou(predicted, ground_truth, mask, class_id):
 
     # Add the intersection over union score
         "iou": float(tp / union) if union else 0.0,
-    }
-
-
-def evaluate_class(scene, gaussians_near_a_vertex, gaussian_labels, full_xyz, full_opacity, spec, selected, tau, min_fraction, opacity_weighted,
-                   min_opacity, gaussian_to_mesh_background_competes, gaussian_to_mesh_transfer,
-                   ground_truth_transfer_metrics=None):
-    """
-    Evaluate one target class and its GT transfer reference
-
-    selected is the boolean mask of the Gaussians predicted for the class, or None when it has no prediction
-    """
-
-    # Resolve the local class and evaluation mask
-    class_id = scene.class_id(spec.name)
-    eval_mask = scene.evaluation_mask
-
-    # Evaluate an empty or populated prediction
-    if selected is None or not selected.any():
-
-        prediction = class_iou(np.full(len(scene.vertices), -1, dtype=np.int64), scene.semantic_labels, eval_mask, class_id)
-
-    else:
-        predicted_labels = np.where(selected, class_id, -1)
-
-        vertex_labels = transfer.predict_vertex_labels(
-            scene.vertices, gaussians_near_a_vertex, predicted_labels,
-            full_opacity, tau, min_fraction, opacity_weighted, min_opacity,
-            gaussian_to_mesh_background_competes,
-            gaussian_to_mesh_transfer,
-        )
-
-        prediction = class_iou(vertex_labels, scene.semantic_labels, eval_mask, class_id)
-
-    # Build the reference transfer metrics when not supplied
-    if ground_truth_transfer_metrics is None:
-
-        ground_truth_transfer_mask = gaussian_labels == class_id
-        ground_truth_transfer_xyz = full_xyz[ground_truth_transfer_mask]
-
-        if len(ground_truth_transfer_xyz):
-            ground_truth_transfer_class_labels = np.where(
-                ground_truth_transfer_mask, class_id, -1,
-            )
-            ground_truth_transfer_labels = transfer.predict_vertex_labels(
-                scene.vertices, gaussians_near_a_vertex,
-                ground_truth_transfer_class_labels,
-                full_opacity, tau, min_fraction, opacity_weighted, min_opacity,
-
-    # Pass background transfer settings
-                gaussian_to_mesh_background_competes,
-                gaussian_to_mesh_transfer,
-            )
-            ground_truth_transfer_metrics = class_iou(
-                ground_truth_transfer_labels, scene.semantic_labels,
-                eval_mask, class_id,
-            )
-
-        else:
-            ground_truth_transfer_metrics = class_iou(
-                np.full(len(scene.vertices), -1, dtype=np.int64),
-                scene.semantic_labels, eval_mask, class_id,
-            )
-
-    # Return prediction and reference metrics
-    return {
-        "class": spec.name,
-        "name_by_detector": spec.name_by_detector,
-        "iou": prediction,
-        "ground_truth_transfer_iou": ground_truth_transfer_metrics,
     }
 
 
