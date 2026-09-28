@@ -194,6 +194,16 @@ def dataset_of(row):
     return row["scene_id"].split(":")[0]
 
 
+def is_frozen(row):
+    """
+    Whether a row belongs to the frozen configuration
+
+    Development sweeps and contribution analysis runs share scenes and operating
+    points with it, so every summary of the frozen configuration keeps only these rows
+    """
+    return row["variant"].startswith("frozen_")
+
+
 def selected_operating_point(path):
     """ Load the (beta, gamma) pair selected on the validation scenes """
     data = json.loads(Path(path).read_text(encoding="utf-8"))

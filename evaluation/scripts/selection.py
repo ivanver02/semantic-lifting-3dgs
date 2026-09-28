@@ -5,18 +5,12 @@ import json
 import statistics
 from pathlib import Path
 
-from evaluation.analytics import load_analytics, number
+from evaluation.analytics import is_frozen, load_analytics, number
 from evaluation.common import atomic_write_text
 
 TOLERANCE = 0.01
 
 FLOAT_SLACK = 1e-12
-
-
-def is_ablation(row):
-    # Contribution analysis runs share the validation scenes, the source and the
-    # selected point, so their rows would overwrite a frozen scene value here
-    return (row.get("variant") or "").startswith("contribution_analysis_")
 
 
 def summarise(rows, expected):
@@ -110,7 +104,7 @@ def main(argv=None):
     rows = [
         row for row in view["aggregate_beta_metrics"]
         if row.get("source") == args.source
-        and not is_ablation(row)
+        and is_frozen(row)
         and row.get("scene_id", "").split(":")[-1] in allowed
     ]
     result = select(rows, len(allowed))

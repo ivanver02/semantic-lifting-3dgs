@@ -4,17 +4,13 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 
-from evaluation.analytics import close, load_analytics, number, selected_operating_point
+from evaluation.analytics import close, is_frozen, load_analytics, number, selected_operating_point
 
 
 FIGURES = (
     "beta_curves.pdf",
     "per_class.pdf",
 )
-
-
-def _is_ablation(row):
-    return (row.get("variant") or "").startswith("contribution_analysis_")
 
 
 def _pdf(path, title, draw):
@@ -53,7 +49,7 @@ def main(argv=None):
             run = runs.get(row.get("run_id"))
             if not run or run.get("dataset") != "replica":
                 continue
-            if row.get("source") != "gt2d" or _is_ablation(row):
+            if row.get("source") != "gt2d" or not is_frozen(row):
                 continue
             b, g, iou = (
                 number(row.get("beta")),
@@ -108,7 +104,7 @@ def main(argv=None):
         values = defaultdict(list)
         for row in metrics:
             run = runs.get(row.get("run_id"))
-            if not run:
+            if not run or not is_frozen(row):
                 continue
             b, g, iou = (
                 number(row.get("beta")),

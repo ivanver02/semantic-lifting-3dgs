@@ -4,7 +4,7 @@ import argparse
 from collections import defaultdict
 from pathlib import Path
 
-from evaluation.analytics import load_analytics, number, selected_operating_point
+from evaluation.analytics import is_frozen, load_analytics, number, selected_operating_point
 from evaluation.common import atomic_write_text
 
 DATASETS = {"replica": "Replica", "scannetpp": "ScanNet++"}
@@ -36,8 +36,10 @@ def strip_last(lines):
 
 
 def _filtered(view, beta, gamma, tolerance):
-    # Yield the rows at the requested point with their run
+    # Yield the frozen configuration rows at the requested point with their run
     for row in view.get("class_beta_metrics", []):
+        if not is_frozen(row):
+            continue
         b, g = number(row.get("beta")), number(row.get("hysteresis_gamma"))
         if beta is not None and (b is None or abs(b - beta) > tolerance):
             continue
@@ -90,6 +92,8 @@ def quantiles(out, view):
     ]
     gathered = defaultdict(lambda: defaultdict(list))
     for row in view["vote_statistics"]:
+        if not is_frozen(row):
+            continue
         run = view["runs"][row["run_id"]]
 
         # Add aggregate values

@@ -7,7 +7,7 @@ from collections import defaultdict
 from pathlib import Path
 
 from evaluation.analytics import (
-    QUANTILES, close, dataset_of, load_analytics, number, selected_operating_point,
+    QUANTILES, close, dataset_of, is_frozen, load_analytics, number, selected_operating_point,
 )
 from evaluation.common import atomic_write_text
 
@@ -36,8 +36,8 @@ SOURCES = (("gt2d", "GT"), ("yolo", "YOLO"))
 # Rows of the ablation table: the frozen configuration and hysteresis disabled
 # reuse the validation runs, and the other rows are contribution analysis variants
 ABLATIONS = (
-    ("ablFrozen", None, None),
-    ("ablNoHyst", None, 0.0),
+    ("ablFrozen", "frozen_", None),
+    ("ablNoHyst", "frozen_", 0.0),
     ("ablNoGtoM", "contribution_analysis_no_competition_gtom", None),
     ("ablNoMtoG", "contribution_analysis_no_competition_mtog", None),
     ("ablNoBoth", "contribution_analysis_no_competition_both", None),
@@ -55,11 +55,6 @@ COST_STAGES = {
         stage == "ground_truth_transfer" or stage.endswith(":evaluation_transfer")
     ),
 }
-
-
-def is_ablation(row):
-    """ Whether a metric row belongs to a contribution analysis variant """
-    return row["variant"].startswith("contribution_analysis_")
 
 
 def numbers(rows, field):
@@ -85,7 +80,7 @@ def main_results(values, view, beta, gamma):
         for source, source_prefix in SOURCES:
             rows = [
                 row for row in view["aggregate_beta_metrics"]
-                if not is_ablation(row) and dataset_of(row) == dataset and row["source"] == source
+                if is_frozen(row) and dataset_of(row) == dataset and row["source"] == source
                 and at_point(row, beta, gamma)
             ]
             prefix = dataset_prefix + source_prefix
@@ -125,7 +120,7 @@ def stability(values, view, beta, gamma):
     curves, at_selected = defaultdict(lambda: defaultdict(list)), defaultdict(lambda: defaultdict(list))
     per_class = defaultdict(list)
     for row in view["class_beta_metrics"]:
-        if not (not is_ablation(row) and dataset_of(row) == "replica" and row["source"] == "gt2d"):
+        if not (is_frozen(row) and dataset_of(row) == "replica" and row["source"] == "gt2d"):
             continue
         iou, row_beta, row_gamma = number(row["iou"]), number(row["beta"]), number(row["hysteresis_gamma"])
         for setting, setting_gamma in (("Hyst", gamma), ("NoHyst", 0.0)):
@@ -149,7 +144,7 @@ def stability(values, view, beta, gamma):
     # The largest recorded quantile of the target evidence fraction that still lies below beta
     rows = [
         row for row in view["vote_statistics"]
-        if not is_ablation(row) and dataset_of(row) == "replica" and row["source"] == "gt2d"
+        if is_frozen(row) and dataset_of(row) == "replica" and row["source"] == "gt2d"
     ]
     below = [
         100 * level for name, level in QUANTILES.items()
@@ -166,8 +161,7 @@ def ablations(values, view, beta, gamma):
         row_gamma = gamma if fixed_gamma is None else fixed_gamma
 
         def selected(row):
-            matches = not is_ablation(row) if variant is None else row["variant"] == variant
-            return (matches and dataset_of(row) == "replica"
+            return (row["variant"].startswith(variant) and dataset_of(row) == "replica"
                     and row["source"] == "gt2d" and at_point(row, beta, row_gamma))
 
         rows = [row for row in view["aggregate_beta_metrics"] if selected(row)]
@@ -193,7 +187,7 @@ def qualitative_pair(values, view, beta, gamma):
     pairs = sorted(
         (number(row["iou"]), row["scene_id"].split(":")[-1], names[row["class_id"]])
         for row in view["class_beta_metrics"]
-        if not is_ablation(row) and dataset_of(row) == "scannetpp" and row["source"] == "gt2d"
+        if is_frozen(row) and dataset_of(row) == "scannetpp" and row["source"] == "gt2d"
         and at_point(row, beta, gamma)
     )
     if pairs:
@@ -225,7 +219,10 @@ def costs(values, view, gamma):
         if row["stage"].endswith(":votes") and row["dataset"] == "replica":
             vote_modes[row["run_id"]].add(row["cache_mode"])
     parameters = {row["run_id"]: row for row in view["run_parameters"]}
-    runs = sorted(view["runs"].values(), key=lambda row: row["created_at"])
+    runs = sorted(
+        (run for run in view["runs"].values() if is_frozen(parameters[run["run_id"]])),
+        key=lambda row: row["created_at"],
+    )
 
     miss = next((run["run_id"] for run in runs if vote_modes.get(run["run_id"]) == {"miss"}), None)
     hit = next((run["run_id"] for run in runs if vote_modes.get(run["run_id"]) == {"hit"}
