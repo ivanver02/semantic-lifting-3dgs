@@ -277,16 +277,15 @@ def _generate_yolo_masks(args, runtime, dataset_dir, output_dir):
     runtime.run_lifting(
         "segmentation/generate_mask.py",
         [
-            "--images_dir", str(dataset_dir / "images"),
-            "--output_root", str(output_dir),
-            "--model", str(runtime.repo_root / "yolo26x-seg.pt"),
-            "--conf", str(YOLO_CONF),
+            "--images_dir", dataset_dir / "images",
+            "--output_root", output_dir,
+            "--model", runtime.repo_root / "yolo26x-seg.pt",
+            "--conf", YOLO_CONF,
         ],
     )
 
 
-def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
-               segmentation_dir, classes, vote_identifier):
+def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir, segmentation_dir, classes, identifier):
     """
     Accumulate 2D votes for every target class present in the source masks.
 
@@ -300,30 +299,33 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir,
         runtime.run_lifting(
             "segmentation/accumulate_votes.py",
             [
-                "--model_path", str(model_dir),
-                "--source_path", str(dataset_dir),
-                "--mask_dir", str(mask_dir),
-                "--output_path", str(vote_path(segmentation_dir, spec, vote_identifier)),
+                "--model_path", model_dir,
+                "--source_path", dataset_dir,
+                "--mask_dir", mask_dir,
+                "--output_path", vote_path(segmentation_dir, spec, identifier),
                 "--target_class", spec.name_by_detector,
-                "--loaded_iter", str(args.iterations),
-                "--raster_block_size", str(RASTER_BLOCK_SIZE),
-                "--data_device", str(args.vote_data_device),
-                "--background_confidence", str(args.background_confidence),
-                "--background_view_policy", str(args.background_view_policy),
+                "--loaded_iter", args.iterations,
+                "--raster_block_size", RASTER_BLOCK_SIZE,
+                "--data_device", args.vote_data_device,
+                "--background_confidence", args.background_confidence,
+                "--background_view_policy", args.background_view_policy,
             ],
         )
 
 
-def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes, vote_identifier):
+def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes, identifier):
     """ Select the Gaussians of every class and beta value in one container """
-    runtime.run_lifting("segmentation/threshold_labels.py", [
-        "--model_path", str(model_dir),
-        "--loaded_iter", str(args.iterations),
-        "--hysteresis_gamma", str(args.hysteresis_gamma),
-        "--hysteresis_radius", str(args.hysteresis_radius),
-        "--beta", *[str(beta) for beta in args.betas],
-        "--votes", *[str(vote_path(segmentation_dir, spec, vote_identifier)) for spec in classes],
-    ])
+    runtime.run_lifting(
+        "segmentation/threshold_labels.py",
+        [
+            "--model_path", model_dir,
+            "--loaded_iter", args.iterations,
+            "--hysteresis_gamma", args.hysteresis_gamma,
+            "--hysteresis_radius", args.hysteresis_radius,
+            "--beta", *args.betas,
+            "--votes", *[vote_path(segmentation_dir, spec, identifier) for spec in classes],
+        ],
+    )
 
 
 def _transfer_to_mesh(args, neighbors, scene, selected, opacity):
