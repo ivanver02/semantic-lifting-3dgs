@@ -1,16 +1,15 @@
 # Create the manuscript metric PDFs from analytics
 
 import argparse
+import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from evaluation.analytics import close, is_frozen, load_analytics, number, selected_operating_point
+from evaluation.analytics import close, dataset_of, is_frozen, load_analytics, number, selected_operating_point
 
 
-FIGURES = (
-    "beta_curves.pdf",
-    "per_class.pdf",
-)
+DATASETS = {"replica": "Replica", "scannetpp": "ScanNet++"}
+DATASET_COLORS = {"replica": "tab:blue", "scannetpp": "tab:orange"}
 
 
 def _pdf(path, title, draw):
@@ -37,8 +36,13 @@ def main(argv=None):
 
     beta, gamma = selected_operating_point(args.selection)
     view = load_analytics(args.analytics)
-    runs = view["runs"]
-    metrics = view.get("class_beta_metrics", [])
+    names = {row["class_id"]: row["class_name"] for row in view["classes"]}
+
+    # Both figures read the frozen configuration under annotation-derived masks
+    metrics = [
+        row for row in view["class_beta_metrics"]
+        if is_frozen(row) and row["source"] == "gt2d"
+    ]
     args.out.mkdir(parents=True, exist_ok=True)
 
     # Figure 1: one line per class under ground-truth masks, with hysteresis
@@ -46,41 +50,32 @@ def main(argv=None):
     def curves(ax):
         series = defaultdict(lambda: defaultdict(list))
         for row in metrics:
-            run = runs.get(row.get("run_id"))
-            if not run or run.get("dataset") != "replica":
+            if dataset_of(row) != "replica":
                 continue
-            if row.get("source") != "gt2d" or not is_frozen(row):
-                continue
-            b, g, iou = (
-                number(row.get("beta")),
-                number(row.get("hysteresis_gamma")),
-                number(row.get("iou")),
-            )
-            if b is None or g is None or iou is None:
-                continue
-            if close(g, gamma):
+            row_gamma = number(row["hysteresis_gamma"])
+            if close(row_gamma, gamma):
                 setting = "hysteresis"
-            elif g == 0.0:
+            elif close(row_gamma, 0.0):
                 setting = "no_hysteresis"
             else:
                 continue
-            series[(row.get("class_id"), setting)][b].append(iou)
+            series[(row["class_id"], setting)][number(row["beta"])].append(number(row["iou"]))
 
         # Average the scenes for every beta and draw one color per class,
         # solid at gammaStar and dashed with hysteresis disabled
-        classes = sorted({cls for cls, _ in series})
-        for index, cls in enumerate(classes):
+        classes = sorted({class_id for class_id, _ in series})
+        for index, class_id in enumerate(classes):
             color = plt.cm.tab10(index % 10)
             for setting, style in (("hysteresis", "-"), ("no_hysteresis", "--")):
                 points = sorted(
-                    (b, sum(v) / len(v))
-                    for b, v in series.get((cls, setting), {}).items()
+                    (b, statistics.mean(values))
+                    for b, values in series.get((class_id, setting), {}).items()
                 )
                 if points:
                     ax.plot(
-                        [p[0] for p in points], [p[1] for p in points],
+                        [point[0] for point in points], [point[1] for point in points],
                         style, color=color,
-                        label=cls if setting == "hysteresis" else None,
+                        label=names[class_id] if setting == "hysteresis" else None,
                     )
         if series:
             ax.legend(fontsize=6, ncol=2)
@@ -88,68 +83,42 @@ def main(argv=None):
         ax.set_xlabel("beta")
         ax.set_ylabel("IoU")
 
-    _pdf(args.out / FIGURES[0], "Validation beta curves", curves)
+    _pdf(args.out / "beta_curves.pdf", "Validation beta curves", curves)
 
     # Figure 2: per-class IoU across the scenes of each dataset against the
     # number of annotated vertices of the class
     def per_class(ax):
-        counts = {}
-        for row in view.get("scene_classes", []):
-            scene_id, class_id = row.get("scene_id"), row.get("class_id")
-            vertices = number(row.get("gt_evaluated_vertex_count"))
-            if vertices is not None:
-                counts[(scene_id, class_id)] = vertices
+        counts = {
+            (row["scene_id"], row["class_id"]): number(row["gt_evaluated_vertex_count"])
+            for row in view["scene_classes"]
+        }
 
-        # Gather the IoU values at the selected operating point
-        values = defaultdict(list)
+        # Gather the IoU values at the selected operating point, and the
+        # annotated vertices of the class in the same scenes
+        values, vertices = defaultdict(list), defaultdict(list)
         for row in metrics:
-            run = runs.get(row.get("run_id"))
-            if not run or not is_frozen(row):
-                continue
-            b, g, iou = (
-                number(row.get("beta")),
-                number(row.get("hysteresis_gamma")),
-                number(row.get("iou")),
-            )
-            if b is None or g is None or iou is None:
-                continue
-            if not (close(b, beta) and close(g, gamma)):
-                continue
-            values[(run.get("dataset"), row.get("class_id"))].append(iou)
+            if close(number(row["beta"]), beta) and close(number(row["hysteresis_gamma"]), gamma):
+                key = (dataset_of(row), row["class_id"])
+                values[key].append(number(row["iou"]))
+                vertices[key].append(counts[(row["scene_id"], row["class_id"])])
 
-        def mean_count(class_id):
-            observed = [
-                vertices for (_, cid), vertices in counts.items()
-                if cid == class_id
-            ]
-            return sum(observed) / len(observed) if observed else 0.0
+        # Each box sits at the mean number of annotated vertices of its class,
+        # on a logarithmic axis so that small and large classes remain readable
+        for (dataset, class_id), iou_values in values.items():
+            position = max(statistics.mean(vertices[(dataset, class_id)]), 1.0)
+            box = ax.boxplot([iou_values], positions=[position], widths=[0.3 * position],
+                             patch_artist=True, manage_ticks=False)
+            box["boxes"][0].set_facecolor(DATASET_COLORS[dataset])
+            ax.text(position, 1.01, names[class_id], transform=ax.get_xaxis_transform(),
+                    ha="center", va="bottom", fontsize=6, rotation=90)
 
-        items = sorted(values.items(), key=lambda kv: mean_count(kv[0][1]))
-        dataset_colors = {"replica": "tab:blue", "scannetpp": "tab:orange"}
-        all_values, positions, tick_labels, box_colors = [], [], [], []
-        for (dataset, class_id), iou_values in items:
-            all_values.append(iou_values)
-            positions.append(mean_count(class_id))
-            tick_labels.append(str(class_id))
-            box_colors.append(dataset_colors.get(dataset, "gray"))
-
-        if all_values:
-            boxes = ax.boxplot(
-                all_values, positions=positions, widths=None,
-                tick_labels=[f"{position:.0f}" for position in positions],
-                patch_artist=True,
-            )
-            for box, color in zip(boxes["boxes"], box_colors):
-                box.set_facecolor(color)
-            handles = [
-                plt.Rectangle((0, 0), 1, 1, facecolor=color, alpha=0.5)
-                for color in dict.fromkeys(box_colors)
-            ]
-            ax.legend(handles, list(dict.fromkeys(box_colors)), fontsize=6)
+        ax.set_xscale("log")
+        handles = [plt.Rectangle((0, 0), 1, 1, facecolor=color) for color in DATASET_COLORS.values()]
+        ax.legend(handles, list(DATASETS.values()), fontsize=6)
         ax.set_xlabel("annotated vertices of the class")
         ax.set_ylabel("IoU")
 
-    _pdf(args.out / FIGURES[1], "Per-class IoU at selected point", per_class)
+    _pdf(args.out / "per_class.pdf", "Per-class IoU at selected point", per_class)
     return 0
 
 
