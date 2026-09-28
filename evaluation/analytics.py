@@ -20,7 +20,7 @@ SCHEMA = {
     "runs": [
         "run_id", "created_at", "dataset", "scene_id", "scene_name", "split",
         "source", "output_root", "model_root", "elapsed_seconds",
-        "peak_cuda_memory_bytes", "peak_cuda_memory_reserved_bytes",
+        "peak_cuda_memory_bytes",
     ],
 
     "run_parameters": [
@@ -46,7 +46,6 @@ SCHEMA = {
     "run_stages": [
         "run_id", "dataset", "scene_id", "stage", "cache_mode",
         "elapsed_seconds", "peak_cuda_memory_bytes",
-        "peak_cuda_memory_reserved_bytes",
     ],
 
     "vote_statistics": [

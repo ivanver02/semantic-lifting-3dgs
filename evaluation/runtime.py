@@ -25,7 +25,6 @@ class Runtime:
         self.lifting_image = lifting_image
         self.colmap_image = colmap_image
         self._stage_peak_cuda_memory_bytes = None
-        self._stage_peak_cuda_memory_reserved_bytes = None
 
     def _container_path(self, value):
         """ Convert a host path into its mounted container path """
@@ -84,19 +83,10 @@ class Runtime:
         print("Docker command: ", " ".join(str(item) for item in command))
         subprocess.run(command, check=True, text=True, cwd=str(self.repo_root))
 
-    def begin_stage(self):
-        """ Reset the maximum CUDA value collected from container processes """
-        self._stage_peak_cuda_memory_bytes = None
-        self._stage_peak_cuda_memory_reserved_bytes = None
-
     def end_stage(self):
         """ Return and clear the maximum CUDA value collected for one stage """
-        peak = {
-            "allocated": self._stage_peak_cuda_memory_bytes,
-            "reserved": self._stage_peak_cuda_memory_reserved_bytes,
-        }
+        peak = self._stage_peak_cuda_memory_bytes
         self._stage_peak_cuda_memory_bytes = None
-        self._stage_peak_cuda_memory_reserved_bytes = None
         return peak
 
     def _run_python(self, image, gpu, target_kind, target, arguments):
@@ -112,23 +102,14 @@ class Runtime:
             "--", *args,
         ]
 
-        # Run the target and merge measured peaks
+        # Run the target and keep the largest measured peak for the stage
         try:
             # Never allow a previous interrupted container to provide this run's values
             metrics_path.unlink(missing_ok=True)
             self._run(self._docker_command(image, gpu, command))
-            metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-            for key, attribute in (
-                ("peak_cuda_memory_bytes", "_stage_peak_cuda_memory_bytes"),
-                ("peak_cuda_memory_reserved_bytes", "_stage_peak_cuda_memory_reserved_bytes"),
-            ):
-                # Keep the largest value for the stage
-                peak = metrics.get(key)
-                if peak is not None:
-                    peak = int(peak)
-                    previous = getattr(self, attribute)
-                    if previous is None or peak > previous:
-                        setattr(self, attribute, peak)
+            peak = json.loads(metrics_path.read_text(encoding="utf-8"))["peak_cuda_memory_bytes"]
+            if peak is not None:
+                self._stage_peak_cuda_memory_bytes = max(peak, self._stage_peak_cuda_memory_bytes or 0)
         finally:
             metrics_path.unlink(missing_ok=True)
 

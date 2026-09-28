@@ -69,16 +69,13 @@ def _measure_stage(stage_records, runtime, name, function, computed=True):
     computed is False when every output of the stage is already in the cache,
     and then the stage is recorded as a cache hit without running
     """
-    runtime.begin_stage()
     started = time.perf_counter()
     result = function() if computed else None
-    memory = runtime.end_stage()
     stage_records.append({
         "stage": name,
         "cache_mode": "miss" if computed else "hit",
         "elapsed_seconds": time.perf_counter() - started,
-        "peak_cuda_memory_bytes": memory["allocated"],
-        "peak_cuda_memory_reserved_bytes": memory["reserved"],
+        "peak_cuda_memory_bytes": runtime.end_stage(),
     })
     return result
 
@@ -631,11 +628,6 @@ def main():
             "peak_cuda_memory_bytes": max(
                 (record["peak_cuda_memory_bytes"] for record in stage_records
                  if record["peak_cuda_memory_bytes"] is not None),
-                default=None,
-            ),
-            "peak_cuda_memory_reserved_bytes": max(
-                (record["peak_cuda_memory_reserved_bytes"] for record in stage_records
-                 if record["peak_cuda_memory_reserved_bytes"] is not None),
                 default=None,
             ),
         })

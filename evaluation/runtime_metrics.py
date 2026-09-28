@@ -2,7 +2,6 @@
 
 import argparse
 import json
-import os
 import runpy
 import sys
 from pathlib import Path
@@ -27,32 +26,8 @@ def _parser():
     return parser
 
 
-def _reset_cuda_peaks():
-    """ Initialize CUDA and reset allocation counters on every device """
-    if torch is None or not torch.cuda.is_available():
-        return
-    
-    torch.cuda.init()
-    for device_index in range(torch.cuda.device_count()):
-        torch.cuda.reset_peak_memory_stats(device_index)
-
-
-def _cuda_peaks():
-    """ Return the largest allocated and reserved peaks across visible devices """
-    if torch is None or not torch.cuda.is_available():
-        return None, None
-    
-    allocated = max(
-        torch.cuda.max_memory_allocated(device_index)
-        for device_index in range(torch.cuda.device_count())
-    )
-
-    # Read reserved memory peaks
-    reserved = max(
-        torch.cuda.max_memory_reserved(device_index)
-        for device_index in range(torch.cuda.device_count())
-    )
-    return int(allocated), int(reserved)
+def _cuda_available():
+    return torch is not None and torch.cuda.is_available()
 
 
 def main():
@@ -61,7 +36,11 @@ def main():
     if stage_args[:1] == ["--"]:
         stage_args = stage_args[1:]
 
-    _reset_cuda_peaks()
+    # Initialize CUDA and reset allocation counters on every device
+    if _cuda_available():
+        torch.cuda.init()
+        for device_index in range(torch.cuda.device_count()):
+            torch.cuda.reset_peak_memory_stats(device_index)
 
     try:
         sys.argv = [args.script or args.module] + stage_args
@@ -71,25 +50,15 @@ def main():
             runpy.run_module(args.module, run_name="__main__")
 
     finally:
-        peak_allocated, peak_reserved = _cuda_peaks()
+        # Keep the largest allocated peak across visible devices
+        peak = None
+        if _cuda_available():
+            peak = max(
+                torch.cuda.max_memory_allocated(device_index)
+                for device_index in range(torch.cuda.device_count())
+            )
         args.metrics_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary_path = args.metrics_path.with_suffix(".tmp")
-        
-        try:
-            with temporary_path.open("w", encoding="utf-8") as handle:
-                json.dump({
-                    "peak_cuda_memory_bytes": peak_allocated,
-                    "peak_cuda_memory_reserved_bytes": peak_reserved,
-                }, handle)
-
-    # Flush the metrics file
-                handle.flush()
-                os.fsync(handle.fileno())
-
-            # Replace the metrics file atomically
-            os.replace(temporary_path, args.metrics_path)
-        finally:
-            temporary_path.unlink(missing_ok=True)
+        args.metrics_path.write_text(json.dumps({"peak_cuda_memory_bytes": peak}), encoding="utf-8")
 
 
 if __name__ == "__main__":
