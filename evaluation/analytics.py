@@ -32,7 +32,7 @@ SCHEMA = {
         "gaussian_to_mesh_transfer", "min_opacity", "opacity_weighting",
         "gaussian_to_mesh_background_competes",
         "mesh_to_gaussian_background_competes",
-        "code_commit", "gpu_name", "command",
+        "code_commit", "gpu_name", "driver_version", "command",
     ],
 
     "classes": ["class_id", "dataset", "class_name", "detector_name", "detector_stored_id"],
@@ -91,16 +91,6 @@ def _command_output(command):
     return result.stdout.strip() or None
 
 
-def _gpu_names():
-    """ Return the names of the visible NVIDIA devices """
-    output = _command_output([
-        "nvidia-smi", "--query-gpu=name", "--format=csv,noheader",
-    ])
-    if output is None:
-        return []
-    return [line.strip() for line in output.splitlines() if line.strip()]
-
-
 def utc_now():
     """ Return a timestamp for CSV records """
     return datetime.now(timezone.utc).isoformat()
@@ -108,9 +98,16 @@ def utc_now():
 
 def collect_run_metadata(repo_root, command):
     """ Collect the reproducibility metadata recorded with every run """
+
+    # One line per visible NVIDIA device with its name and driver version
+    output = _command_output([
+        "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader",
+    ]) or ""
+    devices = [line.split(",") for line in output.splitlines() if line.strip()]
     return {
         "code_commit": _command_output(["git", "-C", str(repo_root), "rev-parse", "HEAD"]),
-        "gpu_name": json.dumps(_gpu_names()),
+        "gpu_name": json.dumps([device[0].strip() for device in devices]),
+        "driver_version": ";".join(sorted({device[-1].strip() for device in devices})),
         "command": shlex.join(command),
     }
 
