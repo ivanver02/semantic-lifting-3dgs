@@ -1,79 +1,65 @@
 # Run the development sweep that selects tau and theta on the two development scenes
 
 import argparse
-import copy
 import json
-import re
 from pathlib import Path
 
-from evaluation.analytics import load_analytics
-from evaluation.common import atomic_write_text
-from evaluation.scripts.experiment_common import command, dump_plan, run_units, token
+from evaluation.analytics import close, load_analytics, number
+from evaluation.scripts.experiment_common import dump_plan, run_units, token, unit
 
 
 DEFAULT_GAMMA = 0.8
 DEFAULT_BETA = 0.975
+TOLERANCE = 0.01
+RULE = "within 0.01 of best mean, then smallest scene_difference, then smallest parameter"
 
 
-def _units(args):
-    """ Build the tau and theta sweep units for both development scenes """
+def _units(args, phase, tau_star=None):
+    """
+    Build the tau or theta sweep units for both development scenes
+
+    The two development scenes belong to different datasets, and each dataset
+    resolves its scenes under its own root. The output root is derived from the
+    data root because evaluation.run requires the output to live inside it.
+    """
     units = []
-    # The theta variant label records the tau it depends on
-    tau_label = (
-        token(args.tau_star) if args.tau_star is not None else "selected"
-    )
-    for dataset, scene in (
-        ("replica", args.replica_scene),
-        ("scannetpp", args.scannetpp_scene),
+    for dataset, scene, data_root in (
+        ("replica", args.replica_scene, args.replica_data_root),
+        ("scannetpp", args.scannetpp_scene, args.scannetpp_data_root),
     ):
-        for tau in args.tau_grid:
-            units.append(
-                {
-                    "phase": "tau",
-                    "dataset": dataset,
-                    "scene": scene,
-                    "tau": tau,
-                    "theta": args.default_theta,
-                    "variant": f"development_tau_{token(tau)}",
-                }
-            )
-
-        for theta in args.theta_grid:
-            units.append(
-                {
-                    "phase": "theta",
-                    "dataset": dataset,
-                    "scene": scene,
-                    "tau": None,
-                    "theta": theta,
-                    "variant": f"development_theta_tau{tau_label}_theta{token(theta)}",
-                }
-            )
+        # The theta variant label records the tau it depends on
+        if phase == "tau":
+            candidates = [(f"development_tau_{token(tau)}", tau, args.default_theta) for tau in args.tau_grid]
+        else:
+            candidates = [(f"development_theta_tau{token(tau_star)}_theta{token(theta)}", tau_star, theta)
+                          for theta in args.theta_grid]
+        for variant, tau, theta in candidates:
+            units.append(unit(
+                dataset, scene, variant, data_root, data_root / args.output_subdir,
+                betas=[args.beta], gamma=args.gamma, tau=tau, theta=theta, mask_source="gt2d",
+            ))
     return units
 
 
-def unit_arguments(args, unit):
+def select_candidate(view, prefix, parameter, beta):
     """
-    Return the arguments one unit runs with
+    Apply a candidate selection rule
 
-    The two development scenes belong to different datasets, and each dataset
-    resolves its scenes under its own root, so the roots cannot be shared. The
-    output root is derived from the data root because evaluation.run requires
-    the output to live inside it.
+    Every candidate is scored by the mean mIoU of the two development scenes, and among those
+    within the tolerance of the best mean, the one where the two scenes differ least is picked
     """
-    current = copy.copy(args)
-    current.data_root = args.data_roots[unit["dataset"]]
-    current.output_root = current.data_root / args.output_subdir
-    return current
 
-
-def select_candidate(rows, parameter):
-    """Apply a candidate selection rule"""
+    # The run parameters say which tau and theta each development run used
+    parameters = {row["run_id"]: row for row in view["run_parameters"]}
 
     # Aggregate one candidate value across both development scenes
     grouped = {}
-    for row in rows:
-        value = float(row[parameter])
+    for row in view["aggregate_beta_metrics"]:
+        if not row["variant"].startswith(prefix) or row["source"] != "gt2d":
+            continue
+        if not close(number(row["beta"]), beta):
+            continue
+        value = float(parameters[row["run_id"]][parameter])
         grouped.setdefault(value, {})[row["scene_id"]] = float(row["mIoU"])
 
     if not grouped or any(len(values) != 2 for values in grouped.values()):
@@ -94,33 +80,8 @@ def select_candidate(rows, parameter):
         )
 
     best = max(item["mean_mIoU"] for item in summaries)
-    eligible = [item for item in summaries if item["mean_mIoU"] >= best - 0.01]
+    eligible = [item for item in summaries if item["mean_mIoU"] >= best - TOLERANCE]
     return min(eligible, key=lambda item: (item["scene_difference"], item[parameter]))
-
-
-def _analytics_rows(args, prefix):
-
-    # Filter completed analytics rows for one sweep phase and decode its parameter
-    view = load_analytics(args.analytics)
-    rows = []
-    for row in view.get("aggregate_beta_metrics", []):
-        if not row.get("variant", "").startswith(prefix):
-            continue
-        if row.get("source") != "gt2d" or float(row["beta"]) != args.beta:
-            continue
-        row = dict(row)
-
-        # Decode the sweep parameter from the variant name
-        if prefix == "development_tau_":
-            parameter_text = row["variant"].removeprefix(prefix)
-            row["tau"] = float(parameter_text.replace("_", "."))
-        else:
-            match = re.search(r"_theta([0-9_]+)$", row["variant"])
-            if match is None:
-                continue
-            row["theta"] = float(match.group(1).replace("_", "."))
-        rows.append(row)
-    return rows
 
 
 def main(argv=None):
@@ -132,116 +93,52 @@ def main(argv=None):
                         help="ScanNet++ root, holding validation_data and metadata")
     parser.add_argument("--output-subdir", default="eval",
                         help="Run directory created inside each data root")
-    parser.add_argument("--analytics", type=Path, default=None)
     parser.add_argument("--selection-output", type=Path, default=None)
     parser.add_argument("--replica-scene", default="office_0")
     parser.add_argument("--scannetpp-scene", required=True)
     parser.add_argument("--tau-grid", nargs="+", type=float, required=True)
     parser.add_argument("--theta-grid", nargs="+", type=float, required=True)
     parser.add_argument("--default-theta", type=float, default=0.5)
-    parser.add_argument("--tau-star", type=float, default=None)
     parser.add_argument("--beta", type=float, default=DEFAULT_BETA)
     parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA)
-    parser.add_argument(
-        "--mask-source",
-        choices=["gt2d", "yolo", "both"],
-        default="gt2d",
-        help="Development selection defaults to annotation-derived masks to isolate transfer",
-    )
-    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Print the tau phase plan, the theta phase depends on the selected tau")
     args = parser.parse_args(argv)
-
-    # This driver always plans the development experiment
-    args.experiment = "development"
-
-    if args.mask_source not in {"gt2d", "both"}:
-        raise SystemExit("development selection requires annotation-derived gt2d masks")
-
-    args.data_roots = {
-        "replica": args.replica_data_root.resolve(),
-        "scannetpp": args.scannetpp_data_root.resolve(),
-    }
+    args.replica_data_root = args.replica_data_root.resolve()
+    args.scannetpp_data_root = args.scannetpp_data_root.resolve()
 
     # Both datasets write their metrics into the same store, which is what lets
     # the rule below compare the two development scenes
-    stores = {root.parent / "analytics" for root in args.data_roots.values()}
-    if args.analytics is None and len(stores) != 1:
-        raise SystemExit(
-            "the two data roots resolve to different analytics stores "
-            f"({sorted(str(store) for store in stores)}); pass --analytics"
-        )
-    args.analytics = Path(args.analytics or stores.pop())
-    selection_path = (
-        args.selection_output or args.analytics / "tau_theta_selection.json"
-    )
+    analytics = args.replica_data_root.parent / "analytics"
+    if args.scannetpp_data_root.parent / "analytics" != analytics:
+        raise SystemExit("the two data roots must share a parent, which holds the analytics store")
+    selection_path = args.selection_output or analytics / "tau_theta_selection.json"
 
-    # Restore a persisted tau so theta variants are labelled consistently
-    if selection_path.exists():
-        persisted = json.loads(selection_path.read_text(encoding="utf-8"))
-        args.tau_star = float(persisted["tau_star"])
-    sweep_units = _units(args)
-
+    # Development selection uses annotation-derived masks to isolate transfer
+    tau_units = _units(args, "tau")
     if args.dry_run:
-        dump_plan(args, "development_sweep", sweep_units)
+        dump_plan("development_tau", tau_units)
         return 0
 
-    # Run the tau phase before selecting the theta dependency
-    def build_command(current, unit):
-        return command(
-            current,
-            unit,
-            betas=[current.beta],
-            gamma=current.gamma,
-            split="validation",
-            tau=(unit["tau"] if unit["tau"] is not None else current.tau_star),
-            theta=unit["theta"],
-        )
+    # Run the tau phase and select tau before running the theta phase that depends on it
+    run_units(tau_units, args.repo_root)
+    tau_selection = select_candidate(load_analytics(analytics), "development_tau_", "tau", args.beta)
 
-    tau_units = [unit for unit in sweep_units if unit["phase"] == "tau"]
-    run_units(args, tau_units, build_command, resolve=unit_arguments)
-
-    # Select tau from analytics unless it was already persisted
-    if selection_path.exists():
-        persisted = json.loads(selection_path.read_text(encoding="utf-8"))
-        args.tau_star = float(persisted["tau_star"])
-        tau_selection = persisted.get("tau_selection", {"tau": args.tau_star})
-    else:
-        tau_rows = _analytics_rows(args, "development_tau_")
-        tau_selection = select_candidate(tau_rows, "tau")
-        args.tau_star = tau_selection["tau"]
-
-        # Persist the tau operating point before running the theta phase
-        selection_path.parent.mkdir(parents=True, exist_ok=True)
-        atomic_write_text(
-            selection_path,
-            json.dumps(
-                {
-                    "tau_star": args.tau_star,
-                    "tau_selection": tau_selection,
-                    "rule": "within 0.01 of best mean, then smallest scene_difference, then smallest parameter",
-                },
-                indent=2,
-            )
-            + "\n",
-        )
-
-    # Relabel and run the theta phase after tau selection
-    theta_units = [
-        unit for unit in _units(args) if unit["phase"] == "theta"
-    ]
-    run_units(args, theta_units, build_command, resolve=unit_arguments)
-    theta_rows = _analytics_rows(args, "development_theta_")
-    theta_selection = select_candidate(theta_rows, "theta")
+    run_units(_units(args, "theta", tau_selection["tau"]), args.repo_root)
+    theta_selection = select_candidate(
+        load_analytics(analytics), f"development_theta_tau{token(tau_selection['tau'])}_",
+        "min_fraction", args.beta,
+    )
 
     selection = {
         "tau_star": tau_selection["tau"],
-        "theta_star": theta_selection["theta"],
+        "theta_star": theta_selection["min_fraction"],
         "tau_selection": tau_selection,
         "theta_selection": theta_selection,
-        "rule": "within 0.01 of best mean, then smallest scene_difference, then smallest parameter",
+        "rule": RULE,
     }
     selection_path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(selection_path, json.dumps(selection, indent=2) + "\n")
+    selection_path.write_text(json.dumps(selection, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(selection, indent=2, sort_keys=True))
     return 0
 

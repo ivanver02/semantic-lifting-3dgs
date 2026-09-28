@@ -4,7 +4,7 @@ import argparse
 import json
 from pathlib import Path
 
-from evaluation.scripts.experiment_common import BETAS, GAMMAS, command, dump_plan, run_units, token
+from evaluation.scripts.experiment_common import BETAS, GAMMAS, dump_plan, run_units, token, unit
 
 
 ROWS = (
@@ -58,37 +58,36 @@ def _load_selection(args):
 
 
 def units(args):
-    """ Build the execution units for the selected experiment """
+    """
+    Build the execution units for the selected experiment
+
+    The validation sweep runs the full beta and gamma grid, while test and
+    contribution analysis evaluate only the selected operating point
+    """
+    settings = EXPERIMENTS[args.experiment]
+    common = {
+        "data_root": args.data_root, "output_root": args.output_root,
+        "tau": args.tau_star, "theta": args.theta_star,
+        "split": settings["split"],
+    }
+
     if args.experiment == "validation":
         return [
-            {
-                "dataset": "replica",
-                "scene": scene,
-                "variant": f"frozen_g{token(gamma)}",
-                "gamma": gamma,
-            }
+            unit("replica", scene, f"frozen_g{token(gamma)}", betas=BETAS, gamma=gamma, **common)
             for scene in args.scene
             for gamma in GAMMAS
         ]
 
+    beta_star, gamma_star = [args.beta_star], args.gamma_star
     if args.experiment == "test":
         return [
-            {
-                "dataset": "scannetpp",
-                "scene": scene,
-                "variant": f"frozen_g{token(args.gamma_star)}",
-            }
+            unit("scannetpp", scene, f"frozen_g{token(gamma_star)}", betas=beta_star, gamma=gamma_star, **common)
             for scene in args.scene
         ]
 
     return [
-        {
-            "dataset": "replica",
-            "scene": scene,
-            "variant": f"contribution_analysis_{name}",
-            "gamma": args.gamma_star,
-            "extra": list(extra),
-        }
+        unit("replica", scene, f"contribution_analysis_{name}", betas=beta_star, gamma=gamma_star,
+             extra=extra, **common)
         for name, extra in ROWS
         for scene in args.scene
     ]
@@ -112,9 +111,6 @@ def _parser():
                         help="JSON holding beta_star, gamma_star, tau_star and theta_star")
     parser.add_argument("--tau-star", type=float)
     parser.add_argument("--theta-star", type=float)
-
-    # Select the source of the 2D masks
-    parser.add_argument("--mask-source", choices=["both"], default="both")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the unit plan without running anything")
     return parser
@@ -132,24 +128,10 @@ def main(argv=None):
 
     planned = units(args)
     if args.dry_run:
-        return dump_plan(args, f"{args.experiment}_plan", planned) or 0
+        dump_plan(args.experiment, planned)
+        return 0
 
-    # The validation sweep runs the full beta grid
-    # Test and contribution analysis evaluate only the selected operating point
-    betas = BETAS if args.experiment == "validation" else [args.beta_star]
-
-    run_units(
-        args,
-        planned,
-        lambda current, unit: command(
-            current,
-            unit,
-            betas=betas,
-            gamma=unit.get("gamma", args.gamma_star),
-            split=settings["split"],
-            extra=unit.get("extra", ()),
-        ),
-    )
+    run_units(planned, args.repo_root)
     return 0
 
 

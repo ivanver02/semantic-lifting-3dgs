@@ -16,74 +16,55 @@ def token(value):
     return str(value).replace(".", "_")
 
 
-def sources(mask_source):
-    # Expand the selected mask source option
-    return ["gt2d", "yolo"] if mask_source == "both" else [mask_source]
-
-
-def unit_results(args, unit):
-    """ Return the result files that mark one unit as complete """
-    results = (
-        Path(args.output_root) / unit["dataset"] / unit["scene"] /
-        "results" / unit["variant"]
-    )
-    return [results / f"results_{source}.json" for source in sources(args.mask_source)]
-
-
-def run_units(args, units, command_builder, resolve=None):
+def unit(dataset, scene, variant, data_root, output_root, *, betas, gamma, tau, theta,
+         split="validation", mask_source="both", extra=()):
     """
-    Launch units whose result files do not exist yet
+    Describe one invocation of evaluation.run
 
-    resolve maps one unit to the arguments it runs with, which a driver spanning
-    two datasets needs because each one has its own data and output root. The
-    resolved arguments decide both the skip check and the command, so the two
-    can never disagree about where a unit writes.
+    Each unit writes into output_root/dataset/scene, which must live inside its data root
     """
-    for unit in units:
-        current = resolve(args, unit) if resolve is not None else args
-        if all(path.exists() for path in unit_results(current, unit)):
-            print(f"skip: {unit['dataset']}/{unit['scene']} ({unit['variant']})")
-            continue
-
-        # Resolve the experiment path or execute an injected test runner
-        result = command_builder(current, unit)
-        if result is not None:
-            subprocess.run(result, check=True, cwd=str(current.repo_root))
+    return {
+        "dataset": dataset, "scene": scene, "variant": variant,
+        "data_root": str(data_root), "output_root": str(Path(output_root) / dataset / scene),
+        "betas": list(betas), "gamma": gamma, "tau": tau, "theta": theta,
+        "split": split, "mask_source": mask_source, "extra": list(extra),
+    }
 
 
-def command(args, unit, *, betas, gamma, split, extra=(), tau=None, theta=None):
-    # Build the common evaluation command
-    scene_root = args.output_root / unit["dataset"] / unit["scene"]
-    result = [
+def evaluation_command(unit):
+    # Build the evaluation command of one unit
+    return [
         sys.executable, "-m",
         "evaluation.run", "--dataset", unit["dataset"],
         "--scene", unit["scene"],
-        "--data-root", str(args.data_root),
-        "--output-root", str(scene_root),
-        "--split", split,
+        "--data-root", unit["data_root"],
+        "--output-root", unit["output_root"],
+        "--split", unit["split"],
 
         # Add mask and threshold options
-        "--mask-source", args.mask_source,
-        "--betas", *map(str, betas),
-        "--hysteresis-gamma", str(gamma),
-        "--tau", str(args.tau_star if tau is None else tau),
-        "--min-fraction", str(args.theta_star if theta is None else theta),
+        "--mask-source", unit["mask_source"],
+        "--betas", *map(str, unit["betas"]),
+        "--hysteresis-gamma", str(unit["gamma"]),
+        "--tau", str(unit["tau"]),
+        "--min-fraction", str(unit["theta"]),
         "--variant", unit["variant"],
         "--save_results_to_csv",
+        *unit["extra"],
     ]
-    result.extend(extra)
-    return result
 
 
-def dump_plan(args, driver, units):
+def run_units(units, repo_root):
+    """ Launch units whose result files do not exist yet """
+    for unit in units:
+        sources = ["gt2d", "yolo"] if unit["mask_source"] == "both" else [unit["mask_source"]]
+        results = Path(unit["output_root"]) / "results" / unit["variant"]
+        if all((results / f"results_{source}.json").exists() for source in sources):
+            print(f"skip: {unit['dataset']}/{unit['scene']} ({unit['variant']})")
+            continue
+        subprocess.run(evaluation_command(unit), check=True, cwd=str(repo_root))
+
+
+def dump_plan(experiment, units):
     # Print the experiment plan
-    print(
-        json.dumps(
-            {
-                "experiment": args.experiment,
-                "driver": driver,
-                "invocations": len(units),
-                "units": units,
-            },
-            indent=2, sort_keys=True)
-    )
+    print(json.dumps({"experiment": experiment, "invocations": len(units), "units": units},
+                     indent=2, sort_keys=True))
