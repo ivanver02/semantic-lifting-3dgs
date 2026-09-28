@@ -16,6 +16,10 @@ def token(value):
     return str(value).replace(".", "_")
 
 
+def load_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
 def unit(dataset, scene, variant, data_root, output_root, *, betas, gamma, tau, theta,
          split="validation", mask_source="both", extra=()):
     """

@@ -17,11 +17,8 @@ def summarise(rows, expected):
     """ Group the candidates by operating point and summarise them over scenes """
     grouped = {}
     for row in rows:
-        beta, gamma = number(row.get("beta")), number(row.get("hysteresis_gamma"))
-        miou = number(row.get("mIoU"))
-        if beta is None or gamma is None or miou is None:
-            continue
-        grouped.setdefault((beta, gamma), {})[row.get("scene_id")] = miou
+        beta, gamma = number(row["beta"]), number(row["hysteresis_gamma"])
+        grouped.setdefault((beta, gamma), {})[row["scene_id"]] = number(row["mIoU"])
 
     incomplete = [key for key, values in grouped.items() if len(values) != expected]
     if not grouped or incomplete:
@@ -31,35 +28,30 @@ def summarise(rows, expected):
             f"{expected} scenes"
         )
 
-    # Summarize each candidate across scenes
-    summaries = []
-    for (beta, gamma), values in grouped.items():
-        numbers = list(values.values())
-        summaries.append({
+    # Summarize each candidate across scenes with the population standard deviation
+    return [
+        {
             "beta": beta,
             "gamma": gamma,
-            "mean": statistics.mean(numbers),
-            "std": statistics.pstdev(numbers),
-        })
-    return summaries
+            "mean": statistics.mean(list(values.values())),
+            "std": statistics.pstdev(list(values.values())),
+        }
+        for (beta, gamma), values in grouped.items()
+    ]
 
 
 def select(rows, expected, tolerance=TOLERANCE):
     """ Return the operating point and the numbers the rule produced with it """
     summaries = summarise(rows, expected)
 
-    # The candidate with the best mean is a row of the manuscript table, so it is
-    # resolved with the same tie rule as the selection and not by its deviation
-    best_mean = max(item["mean"] for item in summaries)
-    best = min(
-        (item for item in summaries if item["mean"] >= best_mean - FLOAT_SLACK),
-        key=lambda item: (item["beta"], item["gamma"]),
-    )
+    # The candidate with the best mean is a row of the manuscript table, so ties
+    # are resolved with the same deterministic rule as the selection: smaller beta, then smaller gamma
+    best = min(summaries, key=lambda item: (-item["mean"], item["beta"], item["gamma"]))
 
-    # Apply the score margin and the deterministic tie rule
+    # Apply the score margin and keep the candidate with the smallest scene standard deviation
     eligible = [
         item for item in summaries
-        if item["mean"] >= best_mean - tolerance - FLOAT_SLACK
+        if item["mean"] >= best["mean"] - tolerance - FLOAT_SLACK
     ]
     selected = min(eligible, key=lambda item: (item["std"], item["beta"], item["gamma"]))
     return {
@@ -67,20 +59,9 @@ def select(rows, expected, tolerance=TOLERANCE):
         "gamma_star": selected["gamma"],
         "best_mean": best["mean"],
         "best_mean_sd": best["std"],
-        "best_beta": best["beta"],
-        "best_gamma": best["gamma"],
         "selected_mean": selected["mean"],
         "selected_sd": selected["std"],
         "eligible_count": len(eligible),
-        "candidate_count": len(summaries),
-        "selected_is_best": (
-            (selected["beta"], selected["gamma"]) == (best["beta"], best["gamma"])
-        ),
-        "tolerance": tolerance,
-        "dispersion": "population standard deviation over scenes",
-
-    # Record the rule alongside its result
-        "tie_rule": "smaller beta, then smaller gamma after scene standard deviation",
     }
 
 
@@ -90,42 +71,29 @@ def main(argv=None):
     parser.add_argument("--analytics", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scene", action="append", required=True)
-    parser.add_argument("--source", default="gt2d")
-    parser.add_argument("--experiment", default="validation")
-
-    # Read optional transfer thresholds
-    parser.add_argument("--tau-star", type=float)
-    parser.add_argument("--theta-star", type=float)
+    parser.add_argument("--development-selection", type=Path, required=True,
+                        help="JSON with tau_star and theta_star written by the development sweep")
     args = parser.parse_args(argv)
 
-    # Select only completed rows from the requested validation scenes and source
-    view = load_analytics(args.analytics)
+    # The rule is applied to the frozen validation rows with annotation-derived masks
     allowed = set(args.scene)
     rows = [
-        row for row in view["aggregate_beta_metrics"]
-        if row.get("source") == args.source
+        row for row in load_analytics(args.analytics)["aggregate_beta_metrics"]
+        if row["source"] == "gt2d"
         and is_frozen(row)
-        and row.get("scene_id", "").split(":")[-1] in allowed
+        and row["scene_id"].split(":")[-1] in allowed
     ]
     result = select(rows, len(allowed))
     result["scenes"] = sorted(allowed)
-    result["source"] = args.source
 
-    if args.tau_star is not None:
-        result["tau_star"] = args.tau_star
-
-    # Return selected records
-    if args.theta_star is not None:
-        result["theta_star"] = args.theta_star
+    # Record the transfer thresholds with the operating point, so one file holds the frozen configuration
+    development = json.loads(args.development_selection.read_text(encoding="utf-8"))
+    result["tau_star"] = development["tau_star"]
+    result["theta_star"] = development["theta_star"]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     atomic_write_text(args.output, json.dumps(result, indent=2, sort_keys=True) + "\n")
     print(json.dumps(result, indent=2, sort_keys=True))
-    if result["selected_is_best"]:
-        print(
-            "note: the rule returned the candidate with the best mean, so the two "
-            "rows of the operating-point table carry the same numbers"
-        )
     return 0
 
 

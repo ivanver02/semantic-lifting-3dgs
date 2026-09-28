@@ -273,16 +273,13 @@ def main(argv=None):
 
     # The operating point and the numbers the selection rule produced beside it
     values = {name: "--" for name in NAMES}
-    values.update(betaStar=f"{beta:g}", gammaStar=f"{gamma:g}")
-    for macro, key in (("tauStar", "tau_star"), ("thetaStar", "theta_star")):
-        if point.get(key) is not None:
-            values[macro] = f"{float(point[key]):g}"
-    for macro, key in (("bestMean", "best_mean"), ("bestMeanSd", "best_mean_sd"),
-                       ("selectedMean", "selected_mean"), ("selectedSd", "selected_sd")):
-        if point.get(key) is not None:
-            values[macro] = f"{point[key]:.2f}"
-    if point.get("eligible_count") is not None:
-        values["eligibleCount"] = f"{point['eligible_count']}"
+    values.update(
+        betaStar=f"{beta:g}", gammaStar=f"{gamma:g}",
+        tauStar=f"{float(point['tau_star']):g}", thetaStar=f"{float(point['theta_star']):g}",
+        bestMean=f"{point['best_mean']:.2f}", bestMeanSd=f"{point['best_mean_sd']:.2f}",
+        selectedMean=f"{point['selected_mean']:.2f}", selectedSd=f"{point['selected_sd']:.2f}",
+        eligibleCount=f"{point['eligible_count']}",
+    )
 
     # Aggregate the analytics rows into manuscript macro values
     view = load_analytics(args.analytics)

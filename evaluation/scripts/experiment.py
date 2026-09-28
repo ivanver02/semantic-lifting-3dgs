@@ -1,10 +1,9 @@
 # Run the validation, held-out test or contribution analysis experiment
 
 import argparse
-import json
 from pathlib import Path
 
-from evaluation.scripts.experiment_common import BETAS, GAMMAS, dump_plan, run_units, token, unit
+from evaluation.scripts.experiment_common import BETAS, GAMMAS, dump_plan, load_json, run_units, token, unit
 
 
 ROWS = (
@@ -42,22 +41,7 @@ def _validate_scenes(args, settings):
         raise SystemExit(f"{args.experiment} requires exactly {settings['count']} scenes")
 
 
-def _load_selection(args):
-    if args.selection is None:
-        raise SystemExit(f"{args.experiment} requires --selection")
-
-    selected = json.loads(args.selection.read_text(encoding="utf-8"))
-    args.tau_star = selected.get("tau_star", selected.get("tau"))
-    args.theta_star = selected.get("theta_star", selected.get("theta"))
-
-    if args.tau_star is None or args.theta_star is None:
-        raise SystemExit("selection must include tau_star and theta_star")
-
-    args.beta_star = float(selected["beta_star"])
-    args.gamma_star = float(selected["gamma_star"])
-
-
-def units(args):
+def units(args, selection):
     """
     Build the execution units for the selected experiment
 
@@ -67,7 +51,7 @@ def units(args):
     settings = EXPERIMENTS[args.experiment]
     common = {
         "data_root": args.data_root, "output_root": args.output_root,
-        "tau": args.tau_star, "theta": args.theta_star,
+        "tau": selection["tau_star"], "theta": selection["theta_star"],
         "split": settings["split"],
     }
 
@@ -78,7 +62,7 @@ def units(args):
             for gamma in GAMMAS
         ]
 
-    beta_star, gamma_star = [args.beta_star], args.gamma_star
+    beta_star, gamma_star = [selection["beta_star"]], selection["gamma_star"]
     if args.experiment == "test":
         return [
             unit("scannetpp", scene, f"frozen_g{token(gamma_star)}", betas=beta_star, gamma=gamma_star, **common)
@@ -106,11 +90,10 @@ def _parser():
     parser.add_argument("--repo-root", type=Path,
                         default=Path(__file__).resolve().parents[2])
 
-    # Read the operating point selected on the validation scenes
-    parser.add_argument("--selection", type=Path,
-                        help="JSON holding beta_star, gamma_star, tau_star and theta_star")
-    parser.add_argument("--tau-star", type=float)
-    parser.add_argument("--theta-star", type=float)
+    # Read the frozen configuration
+    parser.add_argument("--selection", type=Path, required=True,
+                        help="JSON with tau_star and theta_star from the development sweep for validation, "
+                             "and the validation selection with beta_star and gamma_star too for test and contribution analysis")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the unit plan without running anything")
     return parser
@@ -121,12 +104,7 @@ def main(argv=None):
     settings = EXPERIMENTS[args.experiment]
     _validate_scenes(args, settings)
 
-    if args.experiment in {"test", "contribution_analysis"}:
-        _load_selection(args)
-    elif args.tau_star is None or args.theta_star is None:
-        raise SystemExit("validation requires --tau-star and --theta-star")
-
-    planned = units(args)
+    planned = units(args, load_json(args.selection))
     if args.dry_run:
         dump_plan(args.experiment, planned)
         return 0
