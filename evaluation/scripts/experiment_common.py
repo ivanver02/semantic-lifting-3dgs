@@ -10,6 +10,9 @@ from pathlib import Path
 BETAS = (0.50, 0.70, 0.90, 0.94, 0.95, 0.96, 0.97, 0.975, 0.98, 0.985, 0.99, 0.995, 0.999)
 GAMMAS = (0.0, 0.5, 0.7, 0.8, 0.9)
 
+# Development scenes of Replica and Scannet++, never part of a validation or test summary
+DEVELOPMENT_SCENES = {"office_0", "7831862f02"}
+
 
 def token(value):
     # Format a numeric value for an identifier

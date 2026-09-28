@@ -3,7 +3,9 @@
 import argparse
 from pathlib import Path
 
-from evaluation.scripts.experiment_common import BETAS, GAMMAS, dump_plan, load_json, run_units, token, unit
+from evaluation.scripts.experiment_common import (
+    BETAS, DEVELOPMENT_SCENES, GAMMAS, dump_plan, load_json, run_units, token, unit,
+)
 
 
 ROWS = (
@@ -26,19 +28,6 @@ EXPERIMENTS = {
     "test": {"dataset": "scannetpp", "split": "test", "count": 10},
     "contribution_analysis": {"dataset": "replica", "split": "validation", "count": 7},
 }
-
-
-def _validate_scenes(args, settings):
-    if "office_0" in args.scene:
-        raise SystemExit(
-            f"{args.experiment} scenes must exclude development scene office_0"
-        )
-
-    if args.experiment == "validation" and args.dry_run and len(args.scene) == 1:
-        return
-
-    if len(args.scene) != settings["count"]:
-        raise SystemExit(f"{args.experiment} requires exactly {settings['count']} scenes")
 
 
 def units(args, selection):
@@ -102,7 +91,12 @@ def _parser():
 def main(argv=None):
     args = _parser().parse_args(argv)
     settings = EXPERIMENTS[args.experiment]
-    _validate_scenes(args, settings)
+
+    # Development scenes are never evaluated here, and every split has a fixed number of scenes
+    if DEVELOPMENT_SCENES & set(args.scene):
+        raise SystemExit(f"{args.experiment} scenes must exclude the development scenes")
+    if len(set(args.scene)) != settings["count"]:
+        raise SystemExit(f"{args.experiment} requires exactly {settings['count']} scenes")
 
     planned = units(args, load_json(args.selection))
     if args.dry_run:
