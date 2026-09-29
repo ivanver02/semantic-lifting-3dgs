@@ -40,6 +40,14 @@ Jobs are submitted from `$FSCRATCH/tfg`, after `source repo/picasso/env.sh` so
 that `$TFG_DATA` is defined. `picasso/job.sbatch` runs any Python module of the
 repository on one A100, and its log is written to `logs/tfg-<job id>.out`.
 
+Each job asks for two hours in the `short` QoS, because SLURM fits such jobs in
+the gaps between larger ones and they start within minutes. Ten minutes before
+the end, the run stops between stages, or training saves a resume checkpoint,
+and the job submits the same command again as a new part. The new part skips the
+cached stages and continues the training from the checkpoint. A chain stops
+after `TFG_MAX_PARTS` parts (12 by default), and an error never submits a new
+part. A stopped chain continues by submitting the same command again.
+
 Development sweep, one job, since the theta phase depends on the tau selected
 from both development scenes:
 
@@ -82,4 +90,6 @@ copied to another machine to run them.
   `dslr/resized_images`, as nothing reads it again and fscratch has a file quota.
 - Parallel scenes append to the same CSV tables, which is safe because
   `AnalyticsStore` locks the store for every write.
+- A run is recorded in the analytics when it finishes, with the stages of its
+  last part: the ones cached by earlier parts appear as cache hits.
 - `squeue -u $USER` lists the jobs, and `scancel <job id>` stops one.
