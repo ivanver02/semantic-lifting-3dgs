@@ -4,8 +4,15 @@ import csv
 import json
 import shlex
 import subprocess
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:
+    # Windows only reads the tables, so it never needs the lock
+    fcntl = None
 
 
 # Quantiles recorded for the target evidence fraction distribution, from P05 to P99.9.
@@ -120,23 +127,33 @@ class AnalyticsStore:
         self.root = Path(root)
         self.root.mkdir(parents=True, exist_ok=True)
 
-        for table, fields in SCHEMA.items():
-            path = self.root / f"{table}.csv"
-            if not path.exists():
-                with path.open("w", newline="", encoding="utf-8") as handle:
-                    csv.DictWriter(handle, fieldnames=fields).writeheader()
-                continue
+        with self._locked():
+            for table, fields in SCHEMA.items():
+                path = self.root / f"{table}.csv"
+                if not path.exists():
+                    with path.open("w", newline="", encoding="utf-8") as handle:
+                        csv.DictWriter(handle, fieldnames=fields).writeheader()
+                    continue
 
-            # Rows are written by position, so a table with other columns cannot receive them
-            with path.open("r", newline="", encoding="utf-8") as handle:
-                if next(csv.reader(handle), None) != fields:
-                    raise RuntimeError(f"{path} has other columns, use a new analytics directory")
+                # Rows are written by position, so a table with other columns cannot receive them
+                with path.open("r", newline="", encoding="utf-8") as handle:
+                    if next(csv.reader(handle), None) != fields:
+                        raise RuntimeError(f"{path} has other columns, use a new analytics directory")
+
+    @contextmanager
+    def _locked(self):
+        """ Hold an exclusive lock on the store, so scenes running in parallel jobs write whole rows """
+        with (self.root / ".lock").open("a") as handle:
+            if fcntl is not None:
+                # The lock is released when the handle is closed
+                fcntl.lockf(handle, fcntl.LOCK_EX)
+            yield
 
     def append(self, table, row):
         """Append one row using the table schema"""
         fields = SCHEMA[table]
         values = {field: row.get(field) for field in fields}
-        with (self.root / f"{table}.csv").open("a", newline="", encoding="utf-8") as handle:
+        with self._locked(), (self.root / f"{table}.csv").open("a", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=fields).writerow(values)
 
 

@@ -73,7 +73,7 @@ def _parser():
     parser.add_argument("--experiment", choices=EXPERIMENTS, required=True)
     parser.add_argument("--scene", action="append", required=True)
 
-    # Define the paths used by the launcher and by the Docker mounts
+    # Define the paths used by the launcher and by the container mounts
     parser.add_argument("--data-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
     parser.add_argument("--repo-root", type=Path,
@@ -85,6 +85,9 @@ def _parser():
                              "and the validation selection with beta_star and gamma_star too for test and contribution analysis")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the unit plan without running anything")
+    parser.add_argument("--only-scene", default=None,
+                        help="Run only the units of this scene, so each scene can run in its own cluster job; "
+                             "the full --scene list is still checked")
     return parser
 
 
@@ -97,8 +100,12 @@ def main(argv=None):
         raise SystemExit(f"{args.experiment} scenes must exclude the development scenes")
     if len(set(args.scene)) != settings["count"]:
         raise SystemExit(f"{args.experiment} requires exactly {settings['count']} scenes")
+    if args.only_scene is not None and args.only_scene not in args.scene:
+        raise SystemExit("--only-scene must be one of the --scene values")
 
     planned = units(args, load_json(args.selection))
+    if args.only_scene is not None:
+        planned = [item for item in planned if item["scene"] == args.only_scene]
     if args.dry_run:
         dump_plan(args.experiment, planned)
         return 0
