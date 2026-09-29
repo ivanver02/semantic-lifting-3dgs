@@ -1,5 +1,3 @@
-import os
-import sys
 import argparse
 import numpy as np
 import cv2
@@ -8,9 +6,6 @@ from pathlib import Path
 import torch
 from ultralytics import YOLO
 from tqdm import tqdm
-
-# Add project root to path so repository imports work inside the container
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def get_segmentation_masks(image_path, model, conf):
@@ -74,15 +69,6 @@ def get_segmentation_masks(image_path, model, conf):
     )
 
 
-def save_single_mask(key, semantic, confidence, output_dir):
-    # Write semantic and confidence images
-    sem_path = output_dir / "semantic" / f"{key}.png"
-    conf_path = output_dir / "confidence" / f"{key}.png"
-
-    cv2.imwrite(str(sem_path), semantic.astype(np.uint8))
-    cv2.imwrite(str(conf_path), (confidence * 255).astype(np.uint8))
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--images_dir", required=True, help="Directory of images")
@@ -96,16 +82,12 @@ if __name__ == "__main__":
     (output_root / "semantic").mkdir(parents=True, exist_ok=True)
     (output_root / "confidence").mkdir(parents=True, exist_ok=True)
 
-    img_dir = Path(args.images_dir)
-    exts = ["*.jpg", "*.png", "*.JPG", "*.PNG", "*.jpeg"]
-    images_to_process = []
-    for ext in exts:
-        images_to_process.extend(img_dir.glob(ext))
-
-    images_to_process.sort()
+    images_to_process = sorted(
+        path for path in Path(args.images_dir).iterdir()
+        if path.suffix.lower() in {".jpg", ".jpeg", ".png"}
+    )
     if not images_to_process:
-        print(f"No images found in {args.images_dir}")
-        sys.exit(0)
+        raise SystemExit(f"No images found in {args.images_dir}")
 
     print(f"Loading model {args.model}")
     model = YOLO(args.model)
@@ -118,7 +100,10 @@ if __name__ == "__main__":
 
         # Update the global detector name map
         global_names.update(names)
-        save_single_mask(img_path.stem, sem, conf, output_root)
+
+        # Write semantic and confidence images
+        cv2.imwrite(str(output_root / "semantic" / f"{img_path.stem}.png"), sem.astype(np.uint8))
+        cv2.imwrite(str(output_root / "confidence" / f"{img_path.stem}.png"), (conf * 255).astype(np.uint8))
 
     '''
      In classes.json, the keys are stored detector IDs and the values are
