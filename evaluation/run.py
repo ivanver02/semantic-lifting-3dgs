@@ -19,7 +19,7 @@ from .analytics import (
     utc_now,
 )
 from .common import atomic_write, digest, safe_name, selection_path, vote_dir, vote_id, vote_path
-from .runtime import Runtime
+from .runtime import WALLTIME_EXIT, Runtime, WalltimeReached, check_time_left
 from .replica.scene import ReplicaScene
 from .scannetpp.scene import ScannetScene
 
@@ -60,6 +60,9 @@ def _measure_stage(stage_records, runtime, name, function, computed=True):
     computed is False when every output of the stage is already in the cache,
     and then the stage is recorded as a cache hit without running
     """
+    if computed:
+        # A stage that could not finish before the job deadline is left for the next job
+        check_time_left()
     started = time.perf_counter()
     result = function() if computed else None
     stage_records.append({
@@ -621,4 +624,9 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except WalltimeReached as stop:
+        # The finished stages are cached, so the same command continues the run in a new job
+        print(f"walltime: {stop}", flush=True)
+        raise SystemExit(WALLTIME_EXIT)

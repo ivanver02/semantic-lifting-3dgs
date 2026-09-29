@@ -3,6 +3,7 @@
 import os
 import json
 import subprocess
+import time
 import uuid
 from pathlib import Path
 
@@ -17,6 +18,37 @@ SIF_FILES = {
     LIFTING_IMAGE: "lifting.sif",
     COLMAP_IMAGE: "colmap.sif",
 }
+
+# Exit code of a run that stopped before the time limit of its cluster job, and continues in a new job
+WALLTIME_EXIT = 3
+
+# A stage only starts when at least this many seconds remain before the deadline
+STAGE_MIN_SECONDS = 20 * 60
+
+# Checkpoint that train.py writes when it stops at the deadline, and reads to continue
+RESUME_CHECKPOINT = "chkpnt_resume.pth"
+
+
+class WalltimeReached(Exception):
+    """ The job deadline leaves no time for the next stage """
+
+
+def deadline():
+    """
+    Return the time, in seconds since the epoch, at which the current job must stop working
+
+    picasso/job.sbatch sets TFG_DEADLINE some minutes before the end of the SLURM job,
+    and without it there is no deadline.
+    """
+    value = os.environ.get("TFG_DEADLINE")
+    return float(value) if value else None
+
+
+def check_time_left():
+    """ Raise WalltimeReached when the next stage could not finish before the deadline """
+    end = deadline()
+    if end is not None and time.time() > end - STAGE_MIN_SECONDS:
+        raise WalltimeReached("not enough time left in this job for the next stage")
 
 
 class Runtime:
@@ -165,8 +197,10 @@ class Runtime:
         Run Gaussian training with the selected data and image settings
 
         resolution is given to the training script as -r. Values such as 1 and 2 select the original or half image resolution.
+        With a job deadline, train.py saves a resume checkpoint and stops before it,
+        and the next call continues the training from that checkpoint.
         """
-        self._run_python(TRAIN_IMAGE, "script", "train.py", [
+        arguments = [
             "-s", dataset_dir,
             "-m", model_dir,
             "-r", resolution,
@@ -174,7 +208,25 @@ class Runtime:
             "--save_iterations", iterations,
             "--checkpoint_iterations", iterations,
             "--data_device", data_device,
-        ])
+
+            # The viewer is never used, and its fixed port would collide between trainings on one node
+            "--disable_viewer",
+        ]
+        resume = Path(model_dir) / RESUME_CHECKPOINT
+        if resume.exists():
+            arguments += ["--start_checkpoint", resume]
+        if deadline() is not None:
+            arguments += ["--stop_at", deadline()]
+
+        try:
+            self._run_python(TRAIN_IMAGE, "script", "train.py", arguments)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == WALLTIME_EXIT:
+                raise WalltimeReached("training stopped at the job deadline, with its resume checkpoint saved") from error
+            raise
+
+        # The finished model no longer needs the resume checkpoint
+        resume.unlink(missing_ok=True)
 
     def run_colmap(self, arguments):
         """ Run COLMAP in the CPU container with the supplied arguments """

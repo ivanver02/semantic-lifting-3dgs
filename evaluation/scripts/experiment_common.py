@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from evaluation.runtime import WALLTIME_EXIT
+
 
 # The validation beta grid of the manuscript, dense above 0.95
 BETAS = (0.50, 0.70, 0.90, 0.94, 0.95, 0.96, 0.97, 0.975, 0.98, 0.985, 0.99, 0.995, 0.999)
@@ -68,7 +70,11 @@ def run_units(units, repo_root):
         if all((results / f"results_{source}.json").exists() for source in sources):
             print(f"skip: {unit['dataset']}/{unit['scene']} ({unit['variant']})")
             continue
-        subprocess.run(evaluation_command(unit), check=True, cwd=str(repo_root))
+        completed = subprocess.run(evaluation_command(unit), cwd=str(repo_root))
+        if completed.returncode == WALLTIME_EXIT:
+            # The unit stopped at the job deadline, and running the driver again continues it
+            raise SystemExit(WALLTIME_EXIT)
+        completed.check_returncode()
 
 
 def dump_plan(experiment, units):
