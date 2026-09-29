@@ -10,7 +10,7 @@ import numpy as np
 from PIL import Image
 from plyfile import PlyData
 
-from ..common import SceneData, TargetClassInfo
+from ..common import SceneData, TargetClassInfo, atomic_write
 
 
 CLASSES = [
@@ -338,14 +338,17 @@ class ReplicaScene:
             selected = rng.choice(len(points), MAX_POINTS, replace=False)
             points, colors = points[selected], colors[selected]
 
-        # Save sampled points for COLMAP, the last file, whose presence marks the dataset as prepared
-        with open(sparse_dir / "points3D.txt", "w") as output:
-            output.write("# Point list\n")
-            for point_id, (point, color) in enumerate(zip(points, colors), start=1):
-                output.write(
-                    f"{point_id} {point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
-                    f"{int(color[0])} {int(color[1])} {int(color[2])} 1.0\n"
-                )
+        # Save sampled points for COLMAP, the last file, whose presence marks the dataset as prepared,
+        # through a temporary name so an interrupted preparation never looks complete
+        def save_points(path):
+            with open(path, "w") as output:
+                output.write("# Point list\n")
+                for point_id, (point, color) in enumerate(zip(points, colors), start=1):
+                    output.write(
+                        f"{point_id} {point[0]:.6f} {point[1]:.6f} {point[2]:.6f} "
+                        f"{int(color[0])} {int(color[1])} {int(color[2])} 1.0\n"
+                    )
+        atomic_write(sparse_dir / "points3D.txt", save_points)
 
     def generate_gt_masks(self, runtime):
         """

@@ -130,8 +130,11 @@ class ScannetScene:
         if not images.exists():
             images = self.scene_root / "dslr" / "images"
 
-        # Undistort the images and write an output directory ready for COLMAP using the existing COLMAP reconstruction
+        # Undistort the images and write an output directory ready for COLMAP using the existing COLMAP reconstruction,
+        # starting from an empty directory so the output of an interrupted preparation is never mixed in
         output = self.prepared_dir
+        shutil.rmtree(output, ignore_errors=True)
+        output.mkdir(parents=True)
         runtime.run_colmap([
             "image_undistorter",
             "--image_path", images,
@@ -146,11 +149,12 @@ class ScannetScene:
         sparse_zero = sparse / "0"
         if sparse.exists() and not sparse_zero.exists():
 
-            # COLMAP can place its files directly in sparse, but the rest of the project expects sparse/0
-            sparse_zero.mkdir(parents=True, exist_ok=True)
-            for item in sparse.iterdir():
-                if item.is_file() and item.suffix in {".bin", ".txt"}:
-                    shutil.move(str(item), str(sparse_zero / item.name))  # shutil.move can move across filesystems
+            # COLMAP can place its files directly in sparse, but the rest of the project expects sparse/0.
+            # The directory is renamed as a whole, so sparse/0 only appears with every file of the model
+            staged = output / "sparse_staged"
+            sparse.rename(staged)
+            sparse.mkdir()
+            staged.rename(sparse_zero)
 
     def generate_gt_masks(self, runtime):
         """ Generate rasterized Scannet++ GT masks and visibility support """
