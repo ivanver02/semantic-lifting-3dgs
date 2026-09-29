@@ -103,7 +103,12 @@ def main(argv=None):
     parser.add_argument("--gamma", type=float, default=DEFAULT_GAMMA)
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the tau phase plan, the theta phase depends on the selected tau")
+    parser.add_argument("--only-scene", default=None,
+                        help="Run only the tau phase of this development scene, so both scenes train and vote "
+                             "in parallel jobs; a later run without it finishes the sweep")
     args = parser.parse_args(argv)
+    if args.only_scene not in (None, args.replica_scene, args.scannetpp_scene):
+        raise SystemExit("--only-scene must be one of the development scenes")
     args.replica_data_root = args.replica_data_root.resolve()
     args.scannetpp_data_root = args.scannetpp_data_root.resolve()
 
@@ -116,12 +121,16 @@ def main(argv=None):
 
     # Development selection uses annotation-derived masks to isolate transfer
     tau_units = _units(args, "tau")
+    if args.only_scene is not None:
+        tau_units = [item for item in tau_units if item["scene"] == args.only_scene]
     if args.dry_run:
         dump_plan("development_tau", tau_units)
         return 0
 
     # Run the tau phase and select tau before running the theta phase that depends on it
     run_units(tau_units, args.repo_root)
+    if args.only_scene is not None:
+        return 0
     tau_selection = select_candidate(load_analytics(analytics), "development_tau_", "tau", args.beta)
 
     run_units(_units(args, "theta", tau_selection["tau"]), args.repo_root)

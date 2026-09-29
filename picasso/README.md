@@ -36,9 +36,24 @@ weights must already be in the repository root.
 
 ## Jobs
 
-Jobs are submitted from `$FSCRATCH/tfg`, after `source repo/picasso/env.sh` so
-that `$TFG_DATA` is defined. `picasso/job.sbatch` runs any Python module of the
-repository on one A100, and its log is written to `logs/tfg-<job id>.out`.
+`picasso/submit.sh` submits each step of the evaluation, with one job per
+scene wherever the scenes are independent, and `picasso/job.sbatch` runs each
+job on one A100. The log of a job is `logs/<step>-<scene>-<job id>.out`, and a
+step starts once every job of the previous one has finished:
+
+```bash
+cd $FSCRATCH/tfg
+bash repo/picasso/submit.sh development    # tau phase of office_0 and 7831862f02
+bash repo/picasso/submit.sh sweep          # theta phase and tau_theta_selection.json
+bash repo/picasso/submit.sh validation     # the seven validation scenes
+bash repo/picasso/submit.sh selection      # selection.json, on the login node
+bash repo/picasso/submit.sh test           # the ten Scannet++ test scenes
+bash repo/picasso/submit.sh contribution   # the contribution analysis
+```
+
+The test scenes go in `TEST_SCENES` of `picasso/submit.sh`. The tables, figures
+and macros only read the analytics directory, so it can be copied to another
+machine to run them.
 
 Each job asks for two hours in the `short` QoS, because SLURM fits such jobs in
 the gaps between larger ones and they start within minutes. Ten minutes before
@@ -46,43 +61,8 @@ the end, the run stops between stages, or training saves a resume checkpoint,
 and the job submits the same command again as a new part. The new part skips the
 cached stages and continues the training from the checkpoint. A chain stops
 after `TFG_MAX_PARTS` parts (12 by default), and an error never submits a new
-part. A stopped chain continues by submitting the same command again.
-
-Development sweep, one job, since the theta phase depends on the tau selected
-from both development scenes:
-
-```bash
-sbatch repo/picasso/job.sbatch evaluation.scripts.development_sweep \
-    --replica-data-root $TFG_DATA/replica --scannetpp-data-root $TFG_DATA/scannetpp \
-    --scannetpp-scene 7831862f02 \
-    --tau-grid 0.02 0.03 0.05 0.08 0.10 --theta-grid 0.3 0.4 0.5 0.6 0.7
-```
-
-Experiments, as an array with one task per scene. The index of each task picks
-its scene from the `--scene` list, which must still hold every scene:
-
-```bash
-sbatch --array=0-6 repo/picasso/job.sbatch evaluation.scripts.experiment \
-    --experiment validation --selection $TFG_DATA/analytics/tau_theta_selection.json \
-    --data-root $TFG_DATA/replica --output-root $TFG_DATA/replica/eval \
-    --scene office_1 --scene office_2 --scene office_3 --scene office_4 \
-    --scene room_0 --scene room_1 --scene room_2
-```
-
-The selection only reads the CSV tables, so it runs on the login node:
-
-```bash
-cd repo && $TFG_PYTHON -m evaluation.scripts.selection \
-    --analytics $TFG_DATA/analytics --output $TFG_DATA/analytics/selection.json \
-    --development-selection $TFG_DATA/analytics/tau_theta_selection.json \
-    --scene office_1 --scene office_2 --scene office_3 --scene office_4 \
-    --scene room_0 --scene room_1 --scene room_2
-```
-
-The test (`--array=0-9`, Scannet++ roots and its ten scenes) and the
-contribution analysis (`--array=0-6`) take `--selection $TFG_DATA/analytics/selection.json`.
-The tables, figures and macros only read the analytics directory, so it can be
-copied to another machine to run them.
+part. A stopped chain continues by submitting the same step again, which skips
+the scenes that already have results.
 
 ## Notes
 

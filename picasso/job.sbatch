@@ -1,9 +1,7 @@
 #!/bin/bash -l
 # One A100 job that runs a Python module of the repository, with every stage in the Apptainer images
 #   sbatch picasso/job.sbatch evaluation.run --dataset replica --scene room_0 ...
-# As an array, each task adds --only-scene with the --scene value at its index, so the scenes of
-# an experiment run in parallel:
-#   sbatch --array=0-6 picasso/job.sbatch evaluation.scripts.experiment --experiment validation --scene ...
+# picasso/submit.sh submits the steps of the evaluation with it, one job per scene.
 # Submit it from $FSCRATCH/tfg, where the logs directory is
 #
 # Jobs of up to two hours in the short QoS start much sooner, as SLURM fits them in the gaps it
@@ -24,16 +22,6 @@ source "${TFG_REPO:-$FSCRATCH/tfg/repo}/picasso/env.sh"
 set -eo pipefail
 
 arguments=("$@")
-if [ -n "$SLURM_ARRAY_TASK_ID" ]; then
-    # Collect the --scene values and keep the one at the index of this task
-    scenes=()
-    for ((i = 1; i < ${#arguments[@]}; i++)); do
-        if [ "${arguments[i - 1]}" = "--scene" ]; then
-            scenes+=("${arguments[i]}")
-        fi
-    done
-    arguments+=(--only-scene "${scenes[SLURM_ARRAY_TASK_ID]}")
-fi
 
 # The margin leaves time to save the training checkpoint before SLURM stops the job
 end=${SLURM_JOB_END_TIME:-$(date -d "$(squeue -h -j "$SLURM_JOB_ID" -o %e)" +%s)}
@@ -64,7 +52,7 @@ if [ "$code" -eq 3 ]; then
 
     # The new job asks for the same time and QoS, and starts once this one has ended
     read -r limit qos <<< "$(squeue -h -j "$SLURM_JOB_ID" -o "%l %q")"
-    env -u SLURM_ARRAY_TASK_ID TFG_PART=$((part + 1)) sbatch \
+    TFG_PART=$((part + 1)) sbatch \
         --job-name="$SLURM_JOB_NAME" --time="$limit" --qos="$qos" \
         --chdir="$SLURM_SUBMIT_DIR" --dependency=afterany:"$SLURM_JOB_ID" \
         "$TFG_REPO/picasso/job.sbatch" "${arguments[@]}"
