@@ -484,7 +484,13 @@ def main():
     scene = scene_instance.load_data()
     evaluation_classes = _classes_with_gt2d_views(mask_dirs["gt2d"], scene.classes)
     model_ply = model_dir / "point_cloud" / f"iteration_{args.iterations}" / "point_cloud.ply"
-    if not model_ply.exists():
+
+    # A model trained by this run is complete once train.py writes its final checkpoint, which comes
+    # after the point cloud, so a point cloud cut while it was being saved is trained again
+    trained = model_ply.exists() and (
+        model_dir != output_root / "model" or (model_dir / f"chkpnt{args.iterations}.pth").exists()
+    )
+    if not trained:
         _measure_stage(
             stage_records, runtime, "train_gaussians",
             lambda: runtime.run_train(

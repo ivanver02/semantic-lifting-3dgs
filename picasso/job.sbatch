@@ -33,9 +33,12 @@ cd "$TFG_REPO"
 code=0
 "$TFG_PYTHON" -m "${arguments[@]}" || code=$?
 
-# Scannet++ reads the resized DSLR images only to undistort them, so once a scene has its
-# undistorted COLMAP model they are removed to save files of the fscratch quota
-for dslr in "$TFG_DATA"/scannetpp/validation_data/*/dslr; do
+# Scannet++ reads the resized DSLR images only to undistort them, so once a scene named in the
+# arguments of this job has its undistorted COLMAP model they are removed to save files of the
+# fscratch quota. Scenes of other jobs are never touched
+for argument in "${arguments[@]}"; do
+    dslr="$TFG_DATA/scannetpp/validation_data/$argument/dslr"
+    [ -n "$argument" ] && [ -d "$dslr" ] || continue
     sparse="$dslr/undistorted_colmap/sparse/0"
     if [ -e "$sparse/points3D.bin" ] || [ -e "$sparse/points3D.txt" ]; then
         rm -rf "$dslr/resized_images"

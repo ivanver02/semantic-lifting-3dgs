@@ -44,6 +44,7 @@ step starts once every job of the previous one has finished:
 ```bash
 cd $FSCRATCH/tfg
 bash repo/picasso/submit.sh development    # tau phase of office_0 and 7831862f02
+bash repo/picasso/submit.sh warmup         # models, masks and votes of the validation scenes
 bash repo/picasso/submit.sh sweep          # theta phase and tau_theta_selection.json
 bash repo/picasso/submit.sh validation     # the seven validation scenes
 bash repo/picasso/submit.sh selection      # selection.json, on the login node
@@ -51,6 +52,9 @@ bash repo/picasso/submit.sh test           # the ten Scannet++ test scenes
 bash repo/picasso/submit.sh contribution   # the contribution analysis
 ```
 
+`warmup` is optional: it runs the validation scenes with the default configuration and
+without recording anything, so the stages that do not depend on the selection are cached
+while the development sweep runs. `development office_0` submits a single development scene.
 The test scenes go in `TEST_SCENES` of `picasso/submit.sh`. The tables, figures
 and macros only read the analytics directory, so it can be copied to another
 machine to run them.

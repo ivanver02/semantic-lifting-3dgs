@@ -19,17 +19,21 @@ CLASSES = [
     TargetClassInfo("clock", "clock", 75),
 ]
 
+# A dataset label belongs to a class when the detector names that object with the class,
+# so monitors are tv, desks are tables and stools are chairs, while beanbags, which the detector
+# calls couch, and laboratory and work benches, which are work tables and not the seat the
+# detector calls bench, are left out
 DATASET_LABELS = {
-    "bench": {"bench", "experiment bench", "laboratory bench", "work bench",
-               "window bench", "wood bench"},
+    "bench": {"bench"},
     "chair": {
         "chair", "office chair", "armchair", "arm chair", "dining chair",
         "folding chair", "office visitor chair", "rolling chair", "lounge chair",
-        "sofa chair", "deck chair", "papasan chair",
+        "sofa chair", "deck chair", "papasan chair", "ottoman chair", "piano chair",
+        "stool", "stools", "bar stool",
     },
     "table": {"table", "dining table", "office table", "conference table",
-              "joined tables"},
-    "tv": {"tv", "television", "tv screen"},
+              "joined tables", "desk", "computer desk", "coffee table"},
+    "tv": {"tv", "television", "tv screen", "monitor", "flat panel display"},
     "laptop": {"laptop"},
     "sink": {"sink", "kitchen sink", "bathroom sink", "washbasin", "wash basin"},
     "clock": {"clock", "wall clock", "table clock", "alarm clock"},
@@ -142,6 +146,10 @@ class ScannetScene:
             "--output_path", output,
             "--output_type", "COLMAP",
             "--max_image_size", MAX_IMAGE_SIZE,
+
+            # Keep the original focal length and crop the stretched border of the fisheye, instead of
+            # widening the image to twice the original width, which halves the resolution of its centre
+            "--max_scale", 1.0,
         ])
 
         # Normalize COLMAP sparse output so we can always use sparse/0

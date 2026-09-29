@@ -21,7 +21,8 @@ def get_segmentation_masks(image_path, model, conf):
         vocabulary names
     """
 
-    # Inference at the original image resolution
+    # The detector runs at its default input size of 640 pixels, the one it was trained at,
+    # and retina_masks returns the masks at the original image resolution
     results = model(str(image_path), verbose=False, conf=conf, save=False, retina_masks=True)
     result = results[0]
 

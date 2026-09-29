@@ -1,6 +1,9 @@
 #!/bin/bash
 # Submit each step of the evaluation, with one job per scene wherever the scenes are independent
-#   bash picasso/submit.sh development    tau phase of the two development scenes, one job each
+#   bash picasso/submit.sh development    tau phase of the two development scenes, one job each,
+#                                         or of the scenes given after it
+#   bash picasso/submit.sh warmup         model, masks and votes of the validation scenes, one job each,
+#                                         which validation and contribution reuse, outside the analytics
 #   bash picasso/submit.sh sweep          rest of the development sweep and the tau and theta selection
 #   bash picasso/submit.sh validation     the seven validation scenes, one job each
 #   bash picasso/submit.sh selection      validation selection, run here as it only reads the analytics
@@ -14,6 +17,7 @@ set -eo pipefail
 VALIDATION_SCENES=(office_1 office_2 office_3 office_4 room_0 room_1 room_2)
 TEST_SCENES=()  # The ten Scannet++ test scenes, still to be chosen
 DEVELOPMENT_SCENES=(office_0 7831862f02)
+BETAS=(0.50 0.70 0.90 0.94 0.95 0.96 0.97 0.975 0.98 0.985 0.99 0.995 0.999)
 TAU_GRID=(0.02 0.03 0.05 0.08 0.10)
 THETA_GRID=(0.3 0.4 0.5 0.6 0.7)
 
@@ -60,8 +64,21 @@ experiment() {
 
 case "$1" in
     development)
-        for scene in "${DEVELOPMENT_SCENES[@]}"; do
+        scenes=("${@:2}")
+        if [ ${#scenes[@]} -eq 0 ]; then
+            scenes=("${DEVELOPMENT_SCENES[@]}")
+        fi
+        for scene in "${scenes[@]}"; do
             submit "development-$scene" "${DEVELOPMENT_SWEEP[@]}" --only-scene "$scene"
+        done
+        ;;
+    warmup)
+        # The votes do not depend on tau, theta or gamma, so this run with the default configuration
+        # fills the same output directories that the validation units read, without recording anything
+        for scene in "${VALIDATION_SCENES[@]}"; do
+            submit "warmup-$scene" evaluation.run --dataset replica --scene "$scene" \
+                --data-root "$TFG_DATA/replica" --output-root "$TFG_DATA/replica/eval/replica/$scene" \
+                --variant warmup --mask-source both --betas "${BETAS[@]}"
         done
         ;;
     sweep)
@@ -90,7 +107,7 @@ case "$1" in
         experiment contribution_analysis replica "$SELECTION" "${VALIDATION_SCENES[@]}"
         ;;
     *)
-        sed -n 2,9p "$0"
+        sed -n 2,12p "$0"
         exit 1
         ;;
 esac
