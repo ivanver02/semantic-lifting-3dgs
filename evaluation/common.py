@@ -4,7 +4,6 @@
 import hashlib
 import json
 import os
-import tempfile
 from pathlib import Path
 
 class TargetClassInfo:
@@ -127,35 +126,6 @@ def selection_path(class_vote_dir, gamma, radius, beta):
     return Path(class_vote_dir) / f"g{float_token(gamma)}_r{float_token(radius)}" / (
         f"selected_beta{float_token(beta)}.npy"
     )
-
-
-def ensure_dir(path):
-    """ Create a directory and return its path """
-    path.mkdir(parents=True, exist_ok=True)
-    return path
-
-
-def atomic_write_text(path, text):
-    """ Replace a text artifact atomically """
-    path = Path(path)
-    ensure_dir(path.parent)
-    fd, name = tempfile.mkstemp(
-        dir=path.parent, prefix=f".{path.name}.", suffix=".tmp",
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(name, path)
-    finally:
-        if os.path.exists(name):
-            os.unlink(name)
-
-
-def target_classes_by_detector(classes):
-    """ Map detector names to class records """
-    return {item.name_by_detector: item for item in classes}
 
 
 def atomic_write(path, save):

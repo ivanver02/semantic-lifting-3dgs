@@ -6,7 +6,6 @@ from collections import defaultdict
 from pathlib import Path
 
 from evaluation.analytics import close, dataset_of, is_frozen, load_analytics, number, selected_operating_point
-from evaluation.common import atomic_write_text
 
 DATASETS = {"replica": "Replica", "scannetpp": "ScanNet++"}
 
@@ -99,8 +98,8 @@ def main():
     beta, gamma = selected_operating_point(args.selection)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(args.out / "per_class.tex", per_class(view, beta, gamma))
-    atomic_write_text(args.out / "quantiles.tex", quantiles(view))
+    (args.out / "per_class.tex").write_text(per_class(view, beta, gamma), encoding="utf-8")
+    (args.out / "quantiles.tex").write_text(quantiles(view), encoding="utf-8")
     print(f"Wrote per_class.tex and quantiles.tex to {args.out}")
 
 

@@ -6,7 +6,6 @@ import statistics
 from pathlib import Path
 
 from evaluation.analytics import is_frozen, load_analytics, number
-from evaluation.common import atomic_write_text
 
 TOLERANCE = 0.01
 
@@ -92,7 +91,7 @@ def main(argv=None):
     result["theta_star"] = development["theta_star"]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_text(args.output, json.dumps(result, indent=2, sort_keys=True) + "\n")
+    args.output.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(result, indent=2, sort_keys=True))
     return 0
 

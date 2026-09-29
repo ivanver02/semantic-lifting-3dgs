@@ -18,16 +18,7 @@ from .analytics import (
     record_source_analytics,
     utc_now,
 )
-from .common import (
-    atomic_write,
-    digest,
-    safe_name,
-    target_classes_by_detector,
-    selection_path,
-    vote_dir,
-    vote_id,
-    vote_path,
-)
+from .common import atomic_write, digest, safe_name, selection_path, vote_dir, vote_id, vote_path
 from .runtime import Runtime
 from .replica.scene import ReplicaScene
 from .scannetpp.scene import ScannetScene
@@ -165,13 +156,6 @@ def run_parameters(args, data_root):
     }
 
 
-def _source_names(mask_source):
-    """ Determine the list of mask sources """
-    if mask_source == "both":
-        return ["yolo", "gt2d"]
-    return [mask_source]
-
-
 def _pending_sources(results_dir, sources, parameters, force):
     """
     Return sources whose result JSON does not exist yet
@@ -242,21 +226,8 @@ def _mask_classes(mask_dir, classes):
     The returned list contains only records whose detector name appears in the
     mask metadata.
     """
-    classes_path = mask_dir / "classes.json"
-    if not classes_path.exists():
-        raise FileNotFoundError(f"mask class metadata not found: {classes_path}")
-
-    # Read detector names from classes json
-    names = set(json.loads(classes_path.read_text()).values())
-
-    # Map detector names to main class records and keep only supported classes
-    mapping = target_classes_by_detector(classes)
-    selected = []
-    for name in sorted(names):
-        spec = mapping.get(name)
-        if spec is not None:
-            selected.append(spec)
-    return selected
+    names = set(json.loads((mask_dir / "classes.json").read_text()).values())
+    return [spec for spec in classes if spec.name_by_detector in names]
 
 
 def _classes_with_gt2d_views(mask_dir, classes):
@@ -436,19 +407,10 @@ def main():
         raise ValueError("--hysteresis-radius must be greater than zero")
 
     # Resolve the data root and output root directories
-    data_root = (
-        args.data_root
-        if args.data_root is not None
-        else DEFAULT_DATA_ROOT / args.dataset
-    ).resolve()
+    data_root = (args.data_root or DEFAULT_DATA_ROOT / args.dataset).resolve()
+    output_root = (args.output_root or data_root / "evaluation" / args.scene).resolve()
 
-    output_root = (
-        args.output_root
-        if args.output_root is not None
-        else data_root / "evaluation" / args.scene
-    ).resolve()
-
-    # Check if the output root is within the data root
+    # The containers only see the data root, so the outputs must live inside it
     try:
         output_root.relative_to(data_root)
     except ValueError:
@@ -466,9 +428,8 @@ def main():
     results_dir = output_root / "results" / variant
 
     # Decide which mask sources still need a run
-    pending_sources = _pending_sources(
-        results_dir, _source_names(args.mask_source), parameters, args.force,
-    )
+    sources = ["yolo", "gt2d"] if args.mask_source == "both" else [args.mask_source]
+    pending_sources = _pending_sources(results_dir, sources, parameters, args.force)
     if not pending_sources:
         print("skip: All requested sources already have results")
         return
