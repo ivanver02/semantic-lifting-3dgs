@@ -1,10 +1,11 @@
 # Generate appendix table bodies from analytics
 
 import argparse
+import statistics
 from collections import defaultdict
 from pathlib import Path
 
-from evaluation.analytics import is_frozen, load_analytics, number, selected_operating_point
+from evaluation.analytics import close, dataset_of, is_frozen, load_analytics, number, selected_operating_point
 from evaluation.common import atomic_write_text
 
 DATASETS = {"replica": "Replica", "scannetpp": "ScanNet++"}
@@ -13,75 +14,54 @@ DATASETS = {"replica": "Replica", "scannetpp": "ScanNet++"}
 SOURCES = (("gt2d", "annotation-derived"), ("yolo", "YOLO"))
 
 
-def mean(values):
-    # Average available values
-    values = [v for v in values if v is not None]
-    return sum(values) / len(values) if values else None
+def cell(values, digits=2):
+    # Format the mean of the available values as one table cell
+    values = [value for value in values if value is not None]
+    return f"{statistics.mean(values):.{digits}f}" if values else "--"
 
 
-def cell(value, digits=2):
-    # Format one table cell
-    return "--" if value is None else f"{value:.{digits}f}"
+def table_body(groups):
+    """
+    Join the rows of every dataset into a LaTeX table body, with a small space between datasets
+
+    main.tex ends the body with its own line break, so the last row has none
+    """
+    return " \\\\\n\\addlinespace[3pt]\n".join(
+        " \\\\\n".join(rows) for rows in groups if rows
+    ) + "\n"
 
 
-def strip_last(lines):
-    # Remove the final table separator
-    lines = list(lines)
-    while lines and lines[-1] == "\\addlinespace[3pt]":
-        lines.pop()
-    if not lines:
-        return "\n"
-    text = "\n".join(lines)
-    return text[: text.rindex("\\\\")] + "\n" if "\\\\" in text else text + "\n"
-
-
-def _filtered(view, beta, gamma, tolerance):
-    # Yield the frozen configuration rows at the requested point with their run
-    for row in view.get("class_beta_metrics", []):
-        if not is_frozen(row):
-            continue
-        b, g = number(row.get("beta")), number(row.get("hysteresis_gamma"))
-        if beta is not None and (b is None or abs(b - beta) > tolerance):
-            continue
-        if gamma is not None and (g is None or abs(g - gamma) > tolerance):
-            continue
-        # Select the table rows
-        yield row, view["runs"][row["run_id"]]
-
-
-def per_class(out, view, beta=None, gamma=None, tolerance=1e-9):
-    # Gather per class values
-    names = {r["class_id"]: r["class_name"] for r in view["classes"]}
+def per_class(view, beta, gamma):
+    """ IoU per class at the selected point under both mask sources, its reference and the scenes that contain it """
+    names = {row["class_id"]: row["class_name"] for row in view["classes"]}
 
     # Collect values by dataset, class and source
     values = defaultdict(list)
-    refs = defaultdict(dict)
-    scenes = defaultdict(set)
-    for row, run in _filtered(view, beta, gamma, tolerance):
-        key = (run["dataset"], row["class_id"])
-        values[key + (row["source"],)].append(number(row.get("iou")))
-        refs[key][run["scene_id"]] = number(row.get("ground_truth_transfer_iou"))
-        scenes[key].add(run["scene_id"])
+    references = defaultdict(dict)
+    for row in view["class_beta_metrics"]:
+        if not (is_frozen(row) and close(number(row["beta"]), beta)
+                and close(number(row["hysteresis_gamma"]), gamma)):
+            continue
+        key = (dataset_of(row), row["class_id"])
+        values[key + (row["source"],)].append(number(row["iou"]))
 
-    # Build the table header
-    lines = []
-    for dataset in ("replica", "scannetpp"):
-        keys = sorted(k for k in scenes if k[0] == dataset)
-        for position, key in enumerate(keys):
-            lines.append(
-                f"{DATASETS[dataset] if position == 0 else ''} & {names.get(key[1], key[1])} & "
-                f"{cell(mean(values[key + ('gt2d',)]))} & {cell(mean(values[key + ('yolo',)]))} & "
-                f"{cell(mean(refs[key].values()))} & {len(scenes[key])} \\\\"
-            )
-        if dataset == "replica" and keys:
-            # Add table metrics
-            lines.append("\\addlinespace[3pt]")
-    atomic_write_text(out / "per_class.tex", strip_last(lines))
-    return len(lines)
+        # The reference only depends on the mesh annotation, so both sources share it per scene
+        references[key][row["scene_id"]] = number(row["ground_truth_transfer_iou"])
+
+    groups = []
+    for dataset in DATASETS:
+        keys = sorted(key for key in references if key[0] == dataset)
+        groups.append([
+            f"{DATASETS[dataset] if position == 0 else ''} & {names[key[1]]} & "
+            f"{cell(values[key + ('gt2d',)])} & {cell(values[key + ('yolo',)])} & "
+            f"{cell(references[key].values())} & {len(references[key])}"
+            for position, key in enumerate(keys)
+        ])
+    return table_body(groups)
 
 
-def quantiles(out, view):
-    # Gather vote score quantiles
+def quantiles(view):
+    """ Mean quantiles of the target evidence fraction and supported portion per dataset and source """
     columns = [
         "target_score_p25",
         "target_score_median",
@@ -90,30 +70,21 @@ def quantiles(out, view):
         "target_score_p99",
         "supported_fraction",
     ]
-    gathered = defaultdict(lambda: defaultdict(list))
-    for row in view["vote_statistics"]:
-        if not is_frozen(row):
-            continue
-        run = view["runs"][row["run_id"]]
-
-        # Add aggregate values
-        for column in columns:
-            gathered[(run["dataset"], row["source"])][column].append(
-                number(row.get(column))
-            )
-    lines = []
-
-    for dataset in ("replica", "scannetpp"):
+    groups = []
+    for dataset in DATASETS:
+        rows = []
         for source, label in SOURCES:
-            values = gathered.get((dataset, source))
-
-            # Emit quantiles for available sources
-            if values:
-                lines.append(
-                    f"{DATASETS[dataset] if source == 'gt2d' else ''} & {label} & {' & '.join(cell(mean(values[c]), 3) for c in columns)} \\\\"
+            selected = [
+                row for row in view["vote_statistics"]
+                if is_frozen(row) and dataset_of(row) == dataset and row["source"] == source
+            ]
+            if selected:
+                rows.append(
+                    f"{DATASETS[dataset] if not rows else ''} & {label} & "
+                    + " & ".join(cell([number(row[column]) for row in selected], 3) for column in columns)
                 )
-    atomic_write_text(out / "quantiles.tex", strip_last(lines))
-    return len(lines)
+        groups.append(rows)
+    return table_body(groups)
 
 
 def main():
@@ -125,13 +96,12 @@ def main():
     args = p.parse_args()
 
     view = load_analytics(args.analytics)
-    beta = gamma = None
-    if args.selection.exists():
-        beta, gamma = selected_operating_point(args.selection)
+    beta, gamma = selected_operating_point(args.selection)
 
     args.out.mkdir(parents=True, exist_ok=True)
-    print(f"per_class.tex: {per_class(args.out, view, beta, gamma)} rows")
-    print(f"quantiles.tex: {quantiles(args.out, view)} rows")
+    atomic_write_text(args.out / "per_class.tex", per_class(view, beta, gamma))
+    atomic_write_text(args.out / "quantiles.tex", quantiles(view))
+    print(f"Wrote per_class.tex and quantiles.tex to {args.out}")
 
 
 if __name__ == "__main__":
