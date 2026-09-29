@@ -1,4 +1,4 @@
-# Small wrappers for running the project containers
+# Small wrappers for running the project containers with Docker, or with Apptainer where Docker is not available
 
 import os
 import json
@@ -11,14 +11,32 @@ TRAIN_IMAGE = "tfgivanverdugo/semantic-fusion-gs-train:cuda11.6"
 LIFTING_IMAGE = "tfgivanverdugo/semantic-fusion-fusion:cuda11.6"
 COLMAP_IMAGE = "tfgivanverdugo/semantic-fusion-colmap:3.13.0-cpu"
 
+# Apptainer runs the same images from the .sif files built with the recipes in containers/apptainer
+SIF_FILES = {
+    TRAIN_IMAGE: "gs-train.sif",
+    LIFTING_IMAGE: "lifting.sif",
+    COLMAP_IMAGE: "colmap.sif",
+}
+
 
 class Runtime:
-    """ Run training, lifting scripts and COLMAP through Docker """
+    """ Run training, lifting scripts and COLMAP through Docker or Apptainer """
 
     def __init__(self, repo_root, data_root):
-        """ Store host roots and the peak CUDA memory of the current stage """
+        """
+        Store host roots, the container engine and the peak CUDA memory of the current stage
+
+        TFG_RUNTIME selects the engine, docker by default or apptainer, and with
+        apptainer TFG_SIF_DIR is the directory holding the .sif files.
+        """
         self.repo_root = Path(repo_root).resolve()
         self.data_root = Path(data_root).resolve()
+        self.engine = os.environ.get("TFG_RUNTIME", "docker")
+        if self.engine not in ("docker", "apptainer"):
+            raise ValueError(f"TFG_RUNTIME must be docker or apptainer, not {self.engine}")
+        if self.engine == "apptainer" and not os.environ.get("TFG_SIF_DIR"):
+            raise ValueError("TFG_SIF_DIR must point to the directory with the .sif files")
+        self.sif_dir = Path(os.environ.get("TFG_SIF_DIR", ".")).resolve()
         self._stage_peak_cuda_memory_bytes = None
 
     def _container_path(self, value):
@@ -39,13 +57,23 @@ class Runtime:
         except ValueError:
             return value
 
-    def _docker_command(self, image, gpu, command):
+    def _container_command(self, image, gpu, command):
         """
-        Build a Docker command from an image and its command arguments
+        Build a Docker or Apptainer command from an image and its command arguments
 
         gpu adds the NVIDIA runtime when enabled.
         command is the sequence of program arguments that runs inside the container.
         """
+        if self.engine == "docker":
+            result = self._docker_options(image, gpu)
+        else:
+            result = self._apptainer_options(image, gpu)
+
+        # Append the program and its arguments after all container options, with host paths mapped
+        return result + [self._container_path(str(item)) for item in command]
+
+    def _docker_options(self, image, gpu):
+        """ Docker options that mount the repository and the data root """
 
         # Start a temporary container that is removed after the command exits
         result = ["docker", "run", "--rm"]
@@ -67,15 +95,35 @@ class Runtime:
             "-w", "/repo",
             image,
         ]
+        return result
 
-        # Append the program and its arguments after all Docker options, with host paths mapped
-        return result + [self._container_path(str(item)) for item in command]
+    def _apptainer_options(self, image, gpu):
+        """ Apptainer options with the same mounts, working directory and environment as Docker """
+
+        # Start from a clean environment so the host Python and conda variables do not reach the image
+        result = ["apptainer", "exec", "--cleanenv"]
+        if gpu:
+            # Bind the host NVIDIA driver, the images find their own OpenGL libraries first
+            result.append("--nv")
+
+        # Apptainer already runs as the host user, and /tmp is the home as in Docker
+        result += [
+            "--home", "/tmp",
+            "--env", "MPLCONFIGDIR=/tmp/matplotlib",
+            "--env", "YOLO_CONFIG_DIR=/tmp/Ultralytics",
+            "--env", "QT_QPA_PLATFORM=offscreen",
+            "--bind", f"{self.repo_root}:/repo:ro",
+            "--bind", f"{self.data_root}:/data:rw",
+            "--pwd", "/repo",
+            str(self.sif_dir / SIF_FILES[image]),
+        ]
+        return result
 
     def _run(self, command):
         """ Run a prepared command and raise errors from failed stages """
 
         # Print the command so a failed stage can be reproduced manually
-        print("Docker command: ", " ".join(str(item) for item in command))
+        print("Container command: ", " ".join(str(item) for item in command))
         subprocess.run(command, check=True, text=True, cwd=str(self.repo_root))
 
     def end_stage(self):
@@ -96,7 +144,7 @@ class Runtime:
 
         # Run the target and keep the largest measured peak for the stage
         try:
-            self._run(self._docker_command(image, True, command))
+            self._run(self._container_command(image, True, command))
             peak = json.loads(metrics_path.read_text(encoding="utf-8"))["peak_cuda_memory_bytes"]
             if peak is not None:
                 self._stage_peak_cuda_memory_bytes = max(peak, self._stage_peak_cuda_memory_bytes or 0)
@@ -131,4 +179,4 @@ class Runtime:
     def run_colmap(self, arguments):
         """ Run COLMAP in the CPU container with the supplied arguments """
         # COLMAP receives all input and output paths through the shared mounts
-        self._run(self._docker_command(COLMAP_IMAGE, False, ["colmap", *arguments]))
+        self._run(self._container_command(COLMAP_IMAGE, False, ["colmap", *arguments]))

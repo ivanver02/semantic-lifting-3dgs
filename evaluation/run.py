@@ -79,7 +79,7 @@ def _parser():
     parser.add_argument("--dataset", choices=["replica", "scannetpp"], required=True)
     parser.add_argument("--scene", required=True)
 
-    # Define the paths used by the launcher and by the Docker mounts
+    # Define the paths used by the launcher and by the container mounts
     parser.add_argument("--data-root", type=Path, default=None, help="dataset path root, something like .../scannetpp")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-root", type=Path, default=None)
@@ -446,7 +446,7 @@ def main():
     run_started = time.perf_counter()
     stage_records = []
 
-    # Initialize the Docker runtime and create the selected dataset scene
+    # Initialize the container runtime and create the selected dataset scene
     runtime = Runtime(args.repo_root, data_root)
     scene_type = ReplicaScene if args.dataset == "replica" else ScannetScene
     scene_instance = scene_type(data_root, args.scene, output_root)
