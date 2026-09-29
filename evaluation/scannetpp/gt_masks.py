@@ -142,8 +142,8 @@ def _load_mesh(scene_root, metadata_path):
     # Read object labels and assigned segment IDs
     annotations = json.loads((scans_dir / "segments_anno.json").read_text())
 
-    # Validate that object labels come from the same released Scannet++ taxonomy
-    # Reject annotations from another scene or taxonomy release
+    # Labels outside the released Scannet++ taxonomy, such as remove, split or misspelled names,
+    # are left out of the semantic mesh too, so they stay as background here and are only reported
     metadata_names = {
         line.strip().lower()
         for line in metadata_path.read_text().splitlines()
@@ -158,6 +158,7 @@ def _load_mesh(scene_root, metadata_path):
         for name in DATASET_LABELS[item.name]
     }
     object_to_local_id = {}
+    unknown_labels = set()
 
     # Build the mapping from segment IDs to annotated object IDs before
     # project those object IDs onto vertices containing each segment
@@ -172,7 +173,7 @@ def _load_mesh(scene_root, metadata_path):
 
         label = str(group.get("label", "")).strip().lower()
         if label and label not in metadata_names:
-            raise ValueError(f"object {object_id} uses unknown Scannet++ label: {label}")
+            unknown_labels.add(label)
 
         # Keep the object mapping separate so one label can cover all assigned segments
         object_to_local_id[object_id] = label_to_local_id.get(label, -1)
@@ -180,6 +181,8 @@ def _load_mesh(scene_root, metadata_path):
         for segment_id in segment_ids:
             segment_to_object_id[int(segment_id)] = object_id
 
+    if unknown_labels:
+        print(f"labels outside the Scannet++ taxonomy, kept as background: {', '.join(sorted(unknown_labels))}")
     if np.any((faces < 0) | (faces >= len(vertices))):
         raise ValueError("the mesh contains a face with an invalid vertex index")
 
@@ -337,8 +340,8 @@ def main():
     Generate Scannet++ reference masks from command arguments
 
     The CLI is called by run.py inside the lifting container, which can use CUDA
-    The metadata path is retained as an explicit input because it validates that
-    segment annotation labels belong to the released Scannet++ taxonomy
+    The metadata path is retained as an explicit input because it reports the
+    segment annotation labels outside the released Scannet++ taxonomy
     """
     parser = argparse.ArgumentParser()
 
