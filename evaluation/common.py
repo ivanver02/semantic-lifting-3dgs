@@ -116,14 +116,17 @@ def vote_path(segmentation_dir, spec, identifier):
     )
 
 
-def selection_path(class_vote_dir, gamma, radius, beta):
+def selection_path(class_vote_dir, gamma, radius, beta, score="fraction"):
     """
     Indices of the Gaussians selected for one class at one operating point,
     written by segmentation/threshold_labels.py next to the votes they come from
 
-    The hysteresis radius is part of the directory name because the graph depends on it
+    The hysteresis radius is part of the directory name because the graph depends on it, and so is
+    the thresholded score when it is not the evidence fraction, so the selections of the
+    baseline never replace those of the method
     """
-    return Path(class_vote_dir) / f"g{float_token(gamma)}_r{float_token(radius)}" / (
+    suffix = "" if score == "fraction" else f"_{score}"
+    return Path(class_vote_dir) / f"g{float_token(gamma)}_r{float_token(radius)}{suffix}" / (
         f"selected_beta{float_token(beta)}.npy"
     )
 

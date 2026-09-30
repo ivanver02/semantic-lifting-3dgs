@@ -11,7 +11,14 @@
 #                                         the analytics, and the radius vote alone for the contribution analysis
 #   bash picasso/submit.sh test           the ten Scannet++ test scenes with the selected operator, one job each
 #   bash picasso/submit.sh contribution   contribution analysis of the validation scenes, one job each
-# validation, validation-nearest, test and contribution also take scene names after the step, to submit only those
+#   bash picasso/submit.sh baseline-validation   the evidence per view baseline on the validation grid, one job per scene
+#   bash picasso/submit.sh baseline-selection    the same rule applied to the baseline, run here
+#   bash picasso/submit.sh baseline-test  the baseline at its selected point on the ten test scenes, one job each
+#   bash picasso/submit.sh analysis       2D masks against 3D results and scores for selecting Gaussians, one job
+#   bash picasso/submit.sh report         macros, tables and figures of the manuscripts, run here as it only reads
+#                                         the analytics and the analyses; the figures need matplotlib
+# validation, validation-nearest, test, contribution, baseline-validation and baseline-test also take scene
+# names after the step, to submit only those
 # Each step starts once every job of the previous one has finished, which squeue -p gpu_partition shows
 
 source "$(dirname "$0")/env.sh"
@@ -32,6 +39,8 @@ DEVELOPMENT_SELECTION=$ANALYTICS/tau_theta_selection.json
 # alone, which the contribution analysis varies one factor at a time
 SELECTION=$ANALYTICS/selection_transfer.json
 RADIUS_SELECTION=$ANALYTICS/selection.json
+# The selection of the baseline, which thresholds E+ per view with the rest of the method unchanged
+BASELINE_SELECTION=$ANALYTICS/selection_baseline.json
 
 DEVELOPMENT_SWEEP=(
     evaluation.scripts.development_sweep
@@ -136,8 +145,34 @@ case "$1" in
     contribution)
         experiment contribution_analysis contribution_analysis replica "$RADIUS_SELECTION" "${VALIDATION_SCENES[@]}"
         ;;
+    baseline-validation)
+        # The votes, masks and models are cached, so these units only threshold, transfer and score
+        experiment baseline-validation baseline_validation replica "$DEVELOPMENT_SELECTION" "${VALIDATION_SCENES[@]}"
+        ;;
+    baseline-selection)
+        scenes=()
+        for scene in "${VALIDATION_SCENES[@]}"; do
+            scenes+=(--scene "$scene")
+        done
+        cd "$TFG_REPO"
+        "$TFG_PYTHON" -m evaluation.scripts.selection --analytics "$ANALYTICS" --output "$BASELINE_SELECTION" \
+            --development-selection "$DEVELOPMENT_SELECTION" "${scenes[@]}" --baseline
+        ;;
+    baseline-test)
+        experiment baseline-test baseline_test scannetpp "$BASELINE_SELECTION" "${TEST_SCENES[@]}"
+        ;;
+    analysis)
+        sbatch --job-name=analysis "$TFG_REPO/picasso/analysis.sbatch"
+        ;;
+    report)
+        cd "$TFG_REPO"
+        report=(--analytics "$ANALYTICS" --analysis "$TFG_DATA/analysis")
+        "$TFG_PYTHON" -m evaluation.scripts.make_macros "${report[@]}" --output "$TFG_DATA/report/macros_measured.tex"
+        "$TFG_PYTHON" -m evaluation.scripts.make_tables "${report[@]}" --out "$TFG_DATA/report/tables"
+        "$TFG_PYTHON" -m evaluation.scripts.make_figures "${report[@]}" --out "$TFG_DATA/report/figures"
+        ;;
     *)
-        sed -n 2,15p "$0"
+        sed -n 2,22p "$0"
         exit 1
         ;;
 esac

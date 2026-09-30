@@ -47,6 +47,10 @@ VARIANT_DEFAULTS = {
     "background_view_policy": "target_views",
 }
 
+# The score that beta thresholds. It is kept out of VARIANT_DEFAULTS so the parameters recorded by the
+# runs of the method stay as they were, and only a baseline run records it
+THRESHOLD_SCORES = ("fraction", "per_view")
+
 
 def _progress(message):
     """ Print a progress message immediately, even when stdout is buffered """
@@ -114,6 +118,8 @@ def _parser():
     )
     parser.add_argument("--betas", nargs="+", type=float, required=True,
         help="Beta values to evaluate for every target class")
+    parser.add_argument("--threshold-score", choices=THRESHOLD_SCORES, default="fraction",
+        help="Score that beta thresholds: the evidence fraction of the method or the evidence per view of the baseline")
     parser.add_argument("--tau", type=float, default=VARIANT_DEFAULTS["tau"])
     parser.add_argument("--min-fraction", type=float, default=VARIANT_DEFAULTS["min_fraction"])
     parser.add_argument(
@@ -156,6 +162,7 @@ def run_parameters(args, data_root):
         "raster_block_size": RASTER_BLOCK_SIZE,
         "betas": list(args.betas),
         **{key: getattr(args, key) for key in VARIANT_DEFAULTS},
+        **({"threshold_score": args.threshold_score} if args.threshold_score != "fraction" else {}),
     }
 
 
@@ -296,6 +303,7 @@ def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes, identif
             "--loaded_iter", args.iterations,
             "--hysteresis_gamma", args.hysteresis_gamma,
             "--hysteresis_radius", args.hysteresis_radius,
+            "--score", args.threshold_score,
             "--beta", *args.betas,
             "--votes", *[vote_path(segmentation_dir, spec, identifier) for spec in classes],
         ],
@@ -360,7 +368,7 @@ def _evaluate_source(args, scene, classes, vote_classes, neighbors, full_opacity
             if spec in vote_classes:
                 selected[np.load(selection_path(
                     vote_dir(segmentation_dir, spec, identifier),
-                    args.hysteresis_gamma, args.hysteresis_radius, beta,
+                    args.hysteresis_gamma, args.hysteresis_radius, beta, args.threshold_score,
                 ))] = True
 
             # Evaluate the predicted Gaussian mesh including empty predictions
@@ -398,8 +406,10 @@ def main():
     args = _parser().parse_args()
 
     # Validate the operating point ranges used by the host side calculations
-    if any(beta < 0.0 or beta > 1.0 for beta in args.betas):
+    if args.threshold_score == "fraction" and any(beta < 0.0 or beta > 1.0 for beta in args.betas):
         raise ValueError("all --betas must be in [0, 1]")
+    if args.threshold_score == "per_view" and any(beta <= 0.0 for beta in args.betas):
+        raise ValueError("all --betas of the evidence per view must be positive")
     if args.tau <= 0:
         raise ValueError("--tau must be greater than zero")
     if not 0.0 <= args.min_fraction <= 1.0:
@@ -541,7 +551,7 @@ def main():
             if args.force or not all(
                 selection_path(
                     vote_dir(segmentation_dir, spec, identifier),
-                    args.hysteresis_gamma, args.hysteresis_radius, beta,
+                    args.hysteresis_gamma, args.hysteresis_radius, beta, args.threshold_score,
                 ).exists()
                 for beta in args.betas
             )

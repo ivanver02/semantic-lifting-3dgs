@@ -12,6 +12,10 @@ from evaluation.runtime import WALLTIME_EXIT
 BETAS = (0.50, 0.70, 0.90, 0.94, 0.95, 0.96, 0.97, 0.975, 0.98, 0.985, 0.99, 0.995, 0.999)
 GAMMAS = (0.0, 0.5, 0.7, 0.8, 0.9)
 
+# Thresholds of the target evidence per view for the baseline, thirteen like the beta grid of the method,
+# around the values that the version before the fraction used and wide enough to hold its best one
+PER_VIEW_BETAS = (0.003, 0.01, 0.02, 0.03, 0.05, 0.07, 0.1, 0.15, 0.2, 0.3, 0.5, 0.7, 1.0)
+
 # Development scenes of Replica and Scannet++, never part of a validation or test summary
 DEVELOPMENT_SCENES = {"office_0", "7831862f02"}
 

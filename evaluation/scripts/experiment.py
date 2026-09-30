@@ -3,10 +3,14 @@
 import argparse
 from pathlib import Path
 
-from evaluation.analytics import TRANSFER_PREFIX
+from evaluation.analytics import BASELINE_PREFIX, TRANSFER_PREFIX
 from evaluation.scripts.experiment_common import (
-    BETAS, DEVELOPMENT_SCENES, GAMMAS, dump_plan, load_json, run_units, token, unit,
+    BETAS, DEVELOPMENT_SCENES, GAMMAS, PER_VIEW_BETAS, dump_plan, load_json, run_units, token, unit,
 )
+
+# The baseline thresholds the evidence per view and transfers with the nearest Gaussian, and the rest of
+# the configuration is the one of the method
+BASELINE_EXTRA = ("--threshold-score", "per_view", "--gaussian-to-mesh-transfer", "nearest_neighbor_label")
 
 
 def transfer_extra(transfer):
@@ -33,6 +37,8 @@ EXPERIMENTS = {
     "validation": {"dataset": "replica", "split": "validation", "count": 7},
     "test": {"dataset": "scannetpp", "split": "test", "count": 10},
     "contribution_analysis": {"dataset": "replica", "split": "validation", "count": 7},
+    "baseline_validation": {"dataset": "replica", "split": "validation", "count": 7},
+    "baseline_test": {"dataset": "scannetpp", "split": "test", "count": 10},
 }
 
 
@@ -59,6 +65,22 @@ def units(args, selection):
                  extra=transfer_extra(args.transfer), **common)
             for scene in args.scene
             for gamma in GAMMAS
+        ]
+
+    # The baseline goes through the same grid of gamma, with its own thresholds of the evidence per view,
+    # and its test runs the point that the same rule selects for it on validation
+    if args.experiment == "baseline_validation":
+        return [
+            unit("replica", scene, f"{BASELINE_PREFIX}{token(gamma)}", betas=PER_VIEW_BETAS, gamma=gamma,
+                 extra=BASELINE_EXTRA, **common)
+            for scene in args.scene
+            for gamma in GAMMAS
+        ]
+    if args.experiment == "baseline_test":
+        return [
+            unit("scannetpp", scene, f"{BASELINE_PREFIX}{token(selection['gamma_star'])}",
+                 betas=[selection["beta_star"]], gamma=selection["gamma_star"], extra=BASELINE_EXTRA, **common)
+            for scene in args.scene
         ]
 
     # The test runs the operator that the validation selected, the radius vote in older selections

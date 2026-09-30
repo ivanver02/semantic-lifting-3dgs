@@ -32,6 +32,25 @@ def target_fraction(target_weights, background_weights):
     return score, supported
 
 
+def evidence_per_view(voting_data):
+    """
+    The target evidence E+ divided by the number of views where the class appears, the score of the
+    version of the method before the fraction, which the baseline thresholds. A threshold beta on it
+    is the threshold beta times the number of views on E+. It is defined on the support set of the fraction
+    """
+    target, background = voting_data['target_weights'], voting_data['background_weights']
+    supported = (target + background) > 0
+    views = max(int(voting_data.get('num_class_views') or 1), 1)
+    return torch.where(supported, target / views, torch.zeros_like(target)), supported
+
+
+# The score of every choice of --score, computed from the stored votes of one class
+SCORES = {
+    "fraction": lambda data: target_fraction(data['target_weights'], data['background_weights']),
+    "per_view": evidence_per_view,
+}
+
+
 def hysteresis(xyz, score, supported, beta, gamma, radius):
     """
     Select the seeds, whose fraction reaches beta, and every Gaussian above gamma * beta
@@ -77,7 +96,7 @@ def main(args):
     # Process every class and threshold combination
     for voting_path in args.votes:
         voting_data = torch.load(voting_path, map_location="cpu")
-        score, supported = target_fraction(voting_data['target_weights'], voting_data['background_weights'])
+        score, supported = SCORES[args.score](voting_data)
         score, supported = score.numpy(), supported.numpy()
         print(f"{voting_path}: supported={int(supported.sum())}")
 
@@ -89,7 +108,7 @@ def main(args):
 
             # Save the indices of the selected Gaussians next to the votes they come from
             output_path = selection_path(os.path.dirname(voting_path), args.hysteresis_gamma,
-                                         args.hysteresis_radius, beta)
+                                         args.hysteresis_radius, beta, args.score)
             atomic_write(output_path, lambda path: np.save(path, np.flatnonzero(selected)))
             print(f"Saved {int(selected.sum())} selected Gaussians to {output_path}")
 
@@ -103,13 +122,18 @@ if __name__ == "__main__":
     parser.add_argument("--votes", nargs="+", required=True, help="Voting data PT file of each class")
 
     # Threshold configuration
-    parser.add_argument("--beta", nargs="+", type=float, default=[0.5], help="Minimum target evidence ratio(s) in [0, 1]")
+    parser.add_argument("--score", choices=SCORES, default="fraction",
+                        help="Score that beta thresholds: the target evidence fraction, or the target evidence per view of the baseline")
+    parser.add_argument("--beta", nargs="+", type=float, default=[0.5],
+                        help="Threshold(s) of the score, in [0, 1] for the fraction and positive for the evidence per view")
     parser.add_argument("--hysteresis_gamma", type=float, default=0.8, help="Low-threshold factor in [0, 1). 0 disables hysteresis")
     parser.add_argument("--hysteresis_radius", type=float, default=0.05, help="Connectivity radius in meters for the bridge set")
 
     args = parser.parse_args()
-    if any(not 0.0 <= beta <= 1.0 for beta in args.beta):
-        raise ValueError("--beta values must be in [0, 1]")
+    if args.score == "fraction" and any(not 0.0 <= beta <= 1.0 for beta in args.beta):
+        raise ValueError("--beta values of the fraction must be in [0, 1]")
+    if any(beta <= 0.0 for beta in args.beta) and args.score == "per_view":
+        raise ValueError("--beta values of the evidence per view must be positive")
     if not 0.0 <= args.hysteresis_gamma < 1.0:
         raise ValueError("--hysteresis_gamma must be in [0, 1)")
     if args.hysteresis_radius <= 0.0:

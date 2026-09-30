@@ -215,9 +215,16 @@ TRANSFER_PREFIX = {
 }
 
 
+# Variant prefix of the baseline, which thresholds the target evidence per view instead of the
+# fraction and transfers with the nearest Gaussian, the operator selected for the method
+BASELINE_PREFIX = "baseline_per_view_nearest_g"
+
+
 def transfer_of(row):
-    """ Transfer operator of a frozen row, read from its variant """
-    return "nearest_neighbor_label" if row["variant"].startswith(TRANSFER_PREFIX["nearest_neighbor_label"]) else "radius_vote"
+    """ Transfer operator of a frozen or baseline row, read from its variant """
+    variant = row["variant"]
+    nearest = variant.startswith(TRANSFER_PREFIX["nearest_neighbor_label"]) or variant.startswith(BASELINE_PREFIX)
+    return "nearest_neighbor_label" if nearest else "radius_vote"
 
 
 def is_frozen(row, transfer="radius_vote"):

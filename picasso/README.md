@@ -14,6 +14,8 @@ $FSCRATCH/tfg/
   data/replica/    one directory per scene (office_0 ... room_2)
   data/scannetpp/  metadata/semantic_classes.txt and validation_data/<scene>
   data/analytics/  CSV tables written by the runs, shared by both datasets
+  data/analysis/   CSV tables of the two analyses that read masks and votes
+  data/report/     macros, tables and figures of the manuscripts
   logs/            build and job logs
 ```
 
@@ -51,6 +53,11 @@ bash repo/picasso/submit.sh validation-nearest   # the same grid, nearest Gaussi
 bash repo/picasso/submit.sh selection      # selection_transfer.json and selection.json, on the login node
 bash repo/picasso/submit.sh test           # the ten Scannet++ test scenes, selected operator
 bash repo/picasso/submit.sh contribution   # the contribution analysis
+bash repo/picasso/submit.sh baseline-validation   # the evidence per view baseline on the validation grid
+bash repo/picasso/submit.sh baseline-selection    # selection_baseline.json, on the login node
+bash repo/picasso/submit.sh baseline-test         # the baseline at its selected point on the test scenes
+bash repo/picasso/submit.sh analysis       # 2D masks against 3D results, scores for selecting Gaussians
+bash repo/picasso/submit.sh report         # macros, tables and figures, on the login node
 ```
 
 `warmup` is optional: it runs the validation scenes with the default configuration and
@@ -63,9 +70,23 @@ beta and gamma together and writes `selection_transfer.json`, which the test rea
 and applies it to the radius vote alone in `selection.json`, from which the
 contribution analysis varies one factor at a time. Each operator writes its runs
 under its own variant, `frozen_g*` or `frozen_nearest_g*`, so neither replaces
-the results of the other. The tables, figures
-and macros only read the analytics directory, so it can be copied to another
-machine to run them.
+the results of the other. The baseline thresholds the target evidence per view instead of the evidence fraction, with the
+rest of the configuration of the method and the nearest Gaussian as transfer operator. It reads
+the cached votes, so its units only threshold, transfer and score, and it writes its runs under
+the variants `baseline_per_view_nearest_g*` and its selections next to the votes, in directories
+that end in `_per_view`, so nothing of the method is replaced. `analysis` reads the masks and the cached
+votes, so it runs in `lifting.sif` as one job, and writes `mask_agreement.csv`
+and `threshold_scores.csv` to `data/analysis`. The macros, tables and figures
+only read `data/analytics` and `data/analysis`, so both directories can be copied
+to another machine to run them there:
+
+```bash
+python -m evaluation.scripts.make_macros --analytics analytics --analysis analysis --output report/macros_measured.tex
+python -m evaluation.scripts.make_tables --analytics analytics --analysis analysis --out report/tables
+python -m evaluation.scripts.make_figures --analytics analytics --analysis analysis --out report/figures
+```
+
+The figures need matplotlib, which the cluster conda base may not have.
 
 Each job asks for two hours in the `short` QoS, because SLURM fits such jobs in
 the gaps between larger ones and they start within minutes. Ten minutes before

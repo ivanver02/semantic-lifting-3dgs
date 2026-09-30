@@ -5,7 +5,7 @@ import json
 import statistics
 from pathlib import Path
 
-from evaluation.analytics import TRANSFER_PREFIX, is_frozen, load_analytics, number, transfer_of
+from evaluation.analytics import BASELINE_PREFIX, TRANSFER_PREFIX, is_frozen, load_analytics, number, transfer_of
 
 TOLERANCE = 0.01
 
@@ -99,6 +99,8 @@ def main(argv=None):
                         help="JSON with tau_star and theta_star written by the development sweep")
     parser.add_argument("--transfer", choices=TRANSFER_PREFIX, action="append", default=None,
                         help="Transfer operators the rule compares, every operator with validation results by default")
+    parser.add_argument("--baseline", action="store_true",
+                        help="Apply the rule to the evidence per view baseline instead of the method")
     args = parser.parse_args(argv)
 
     # The rule is applied to the frozen validation rows with annotation-derived masks
@@ -106,7 +108,7 @@ def main(argv=None):
     rows = [
         row for row in load_analytics(args.analytics)["aggregate_beta_metrics"]
         if row["source"] == "gt2d"
-        and is_frozen(row, transfer=None)
+        and (row["variant"].startswith(BASELINE_PREFIX) if args.baseline else is_frozen(row, transfer=None))
         and (args.transfer is None or transfer_of(row) in args.transfer)
         and row["scene_id"].split(":")[-1] in allowed
     ]
