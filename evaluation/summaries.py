@@ -4,11 +4,12 @@
 import csv
 import json
 import math
+import random
 import statistics
 from collections import defaultdict, namedtuple
 from pathlib import Path
 
-from evaluation.analytics import close, dataset_of, is_frozen, number
+from evaluation.analytics import BASELINE_PREFIX, close, dataset_of, is_frozen, number
 
 DATASETS = {"replica": "Replica", "scannetpp": "ScanNet++"}
 SOURCES = {"gt2d": "annotation-derived", "yolo": "YOLO"}
@@ -18,8 +19,13 @@ SCORES = {"fraction": "Evidence fraction", "evidence": "Raw evidence", "per_view
 # The class order of the tables and figures, the four shared classes first
 CLASS_ORDER = ("chair", "sofa", "table", "tv", "laptop", "sink", "plant", "clock", "bench")
 
-# One operating point of one transfer operator
+# One operating point of one transfer operator, or of the evidence per view baseline when transfer is BASELINE
 Point = namedtuple("Point", "transfer beta gamma")
+BASELINE = "baseline"
+
+# Resamples of the bootstrap over scenes, with a fixed seed so every run of the scripts gives the same intervals
+BOOTSTRAP_SAMPLES = 10000
+BOOTSTRAP_SEED = 0
 
 
 def load_points(analytics):
@@ -44,6 +50,22 @@ def load_points(analytics):
     return point(selections["selected"]), point(selections["radius"]), selections
 
 
+def load_baseline(analytics):
+    """ The point that the selection rule chose for the evidence per view baseline, None before it has run """
+    path = Path(analytics) / "selection_baseline.json"
+    if not path.exists():
+        return None, None
+    data = json.loads(path.read_text(encoding="utf-8"))
+    return Point(BASELINE, float(data["beta_star"]), float(data["gamma_star"])), data
+
+
+def belongs(row, transfer):
+    """ Whether a row belongs to the frozen runs of one operator, or to the baseline """
+    if transfer == BASELINE:
+        return row["variant"].startswith(BASELINE_PREFIX)
+    return is_frozen(row, transfer)
+
+
 def at_point(row, beta, gamma):
     """ Whether a metric row belongs to one operating point """
     return close(number(row["beta"]), beta) and close(number(row["hysteresis_gamma"]), gamma)
@@ -54,7 +76,7 @@ def frozen_rows(view, table, point, dataset=None, source=None, gamma=None):
     gamma = point.gamma if gamma is None else gamma
     return [
         row for row in view[table]
-        if is_frozen(row, point.transfer) and at_point(row, point.beta, gamma)
+        if belongs(row, point.transfer) and at_point(row, point.beta, gamma)
         and (dataset is None or dataset_of(row) == dataset) and (source is None or row["source"] == source)
     ]
 
@@ -102,6 +124,7 @@ def scene_summary(view, point, dataset, source, gamma=None):
     if not scenes:
         return None
     summary = {key: mean(item[key] for item in scenes.values()) for key in next(iter(scenes.values()))}
+    summary["low"], summary["high"] = bootstrap_ci(item["miou"] for item in scenes.values())
     summary.update(scenes=scenes, count=len(scenes), sd=sd(item["miou"] for item in scenes.values()),
                    median=statistics.median(item["miou"] for item in scenes.values()),
                    pairs=sum(len(rows) for rows in classes.values()),
@@ -121,13 +144,28 @@ def gaps(view, point, dataset):
     )
 
 
+def bootstrap_ci(values, level=0.95):
+    """
+    Interval of the mean of the scene values from a bootstrap over scenes: the scenes are resampled
+    with replacement, and the interval holds the central level of the resampled means
+    """
+    values = [value for value in values if value is not None]
+    if len(values) < 2:
+        return None, None
+    generator = random.Random(BOOTSTRAP_SEED)
+    means = sorted(statistics.mean(generator.choices(values, k=len(values))) for _ in range(BOOTSTRAP_SAMPLES))
+    tail = (1.0 - level) / 2.0
+    return means[int(tail * BOOTSTRAP_SAMPLES)], means[int((1.0 - tail) * BOOTSTRAP_SAMPLES) - 1]
+
+
 def paired(first, second):
     """ Mean difference of two scene summaries over their common scenes, and the scenes where the first is better """
     common = sorted(set(first["scenes"]) & set(second["scenes"]))
     differences = [first["scenes"][s]["miou"] - second["scenes"][s]["miou"] for s in common]
+    low, high = bootstrap_ci(differences)
     return dict(
         delta=mean(differences), better=sum(d > 0 for d in differences),
-        worse=sum(d < 0 for d in differences), count=len(common),
+        worse=sum(d < 0 for d in differences), count=len(common), low=low, high=high,
     )
 
 

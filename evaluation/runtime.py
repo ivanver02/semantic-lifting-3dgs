@@ -187,6 +187,14 @@ class Runtime:
         """ Run a repository Python script in the lifting container """
         self._run_python(LIFTING_IMAGE, "script", script, arguments)
 
+    def run_train_script(self, script, arguments):
+        """ Run a repository Python script in the training container, which has the official rasteriser """
+        self._run_python(TRAIN_IMAGE, "script", script, arguments)
+
+    def container_path(self, value):
+        """ The path that a host file has inside the containers, for paths written into files they read """
+        return self._container_path(str(value))
+
     def run_lifting_module(self, module, arguments):
         """ Run a Python module in the lifting container """
         # Module execution keeps relative imports working inside the repository

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from evaluation.analytics import dataset_of, is_frozen, load_analytics, number
 from evaluation.summaries import (
-    DATASETS, SOURCES, TRANSFERS, class_summary, load_points, mask_rows, mean, ordered_classes, paired,
+    DATASETS, SOURCES, TRANSFERS, class_summary, load_baseline, load_points, mask_rows, mean, ordered_classes, paired,
     scene_summary, threshold_summary,
 )
 from evaluation.scripts.make_macros import ABLATIONS
@@ -93,6 +93,46 @@ def operators(view, selected, radius):
         if mine and theirs:
             comparison = paired(mine, theirs)
             cells.append(f"{comparison['better']}/{comparison['count']}")
+        rows.append(" & ".join(cells))
+    return table_body([rows])
+
+
+def interval(summary):
+    """ The bootstrap interval of a mean, as the manuscripts write it """
+    return "--" if summary is None or summary["low"] is None else f"[{cell(summary['low'])}, {cell(summary['high'])}]"
+
+
+def main_results(view, selected):
+    """ The main table: mean and deviation over scenes, bootstrap interval, precision, recall and reference """
+    groups = []
+    for dataset in DATASETS:
+        rows = []
+        for source, label in SOURCES.items():
+            summary = scene_summary(view, selected, dataset, source)
+            if summary is None:
+                continue
+            rows.append(" & ".join([
+                DATASETS[dataset] if not rows else "", "annotation" if source == "gt2d" else label,
+                str(summary["count"]), pm(summary["miou"], summary["sd"]), interval(summary),
+                cell(summary["precision"]), cell(summary["recall"]), cell(summary["reference"]),
+                cell(summary["relative"], 3),
+            ]))
+        groups.append(rows)
+    return table_body(groups)
+
+
+def baseline(view, selected, analytics):
+    """ The evidence per view baseline and the method, each at its selected point, on both splits """
+    point, _ = load_baseline(analytics)
+    if point is None:
+        return None
+    rows = []
+    for label, current in (("Target evidence per view", point), ("Target evidence fraction", selected)):
+        cells = [label, f"$({current.beta:g},\\,{current.gamma:g})$"]
+        for dataset in DATASETS:
+            for source in SOURCES:
+                summary = scene_summary(view, current, dataset, source)
+                cells.append(pm(summary["miou"], summary["sd"]) if summary else "--")
         rows.append(" & ".join(cells))
     return table_body([rows])
 
@@ -200,12 +240,16 @@ def main(argv=None):
     view = load_analytics(args.analytics)
     selected, radius, _ = load_points(args.analytics)
     tables = {
+        "main_results": main_results(view, selected),
         "per_class": per_class(view, selected),
         "per_scene": per_scene(view, selected, radius),
         "operators": operators(view, selected, radius),
         "ablations": ablations(view, radius),
         "quantiles": quantiles(view),
     }
+    base = baseline(view, selected, args.analytics)
+    if base is not None:
+        tables["baseline"] = base
     if args.analysis is not None and (args.analysis / "threshold_scores.csv").exists():
         tables["scores"] = scores(args.analysis / "threshold_scores.csv")
     if args.analysis is not None and (args.analysis / "mask_agreement.csv").exists():

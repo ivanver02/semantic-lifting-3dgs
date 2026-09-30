@@ -8,7 +8,8 @@ from pathlib import Path
 
 from evaluation.analytics import QUANTILES, close, dataset_of, is_frozen, load_analytics, number
 from evaluation.summaries import (
-    at_point, class_summary, frozen_rows, gaps, load_points, mask_rows, mask_summary, mean, paired, reachable,
+    BASELINE, at_point, belongs, class_summary, frozen_rows, gaps, load_baseline, load_points, mask_rows,
+    mask_summary, mean, paired, reachable,
     scene_summary, threshold_summary, validation_grid,
 )
 
@@ -87,6 +88,7 @@ def main_results(values, view, point, prefix=""):
             values[stem + label + "mIoUSd"] = two(summary["sd"])
             values[stem + label + "mIoUMedian"] = two(summary["median"])
             values[stem + label + "mIoUAll"] = two(summary["miou_all"])
+            values[stem + label + "CILow"], values[stem + label + "CIHigh"] = two(summary["low"]), two(summary["high"])
             values[stem + "Pairs"], values[stem + "Unreachable"] = str(summary["pairs"]), str(summary["unreachable"])
             scene_miou = [item["miou"] for item in summary["scenes"].values()]
             values[stem + label + "SceneMin"], values[stem + label + "SceneMax"] = two(min(scene_miou)), two(max(scene_miou))
@@ -113,9 +115,11 @@ def operators(values, view, selected, radius):
             comparison = paired(first, second)
             stem = name.capitalize() + label
             values["opDelta" + stem] = signed(comparison["delta"])
+            values["opGain" + stem] = two(abs(comparison["delta"]))
             values["opBetter" + stem] = str(comparison["better"])
             values["opWorse" + stem] = str(comparison["worse"])
             values["opScenes" + name.capitalize()] = str(comparison["count"])
+            values["opCILow" + stem], values["opCIHigh" + stem] = signed(comparison["low"]), signed(comparison["high"])
             if source == "gt2d":
                 values["opRefDelta" + name.capitalize()] = signed(first["reference"] - second["reference"])
 
@@ -216,6 +220,55 @@ def classes(values, view, point, prefix=""):
         values[stem + "Zero"] = str(item["zero_yolo"])
 
 
+def baseline(values, view, selected, analytics):
+    """
+    The evidence per view baseline at the point that the same rule chose for it on validation, and its
+    difference with the method scene by scene, with the bootstrap interval of that difference
+    """
+    point, data = load_baseline(analytics)
+    if point is None:
+        return
+    # How much the baseline changes along its grid, and how much the best threshold changes between classes
+    names = {row["class_id"]: row["class_name"] for row in view["classes"]}
+    line, per_class = defaultdict(list), defaultdict(lambda: defaultdict(list))
+    for row in view["aggregate_beta_metrics"]:
+        if (belongs(row, BASELINE) and dataset_of(row) == "replica" and row["source"] == "gt2d"
+                and close(number(row["hysteresis_gamma"]), point.gamma)):
+            line[number(row["beta"])].append(number(row["mIoU"]))
+    for row in view["class_beta_metrics"]:
+        if (belongs(row, BASELINE) and dataset_of(row) == "replica" and row["source"] == "gt2d"
+                and close(number(row["hysteresis_gamma"]), point.gamma)):
+            per_class[names[row["class_id"]]][number(row["beta"])].append(number(row["iou"]))
+    if line:
+        means = [statistics.mean(v) for v in line.values()]
+        values["baseRangeLow"], values["baseRangeHigh"] = two(min(means)), two(max(means))
+    if per_class:
+        best = [max(betas, key=lambda b: statistics.mean(betas[b])) for betas in per_class.values()]
+        values["baseClassBetaMin"], values["baseClassBetaMax"] = f"{min(best):g}", f"{max(best):g}"
+    values.update(
+        baseBetaStar=f"{point.beta:g}", baseGammaStar=f"{point.gamma:g}",
+        baseSelectedMean=two(data["selected_mean"]), baseSelectedSd=two(data["selected_sd"]),
+        baseBestMean=two(data["best_mean"]), baseCandidateCount=f"{data.get('candidate_count', '--')}",
+    )
+    for dataset, name in DATASETS:
+        for source, label in SOURCES:
+            method, base = scene_summary(view, selected, dataset, source), scene_summary(view, point, dataset, source)
+            if base is None:
+                continue
+            stem = name.capitalize() + label
+            values["base" + stem + "mIoU"], values["base" + stem + "mIoUSd"] = two(base["miou"]), two(base["sd"])
+            values["base" + stem + "CILow"], values["base" + stem + "CIHigh"] = two(base["low"]), two(base["high"])
+            values["base" + stem + "Prec"], values["base" + stem + "Rec"] = two(base["precision"]), two(base["recall"])
+            if method is not None:
+                comparison = paired(method, base)
+                values["baseDelta" + stem] = signed(comparison["delta"])
+                values["baseGain" + stem] = two(abs(comparison["delta"]))
+                values["baseBetter" + stem] = str(comparison["better"])
+                values["baseScenes" + stem] = str(comparison["count"])
+                values["baseCILow" + stem] = signed(comparison["low"])
+                values["baseCIHigh" + stem] = signed(comparison["high"])
+
+
 def development(values, view, chosen):
     """
     mIoU and reference of each development scene at the selected theta and at the default 0.5 of the
@@ -290,15 +343,19 @@ def masks(values, path):
         values[stem + "Pearson"] = two(item["pearson"])
 
 
-def qualitative_pair(values, view, selected):
-    """ Name the scene and class whose IoU is the median of the test split """
+def overview_scene(values, view, selected):
+    """ The scene of the overview figure, with the rule of figure_renders.py: the test scene with the most classes """
     names = {row["class_id"]: row["class_name"] for row in view["classes"]}
-    pairs = sorted(
-        (number(row["iou"]), row["scene_id"].split(":")[-1], names[row["class_id"]])
-        for row in frozen_rows(view, "class_beta_metrics", selected, "scannetpp", "gt2d") if reachable(row)
-    )
-    if pairs:
-        _, values["qualScene"], values["qualClass"] = pairs[len(pairs) // 2]
+    classes = defaultdict(set)
+    for row in frozen_rows(view, "class_beta_metrics", selected, "scannetpp", "gt2d"):
+        if reachable(row):
+            classes[row["scene_id"].split(":")[1]].add(names[row["class_id"]])
+    summary = scene_summary(view, selected, "scannetpp", "gt2d")
+    if summary is None:
+        return
+    scenes = summary["scenes"]
+    values["overviewScene"] = max(scenes, key=lambda s: (len(classes[s]), scenes[s]["miou"]))
+    values["overviewClassCount"] = str(len(classes[values["overviewScene"]]))
 
 
 def seconds(value):
@@ -396,8 +453,9 @@ def main(argv=None):
     classes(values, view, selected)
     classes(values, view, radius, prefix="radius")
     development(values, view, selections["selected"])
+    baseline(values, view, selected, args.analytics)
     worst_scene(values, view, selected)
-    qualitative_pair(values, view, selected)
+    overview_scene(values, view, selected)
     costs(values, view)
     hardware(values, view)
     if args.analysis is not None and (args.analysis / "threshold_scores.csv").exists():

@@ -57,6 +57,7 @@ bash repo/picasso/submit.sh baseline-validation   # the evidence per view baseli
 bash repo/picasso/submit.sh baseline-selection    # selection_baseline.json, on the login node
 bash repo/picasso/submit.sh baseline-test         # the baseline at its selected point on the test scenes
 bash repo/picasso/submit.sh analysis       # 2D masks against 3D results, scores for selecting Gaussians
+bash repo/picasso/submit.sh figures        # image panels of the overview and qualitative figures
 bash repo/picasso/submit.sh report         # macros, tables and figures, on the login node
 ```
 

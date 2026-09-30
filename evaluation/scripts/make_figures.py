@@ -2,14 +2,15 @@
 # of the preprint (3.4 in) or for its full width (7 in)
 
 import argparse
+import json
 import statistics
 from collections import defaultdict
 from pathlib import Path
 
 from evaluation.analytics import close, dataset_of, is_frozen, load_analytics, number
 from evaluation.summaries import (
-    CLASS_ORDER, DATASETS, TRANSFERS, class_summary, load_points, mask_rows, ordered_classes,
-    threshold_summary, validation_grid,
+    CLASS_ORDER, DATASETS, TRANSFERS, belongs, class_summary, load_baseline, load_points, mask_rows,
+    ordered_classes, threshold_summary, validation_grid,
 )
 
 # Okabe-Ito colours, which stay distinct for colour-blind readers, one per class of both datasets
@@ -23,6 +24,9 @@ SOURCE_STYLE = {
     "reference": dict(color="#555555", marker="D", label="reference"),
 }
 DATASET_MARKERS = {"replica": "o", "scannetpp": "^"}
+# The views of the qualitative figure, as (scene, camera), taken from the candidates of figure_renders.py:
+# two test scenes next to the median mIoU, one with a dining table that YOLO finds and one with a desk that it misses
+QUALITATIVE_VIEWS = [("3db0a1c8f3", "DSC09808"), ("0d2ee665be", "DSC00097")]
 SCORE_AXES = {
     "fraction": ("target evidence fraction $\\rho$", "linear"),
     "evidence": ("raw target evidence $E^{+}$", "log"),
@@ -237,6 +241,112 @@ def class_gaps(view, selected, path):
     save(fig, path)
 
 
+def thresholds(view, selected, baseline, path):
+    """
+    Mean validation mIoU along the threshold grid, for the evidence fraction of the method and for the
+    evidence per view of the baseline, without hysteresis and at the gamma selected for each one
+    """
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+
+    def line(point, gamma):
+        values = defaultdict(list)
+        for row in view["aggregate_beta_metrics"]:
+            if (belongs(row, point.transfer) and dataset_of(row) == "replica" and row["source"] == "gt2d"
+                    and close(number(row["hysteresis_gamma"]), gamma)):
+                values[number(row["beta"])].append(number(row["mIoU"]))
+        return sorted((beta, statistics.mean(v)) for beta, v in values.items())
+
+    fig, axes = plt.subplots(1, 2, figsize=(3.6, 1.9), sharey=True)
+    panels = ((axes[0], selected, "evidence fraction $\\rho$"), (axes[1], baseline, "evidence per view"))
+    for ax, point, label in panels:
+        for gamma, style in ((point.gamma, "-"), (0.0, "--")):
+            points = line(point, gamma)
+            if not points:
+                continue
+            ax.plot(range(len(points)), [v for _, v in points], style, color="#0072B2" if point is selected else "#D55E00",
+                    marker="o", markersize=2)
+            ax.set_xticks(range(len(points)), [f"{b:g}" for b, _ in points], rotation=90, fontsize=5)
+        star = [b for b, _ in line(point, point.gamma)]
+        if star:
+            ax.axvline(min(range(len(star)), key=lambda i: abs(star[i] - point.beta)), color="#777777", linestyle=":", linewidth=0.7)
+        ax.set_xlabel(label, fontsize=7)
+        ax.set_ylim(0, 1)
+        ax.grid(axis="y", color="#EEEEEE", linewidth=0.6)
+    axes[0].set_ylabel("mean mIoU, validation")
+    handles = [Line2D([], [], color="#444444", linestyle="-", label="with hysteresis"),
+               Line2D([], [], color="#444444", linestyle="--", label="without hysteresis")]
+    fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=2, fontsize=6)
+    fig.tight_layout()
+    save(fig, path)
+
+
+def overview(renders, path):
+    """ The photograph, the YOLO masks, the evidence fraction and the labelled Gaussians of one view """
+    import matplotlib.image as mpimg
+    import matplotlib.pyplot as plt
+    import numpy as np
+    from matplotlib.colors import LinearSegmentedColormap
+    from matplotlib.patches import Patch
+
+    manifest = json.loads((renders / "manifest.json").read_text(encoding="utf-8"))
+    info = next(item for item in manifest["views"] if item["name"] == "overview")
+    titles = {"photo": "photograph", "masks": "YOLO masks of this view",
+              "fraction": f"evidence fraction of the {info['fraction_class']}", "labels": "labelled Gaussians"}
+    fig, axes = plt.subplots(1, 4, figsize=(7.0, 1.55))
+    for ax, (key, title) in zip(axes, titles.items()):
+        ax.imshow(mpimg.imread(renders / f"overview_{key}.png"), interpolation="none")
+        ax.set_axis_off()
+        ax.set_title(title, fontsize=7, pad=3)
+    handles = [Patch(color=CLASS_COLORS[name], label=name) for name in info["classes"]]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.25, -0.02), ncol=len(handles), fontsize=6,
+               handlelength=1.0, columnspacing=0.8)
+    # The colour scale of the fraction panel, from the pale colour of the room to the strongest red
+    scale = LinearSegmentedColormap.from_list("fraction", ["#E6E6E6", "#D62728"])
+    fig.subplots_adjust(wspace=0.03, left=0.005, right=0.995, top=0.9, bottom=0.12)
+    bar = fig.add_axes([axes[2].get_position().x0 + 0.03, 0.06, axes[2].get_position().width - 0.06, 0.035])
+    bar.imshow([np.linspace(0, 1, 256)], aspect="auto", cmap=scale)
+    bar.set_yticks([])
+    bar.set_xticks([0, 255], ["$\\rho=0$", "$\\rho=1$"], fontsize=5)
+    bar.tick_params(length=1.5, pad=1)
+    save(fig, path)
+
+
+def qualitative(renders, path, views=QUALITATIVE_VIEWS):
+    """
+    One row per view of the candidates of figure_renders.py: the photograph and the agreement between the
+    prediction and the reference over all the classes of the scene, with each mask source
+    """
+    import matplotlib.image as mpimg
+    import matplotlib.pyplot as plt
+    from matplotlib.patches import Patch
+
+    manifest = json.loads((renders / "manifest.json").read_text(encoding="utf-8"))
+    candidates = {(item["scene"], item["camera"]): item for item in manifest.get("candidates", [])}
+    views = [v for v in views if v in candidates]
+    if not views:
+        return
+    columns = (("photo", "photograph"), ("agreement_gt2d", "annotation masks"), ("agreement_yolo", "YOLO masks"))
+    fig, axes = plt.subplots(len(views), 3, figsize=(7.0, 1.62 * len(views) + 0.2), squeeze=False)
+    for row, (scene, camera) in zip(axes, views):
+        info = candidates[(scene, camera)]
+        for ax, (key, title) in zip(row, columns):
+            ax.imshow(mpimg.imread(renders / "candidates" / f"{scene}_{camera}_{key}.png"), interpolation="none")
+            ax.set_axis_off()
+            if key == "photo":
+                title = f"scene {scene}"
+            else:
+                title = f"{title}, mIoU {info['miou'][key.split('_')[1]]:.2f}"
+            ax.set_title(title, fontsize=7, pad=3)
+    colours = {"both": "#2CA02C", "prediction": "#D62728", "reference": "#1F77B4"}
+    labels = {"both": "prediction and reference", "prediction": "only the prediction", "reference": "only the reference"}
+    fig.legend(handles=[Patch(color=colours[k], label=labels[k]) for k in colours], loc="lower center",
+               bbox_to_anchor=(0.5, 0.0), ncol=3, fontsize=6.5)
+    fig.subplots_adjust(wspace=0.03, hspace=0.14, left=0.005, right=0.995, top=0.95,
+                        bottom=0.24 / (1.62 * len(views) + 0.2))
+    save(fig, path)
+
+
 def development(view, development_selection, path):
     """ mIoU and reference of the two development scenes along the tau grid and then along the theta grid """
     import matplotlib.pyplot as plt
@@ -281,6 +391,8 @@ def main(argv=None):
     p.add_argument("--analysis", type=Path, default=None,
                    help="directory with mask_agreement.csv and threshold_scores.csv, skipped when missing")
     p.add_argument("--out", type=Path, default=Path("preprint/figures"))
+    p.add_argument("--renders", type=Path, default=None,
+                   help="directory written by figure_renders.py, for the overview and qualitative figures")
     args = p.parse_args(argv)
     style()
 
@@ -296,6 +408,12 @@ def main(argv=None):
         score_bars(args.analysis / "threshold_scores.csv", args.out / "scores.pdf")
     if args.analysis is not None and (args.analysis / "mask_agreement.csv").exists():
         mask_2d_3d(args.analysis / "mask_agreement.csv", args.out / "mask_2d_3d.pdf")
+    baseline, _ = load_baseline(args.analytics)
+    if baseline is not None:
+        thresholds(view, selected, baseline, args.out / "thresholds.pdf")
+    if args.renders is not None and (args.renders / "manifest.json").exists():
+        overview(args.renders, args.out / "overview.pdf")
+        qualitative(args.renders, args.out / "qualitative.pdf")
     return 0
 
 

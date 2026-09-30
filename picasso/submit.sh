@@ -15,6 +15,7 @@
 #   bash picasso/submit.sh baseline-selection    the same rule applied to the baseline, run here
 #   bash picasso/submit.sh baseline-test  the baseline at its selected point on the ten test scenes, one job each
 #   bash picasso/submit.sh analysis       2D masks against 3D results and scores for selecting Gaussians, one job
+#   bash picasso/submit.sh figures        image panels of the overview and qualitative figures, one job
 #   bash picasso/submit.sh report         macros, tables and figures of the manuscripts, run here as it only reads
 #                                         the analytics and the analyses; the figures need matplotlib
 # validation, validation-nearest, test, contribution, baseline-validation and baseline-test also take scene
@@ -164,15 +165,19 @@ case "$1" in
     analysis)
         sbatch --job-name=analysis "$TFG_REPO/picasso/analysis.sbatch"
         ;;
+    figures)
+        submit figures evaluation.scripts.figure_renders --data-root "$TFG_DATA"
+        ;;
     report)
         cd "$TFG_REPO"
         report=(--analytics "$ANALYTICS" --analysis "$TFG_DATA/analysis")
         "$TFG_PYTHON" -m evaluation.scripts.make_macros "${report[@]}" --output "$TFG_DATA/report/macros_measured.tex"
         "$TFG_PYTHON" -m evaluation.scripts.make_tables "${report[@]}" --out "$TFG_DATA/report/tables"
-        "$TFG_PYTHON" -m evaluation.scripts.make_figures "${report[@]}" --out "$TFG_DATA/report/figures"
+        "$TFG_PYTHON" -m evaluation.scripts.make_figures "${report[@]}" --out "$TFG_DATA/report/figures" \
+            --renders "$TFG_DATA/scannetpp/figures"
         ;;
     *)
-        sed -n 2,22p "$0"
+        sed -n 2,23p "$0"
         exit 1
         ;;
 esac
