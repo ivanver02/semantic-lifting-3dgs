@@ -23,8 +23,9 @@ set -eo pipefail
 
 arguments=("$@")
 
-# The margin leaves time to save the training checkpoint before SLURM stops the job
-end=${SLURM_JOB_END_TIME:-$(date -d "$(squeue -h -j "$SLURM_JOB_ID" -o %e)" +%s)}
+# The margin leaves time to save the training checkpoint before SLURM stops the job. The fallback
+# reads scontrol, since the squeue of Picasso is a wrapper that does not handle -o reliably
+end=${SLURM_JOB_END_TIME:-$(date -d "$(scontrol show job "$SLURM_JOB_ID" | grep -o 'EndTime=[^ ]*' | cut -d= -f2)" +%s)}
 export TFG_DEADLINE=$((end - ${TFG_MARGIN:-600}))
 part=${TFG_PART:-1}
 echo "$(hostname): $(nvidia-smi -L), part $part, stops at $(date -d "@$TFG_DEADLINE")"
@@ -53,10 +54,11 @@ if [ "$code" -eq 3 ]; then
         exit 3
     fi
 
-    # The new job asks for the same time and QoS, and starts once this one has ended
-    read -r limit qos <<< "$(squeue -h -j "$SLURM_JOB_ID" -o "%l %q")"
+    # The new job takes its time and QoS from the directives of this file, and its memory from
+    # SBATCH_MEM_PER_NODE when the first job was submitted with it, as the job inherits the
+    # environment. It starts once this one has ended
     TFG_PART=$((part + 1)) sbatch \
-        --job-name="$SLURM_JOB_NAME" --time="$limit" --qos="$qos" \
+        --job-name="$SLURM_JOB_NAME" \
         --chdir="$SLURM_SUBMIT_DIR" --dependency=afterany:"$SLURM_JOB_ID" \
         "$TFG_REPO/picasso/job.sbatch" "${arguments[@]}"
     echo "continues in part $((part + 1))"

@@ -207,20 +207,40 @@ def dataset_of(row):
     return row["scene_id"].split(":")[0]
 
 
-def is_frozen(row):
+# Variant prefix of the frozen runs of each transfer operator from Gaussians to mesh, which the
+# validation compares like any other choice of the operating point
+TRANSFER_PREFIX = {
+    "radius_vote": "frozen_g",
+    "nearest_neighbor_label": "frozen_nearest_g",
+}
+
+
+def transfer_of(row):
+    """ Transfer operator of a frozen row, read from its variant """
+    return "nearest_neighbor_label" if row["variant"].startswith(TRANSFER_PREFIX["nearest_neighbor_label"]) else "radius_vote"
+
+
+def is_frozen(row, transfer="radius_vote"):
     """
-    Whether a row belongs to the frozen configuration
+    Whether a row belongs to the frozen configuration of one transfer operator, or of any with None
 
     Development sweeps and contribution analysis runs share scenes and operating
     points with it, so every summary of the frozen configuration keeps only these rows
     """
-    return row["variant"].startswith("frozen_")
+    if transfer is None:
+        return any(row["variant"].startswith(prefix) for prefix in TRANSFER_PREFIX.values())
+    return row["variant"].startswith(TRANSFER_PREFIX[transfer])
 
 
 def selected_operating_point(path):
     """ Load the (beta, gamma) pair selected on the validation scenes """
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     return float(data["beta_star"]), float(data["gamma_star"])
+
+
+def selected_transfer(path):
+    """ Load the transfer operator selected on the validation scenes, the radius vote in older selections """
+    return json.loads(Path(path).read_text(encoding="utf-8")).get("transfer", "radius_vote")
 
 
 def record_class_inventory(store, scene):

@@ -5,22 +5,28 @@ import json
 import statistics
 from pathlib import Path
 
-from evaluation.analytics import is_frozen, load_analytics, number
+from evaluation.analytics import TRANSFER_PREFIX, is_frozen, load_analytics, number, transfer_of
 
 TOLERANCE = 0.01
 
 FLOAT_SLACK = 1e-12
 
+# Ties go to the operator listed first, the radius vote, as they go to the smaller beta and gamma
+TRANSFER_ORDER = {transfer: index for index, transfer in enumerate(TRANSFER_PREFIX)}
+
 
 def summarise(rows, expected):
-    """ Group the candidates by operating point and summarise them over scenes """
+    """ Group the candidates by transfer operator and operating point and summarise them over scenes """
     grouped = {}
     for row in rows:
-        beta, gamma = number(row["beta"]), number(row["hysteresis_gamma"])
-        grouped.setdefault((beta, gamma), {})[row["scene_id"]] = number(row["mIoU"])
+        key = (transfer_of(row), number(row["beta"]), number(row["hysteresis_gamma"]))
+        grouped.setdefault(key, {})[row["scene_id"]] = number(row["mIoU"])
 
+    # With no rows at all the validation step has not run, which is worth saying apart from a partial sweep
+    if not grouped:
+        raise RuntimeError("selection found no frozen validation results in the analytics, run the validation step first")
     incomplete = [key for key, values in grouped.items() if len(values) != expected]
-    if not grouped or incomplete:
+    if incomplete:
         raise RuntimeError(
             "selection requires one validation mIoU per candidate and scene: "
             f"{len(incomplete)} of {len(grouped)} candidates do not have "
@@ -30,12 +36,13 @@ def summarise(rows, expected):
     # Summarize each candidate across scenes with the population standard deviation
     return [
         {
+            "transfer": transfer,
             "beta": beta,
             "gamma": gamma,
             "mean": statistics.mean(list(values.values())),
             "std": statistics.pstdev(list(values.values())),
         }
-        for (beta, gamma), values in grouped.items()
+        for (transfer, beta, gamma), values in grouped.items()
     ]
 
 
@@ -43,24 +50,42 @@ def select(rows, expected, tolerance=TOLERANCE):
     """ Return the operating point and the numbers the rule produced with it """
     summaries = summarise(rows, expected)
 
+    def order(item):
+        return TRANSFER_ORDER[item["transfer"]], item["beta"], item["gamma"]
+
     # The candidate with the best mean is a row of the manuscript table, so ties
-    # are resolved with the same deterministic rule as the selection: smaller beta, then smaller gamma
-    best = min(summaries, key=lambda item: (-item["mean"], item["beta"], item["gamma"]))
+    # are resolved with the same deterministic rule as the selection
+    best = min(summaries, key=lambda item: (-item["mean"],) + order(item))
 
     # Apply the score margin and keep the candidate with the smallest scene standard deviation
     eligible = [
         item for item in summaries
         if item["mean"] >= best["mean"] - tolerance - FLOAT_SLACK
     ]
-    selected = min(eligible, key=lambda item: (item["std"], item["beta"], item["gamma"]))
+    selected = min(eligible, key=lambda item: (item["std"],) + order(item))
+
+    # The best candidate of every operator, so the manuscript can compare them at their own best
+    per_transfer = {}
+    for item in summaries:
+        current = per_transfer.get(item["transfer"])
+        if current is None or (-item["mean"],) + order(item) < (-current["mean"],) + order(current):
+            per_transfer[item["transfer"]] = item
+
     return {
+        "transfer": selected["transfer"],
         "beta_star": selected["beta"],
         "gamma_star": selected["gamma"],
         "best_mean": best["mean"],
         "best_mean_sd": best["std"],
+        "best_transfer": best["transfer"],
         "selected_mean": selected["mean"],
         "selected_sd": selected["std"],
         "eligible_count": len(eligible),
+        "candidate_count": len(summaries),
+        "best_per_transfer": {
+            transfer: {"beta": item["beta"], "gamma": item["gamma"], "mean": item["mean"], "std": item["std"]}
+            for transfer, item in per_transfer.items()
+        },
     }
 
 
@@ -72,6 +97,8 @@ def main(argv=None):
     parser.add_argument("--scene", action="append", required=True)
     parser.add_argument("--development-selection", type=Path, required=True,
                         help="JSON with tau_star and theta_star written by the development sweep")
+    parser.add_argument("--transfer", choices=TRANSFER_PREFIX, action="append", default=None,
+                        help="Transfer operators the rule compares, every operator with validation results by default")
     args = parser.parse_args(argv)
 
     # The rule is applied to the frozen validation rows with annotation-derived masks
@@ -79,7 +106,8 @@ def main(argv=None):
     rows = [
         row for row in load_analytics(args.analytics)["aggregate_beta_metrics"]
         if row["source"] == "gt2d"
-        and is_frozen(row)
+        and is_frozen(row, transfer=None)
+        and (args.transfer is None or transfer_of(row) in args.transfer)
         and row["scene_id"].split(":")[-1] in allowed
     ]
     result = select(rows, len(allowed))

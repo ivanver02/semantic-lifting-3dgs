@@ -109,24 +109,40 @@ def radius_label_vote(n_query, query, reference, distances, reference_labels, re
     scores = np.bincount(query.astype(np.int64) * columns + edge_labels % columns,
                          weights=edge_weights, minlength=n_query * columns).reshape(n_query, columns)
 
-    # Select the strongest class score for each query, which has to beat the background
+    # Select the strongest class score for each query
     best_label = scores[:, :n_classes].argmax(axis=1)
     best_score = scores[np.arange(n_query), best_label]
 
-    # Reject scores below the required fraction
+    # The class is accepted when its fraction of the competing evidence reaches min_fraction, which
+    # is the only rule, so a value below 0.5 can label a vertex where the background holds more weight
     fraction = np.divide(best_score, total, out=np.zeros_like(best_score), where=total > 0)
-    accepted = (best_score > scores[:, -1]) & (fraction >= min_fraction)
+    accepted = (best_score > 0) & (fraction >= min_fraction)
     return np.where(accepted, best_label, -1)
 
 
-def nearest_neighbor_label(n_query, query, reference, distances, reference_labels):
-    """ Assign each query point the label of its nearest reference point within the radius """
+# The nearest pair of every query only depends on the pairs, not on the labels, so it is kept for the
+# pairs it was computed from. An evaluation transfers every class and beta through the same pairs
+_nearest_cache = {"pairs": None, "nearest": None}
+
+
+def _nearest_pairs(query, reference, distances):
+    """ Index of the nearest pair of every query that has one, computed once for the same pair arrays """
+    pairs = (query, reference, distances)
+    cached = _nearest_cache["pairs"]
+    if cached is not None and all(a is b for a, b in zip(cached, pairs)):
+        return _nearest_cache["nearest"]
 
     # Sort the pairs by query and then by distance, so the first pair of each query is its nearest reference
     order = np.lexsort((distances, query))
     _, first = np.unique(query[order], return_index=True)
     nearest = order[first]
+    _nearest_cache.update(pairs=pairs, nearest=nearest)
+    return nearest
 
+
+def nearest_neighbor_label(n_query, query, reference, distances, reference_labels):
+    """ Assign each query point the label of its nearest reference point within the radius """
+    nearest = _nearest_pairs(query, reference, distances)
     output = np.full(n_query, -1, dtype=np.int64)
     output[query[nearest]] = reference_labels[reference[nearest]]
     return output

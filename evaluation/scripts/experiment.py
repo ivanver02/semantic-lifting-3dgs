@@ -3,9 +3,15 @@
 import argparse
 from pathlib import Path
 
+from evaluation.analytics import TRANSFER_PREFIX
 from evaluation.scripts.experiment_common import (
     BETAS, DEVELOPMENT_SCENES, GAMMAS, dump_plan, load_json, run_units, token, unit,
 )
+
+
+def transfer_extra(transfer):
+    """ Arguments of evaluation.run for a transfer operator, none for the default radius vote """
+    return () if transfer == "radius_vote" else ("--gaussian-to-mesh-transfer", transfer)
 
 
 ROWS = (
@@ -44,20 +50,28 @@ def units(args, selection):
         "split": settings["split"],
     }
 
+    # The validation runs the whole grid with the operator asked for, so the selection can compare operators.
+    # Each operator writes under its own variant, so the runs of one never replace those of the other
     if args.experiment == "validation":
+        prefix = TRANSFER_PREFIX[args.transfer]
         return [
-            unit("replica", scene, f"frozen_g{token(gamma)}", betas=BETAS, gamma=gamma, **common)
+            unit("replica", scene, f"{prefix}{token(gamma)}", betas=BETAS, gamma=gamma,
+                 extra=transfer_extra(args.transfer), **common)
             for scene in args.scene
             for gamma in GAMMAS
         ]
 
+    # The test runs the operator that the validation selected, the radius vote in older selections
     beta_star, gamma_star = [selection["beta_star"]], selection["gamma_star"]
     if args.experiment == "test":
+        transfer = selection.get("transfer", "radius_vote")
         return [
-            unit("scannetpp", scene, f"frozen_g{token(gamma_star)}", betas=beta_star, gamma=gamma_star, **common)
+            unit("scannetpp", scene, f"{TRANSFER_PREFIX[transfer]}{token(gamma_star)}", betas=beta_star,
+                 gamma=gamma_star, extra=transfer_extra(transfer), **common)
             for scene in args.scene
         ]
 
+    # The contribution analysis varies one factor at a time from the radius vote configuration
     return [
         unit("replica", scene, f"contribution_analysis_{name}", betas=beta_star, gamma=gamma_star,
              extra=extra, **common)
@@ -83,6 +97,9 @@ def _parser():
     parser.add_argument("--selection", type=Path, required=True,
                         help="JSON with tau_star and theta_star from the development sweep for validation, "
                              "and the validation selection with beta_star and gamma_star too for test and contribution analysis")
+    parser.add_argument("--transfer", choices=TRANSFER_PREFIX, default="radius_vote",
+                        help="Transfer operator from Gaussians to mesh of the validation grid; the test takes "
+                             "the one in the selection file")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the unit plan without running anything")
     parser.add_argument("--only-scene", default=None,
