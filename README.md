@@ -84,6 +84,17 @@ The results per class and per scene, the comparison of the two transfer operator
 
 The heavy stages run inside three images: one for COLMAP, one that trains the Gaussian model with the official rasteriser, and one for the masks and the lifting. `containers/` has them as Dockerfiles and as Apptainer definitions. `evaluation/runtime.py` launches each stage with Docker by default, or with Apptainer when `TFG_RUNTIME=apptainer`, with the repository mounted as read only and the data as read and write. The transfer to the mesh and the metrics only need NumPy and SciPy, so they run outside the images.
 
+The images are not published in any registry, so they have to be built once from the root of the repository, with the tags that `evaluation/runtime.py` expects. Note that the training image compiles the three CUDA submodules, so they must be checked out before:
+
+```bash
+git submodule update --init --recursive submodules/diff-gaussian-rasterization submodules/simple-knn submodules/fused-ssim
+docker build -f containers/Dockerfile.colmap -t tfgivanverdugo/semantic-fusion-colmap:3.13.0-cpu .
+docker build -f containers/Dockerfile.gs-train -t tfgivanverdugo/semantic-fusion-gs-train:cuda11.6 .
+docker build -f containers/Dockerfile.gaussian-fusion -t tfgivanverdugo/semantic-fusion-fusion:cuda11.6 .
+```
+
+The two CUDA images are compiled by default for GPUs of compute capability 8.6. For another GPU, it is necessary to add `--build-arg TORCH_CUDA_ARCH_LIST=<capability>` to both builds, for example `8.0` for an A100. On a cluster without Docker, `picasso/build_images.sh` builds the same three images with Apptainer.
+
 One scene at the selected point, with both mask sources:
 
 ```bash
