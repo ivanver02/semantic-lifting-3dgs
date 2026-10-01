@@ -24,8 +24,6 @@ from .replica.scene import ReplicaScene
 from .scannetpp.scene import ScannetScene
 
 
-DEFAULT_DATA_ROOT = Path("/mnt/hddb/dataTFGIvanVerdugo")
-
 # Protocol values frozen in the manuscript configuration (Table of the
 # experimental design). They are not command line options on purpose: changing
 # them means changing the documented experiment.
@@ -87,7 +85,7 @@ def _parser():
     parser.add_argument("--scene", required=True)
 
     # Define the paths used by the launcher and by the container mounts
-    parser.add_argument("--data-root", type=Path, default=None, help="dataset path root, something like .../scannetpp")
+    parser.add_argument("--data-root", type=Path, required=True, help="dataset path root, something like .../scannetpp")
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--output-root", type=Path, default=None)
     parser.add_argument("--variant", default=None,
@@ -420,7 +418,7 @@ def main():
         raise ValueError("--hysteresis-radius must be greater than zero")
 
     # Resolve the data root and output root directories
-    data_root = (args.data_root or DEFAULT_DATA_ROOT / args.dataset).resolve()
+    data_root = args.data_root.resolve()
     output_root = (args.output_root or data_root / "evaluation" / args.scene).resolve()
 
     # The containers only see the data root, so the outputs must live inside it

@@ -111,7 +111,7 @@ def main(args, pipe):
 if __name__ == "__main__":
     parser = ArgumentParser()
 
-    # Model and dataset configuration shared with training and fusion stages
+    # Model and dataset configuration shared with training and lifting stages
     model_params = ModelParams(parser)
     pipeline_params = PipelineParams(parser)
 
