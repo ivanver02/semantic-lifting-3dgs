@@ -1,5 +1,5 @@
 #!/bin/bash
-# Submit each step of the evaluation, with one job per scene wherever the scenes are independent
+# Submits each step of the evaluation, with one job per scene in the case of the steps whose scenes are independent
 #   bash picasso/submit.sh development    tau phase of the two development scenes, one job each,
 #                                         or of the scenes given after it
 #   bash picasso/submit.sh warmup         model, masks and votes of the validation scenes, one job each,
@@ -18,16 +18,17 @@
 #   bash picasso/submit.sh figures        image panels of the overview and qualitative figures, one job
 #   bash picasso/submit.sh report         macros, tables and figures of the manuscripts, run here as it only reads
 #                                         the analytics and the analyses; the figures need matplotlib
-# validation, validation-nearest, test, contribution, baseline-validation and baseline-test also take scene
-# names after the step, to submit only those
-# Each step starts once every job of the previous one has finished, which squeue -p gpu_partition shows
+# In the case of validation, validation-nearest, test, contribution, baseline-validation and baseline-test,
+# it is also possible to give scene names after the step, in order to submit only those scenes
+# Each step is started once every job of the previous one has finished, which can be seen with squeue -p gpu_partition
 
 source "$(dirname "$0")/env.sh"
 set -eo pipefail
 
 VALIDATION_SCENES=(office_1 office_2 office_3 office_4 room_0 room_1 room_2)
-# The ten Scannet++ test scenes: the downloaded scenes with the most evaluated classes in their 3D annotation,
-# ties broken by scene id, leaving out the development scene; chosen before any of them was evaluated
+# The ten Scannet++ test scenes. They are the downloaded scenes with the most evaluated classes in their 3D
+# annotation, with ties broken by scene id and leaving out the development scene, and they were chosen
+# before any of them was evaluated
 TEST_SCENES=(21d970d8de 27dd4da69e 09c1414f1b 0d2ee665be 25f3b7a318 3db0a1c8f3 3f15a9266d 5942004064 5eb31827b7 6115eddb86)
 DEVELOPMENT_SCENES=(office_0 7831862f02)
 BETAS=(0.50 0.70 0.90 0.94 0.95 0.96 0.97 0.975 0.98 0.985 0.99 0.995 0.999)
@@ -36,11 +37,11 @@ THETA_GRID=(0.3 0.4 0.5 0.6 0.7)
 
 ANALYTICS=$TFG_DATA/analytics
 DEVELOPMENT_SELECTION=$ANALYTICS/tau_theta_selection.json
-# The selection over both transfer operators, which the test reads, and the one over the radius vote
-# alone, which the contribution analysis varies one factor at a time
+# The selection over both transfer operators, which is the one that the test reads, and the one over the
+# radius vote alone, from which the contribution analysis varies one factor at a time
 SELECTION=$ANALYTICS/selection_transfer.json
 RADIUS_SELECTION=$ANALYTICS/selection.json
-# The selection of the baseline, which thresholds E+ per view with the rest of the method unchanged
+# The selection of the baseline, which thresholds E+ per view and keeps the rest of the method as it is
 BASELINE_SELECTION=$ANALYTICS/selection_baseline.json
 
 DEVELOPMENT_SWEEP=(
@@ -50,21 +51,21 @@ DEVELOPMENT_SWEEP=(
     --tau-grid "${TAU_GRID[@]}" --theta-grid "${THETA_GRID[@]}"
 )
 
-# Jobs write their logs relative to the directory they are submitted from
+# The jobs write their logs relative to the directory from which they are submitted
 mkdir -p "$TFG_ROOT/logs"
 cd "$TFG_ROOT"
 
 submit() {
-    # Submit one job named after its step and scene, so its log is logs/<name>-<job id>.out
+    # Submits one job with the name of its step and scene, so that its log is logs/<name>-<job id>.out
     local name=$1
     shift
     sbatch --job-name="$name" "$TFG_REPO/picasso/job.sbatch" "$@"
 }
 
 experiment() {
-    # Submit one job per scene of an experiment, each with the full scene list and its own --only-scene.
-    # When ONLY holds scenes, just those are submitted, to continue the ones that did not finish.
-    # The jobs are named after the step, and EXPERIMENT_ARGS holds extra arguments of the experiment
+    # Submits one job per scene of an experiment, each one with the full list of scenes and its own --only-scene.
+    # When ONLY holds scenes, only those are submitted, in order to continue the ones that did not finish.
+    # The jobs take the name of the step, and EXPERIMENT_ARGS holds the extra arguments of the experiment
     local step=$1 name=$2 dataset=$3 selection=$4
     shift 4
     if [ ! -e "$selection" ]; then
@@ -91,7 +92,7 @@ experiment() {
     done
 }
 
-# Scenes given after validation, validation-nearest, test or contribution limit that step to them
+# The scenes given after the name of the step limit that step to them
 ONLY=("${@:2}")
 EXPERIMENT_ARGS=()
 
@@ -106,7 +107,7 @@ case "$1" in
         done
         ;;
     warmup)
-        # The votes do not depend on tau, theta or gamma, so this run with the default configuration
+        # The votes do not depend on tau, theta or gamma. In this way, this run with the default configuration
         # fills the same output directories that the validation units read, without recording anything
         for scene in "${VALIDATION_SCENES[@]}"; do
             submit "warmup-$scene" evaluation.run --dataset replica --scene "$scene" \
@@ -121,7 +122,7 @@ case "$1" in
         experiment validation validation replica "$DEVELOPMENT_SELECTION" "${VALIDATION_SCENES[@]}"
         ;;
     validation-nearest)
-        # The votes and the selected Gaussians are cached, so these units only transfer and score again
+        # The votes and the selected Gaussians are already cached, so these units only transfer and score again
         EXPERIMENT_ARGS=(--transfer nearest_neighbor_label)
         experiment validation-nearest validation replica "$DEVELOPMENT_SELECTION" "${VALIDATION_SCENES[@]}"
         ;;
@@ -147,7 +148,7 @@ case "$1" in
         experiment contribution_analysis contribution_analysis replica "$RADIUS_SELECTION" "${VALIDATION_SCENES[@]}"
         ;;
     baseline-validation)
-        # The votes, masks and models are cached, so these units only threshold, transfer and score
+        # The votes, the masks and the models are already cached, so these units only threshold, transfer and score
         experiment baseline-validation baseline_validation replica "$DEVELOPMENT_SELECTION" "${VALIDATION_SCENES[@]}"
         ;;
     baseline-selection)

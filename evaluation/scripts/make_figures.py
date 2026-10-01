@@ -13,15 +13,10 @@ from evaluation.summaries import (
     ordered_classes, threshold_summary, validation_grid,
 )
 
-# Okabe-Ito colours, which stay distinct for colour-blind readers, one per class of both datasets
+
 CLASS_COLORS = {
     "chair": "#0072B2", "sofa": "#E69F00", "table": "#009E73", "tv": "#CC79A7",
     "laptop": "#56B4E9", "sink": "#D55E00", "plant": "#999933", "clock": "#000000", "bench": "#882255",
-}
-SOURCE_STYLE = {
-    "yolo": dict(color="#E69F00", marker="o", label="YOLO masks"),
-    "gt2d": dict(color="#0072B2", marker="o", label="annotation-derived masks"),
-    "reference": dict(color="#555555", marker="D", label="reference"),
 }
 DATASET_MARKERS = {"replica": "o", "scannetpp": "^"}
 # The views of the qualitative figure, as (scene, camera), taken from the candidates of figure_renders.py:
@@ -60,47 +55,56 @@ def save(fig, path):
 
 
 def beta_gamma(view, selected, radius, path):
-    """ Mean validation mIoU of every (beta, gamma) for both operators, with the eligible and selected cells """
+    """
+    Mean validation mIoU along beta, one curve per gamma, for both operators, with the band of the candidates
+    within 0.01 of the best mean and the point that the rule chooses for each operator
+    """
     import matplotlib.pyplot as plt
-    import numpy as np
-    from matplotlib.patches import Rectangle
+    from matplotlib.lines import Line2D
+    from matplotlib.patches import Patch
 
     means = {transfer: {key: statistics.mean(scenes.values()) for key, scenes in validation_grid(view, transfer).items()}
              for transfer in TRANSFERS}
     betas = sorted({beta for grid in means.values() for beta, _ in grid})
     gammas = sorted({gamma for grid in means.values() for _, gamma in grid})
     best = max(value for grid in means.values() for value in grid.values())
-    low = 0.80
+    low = 0.6
+    shades = dict(zip([g for g in gammas if g > 0], ["#7AD151", "#22A884", "#2A788E", "#414487"]))
 
-    fig, axes = plt.subplots(2, 1, figsize=(7.0, 3.3), sharex=True)
-    for ax, point in zip(axes, (selected, radius) if selected.transfer != radius.transfer else (selected,)):
+    points = (selected, radius) if selected.transfer != radius.transfer else (selected,)
+    fig, axes = plt.subplots(len(points), 1, figsize=(3.4, 1.45 * len(points) + 0.55), sharex=True, sharey=True)
+    axes = list(axes) if len(points) > 1 else [axes]
+    for ax, point in zip(axes, points):
         grid = means[point.transfer]
-        matrix = np.array([[grid.get((b, g), np.nan) for b in betas] for g in gammas])
-        image = ax.imshow(matrix, cmap="viridis", vmin=low, vmax=best, aspect="auto", origin="lower")
-        for i, gamma in enumerate(gammas):
-            for j, beta in enumerate(betas):
-                value = matrix[i, j]
-                if np.isnan(value):
-                    continue
-                ax.text(j, i, f"{value:.2f}"[1:], ha="center", va="center", fontsize=6,
-                        color="white" if value < (low + best) / 2 else "black")
-                # Cells within the tolerance of the best mean of both operators
-                if value >= best - 0.01:
-                    ax.add_patch(Rectangle((j - 0.5, i - 0.5), 1, 1, fill=False, edgecolor="white", linewidth=0.8))
-                if close(beta, point.beta) and close(gamma, point.gamma):
-                    ax.add_patch(Rectangle((j - 0.46, i - 0.46), 0.92, 0.92, fill=False,
-                                           edgecolor="#D55E00", linewidth=1.8))
-        ax.set_yticks(range(len(gammas)), [f"{g:g}" for g in gammas])
-        ax.set_ylabel("$\\gamma$")
-        title = TRANSFERS[point.transfer] + (", selected" if point == selected else ", best point of its own rule")
-        ax.set_title(title, loc="left")
-        for spine in ax.spines.values():
-            spine.set_visible(False)
-    axes[-1].set_xticks(range(len(betas)), [f"{b:g}" for b in betas])
+        ax.axhspan(best - 0.01, best, color="#DDDDDD", linewidth=0, zorder=0)
+        for gamma in gammas:
+            xs = [i for i, b in enumerate(betas) if (b, gamma) in grid]
+            ys = [grid[(betas[i], gamma)] for i in xs]
+            clipped = [(x, y) for x, y in zip(xs, ys) if y < low]
+            style = dict(color="#777777", linestyle="--") if gamma == 0 else dict(color=shades[gamma], linestyle="-")
+            ax.plot(xs, ys, marker="o", markersize=2, linewidth=1.0, **style)
+            if clipped:
+                # The curve without hysteresis leaves the axis, and its last value is written at the border
+                x, y = clipped[-1]
+                ax.annotate(f"{y:.2f}", (x, low), xytext=(0, 3), textcoords="offset points", ha="center",
+                            fontsize=5.5, color="#555555")
+        star = next(i for i, b in enumerate(betas) if close(b, point.beta))
+        ax.plot([star], [grid[(betas[star], point.gamma)]], marker="o", markersize=7, markerfacecolor="none",
+                markeredgecolor="#D55E00", markeredgewidth=1.4, linestyle="none")
+        ax.set_ylim(low, best + 0.02)
+        ax.grid(axis="y", color="#EEEEEE", linewidth=0.6)
+        ax.set_title(TRANSFERS[point.transfer], loc="left", fontsize=7)
+    axes[-1].set_xticks(range(len(betas)), [f"{b:g}" for b in betas], rotation=90, fontsize=6)
     axes[-1].set_xlabel("$\\beta$")
-    bar = fig.colorbar(image, ax=axes, fraction=0.025, pad=0.015)
-    bar.set_label("mean validation mIoU")
-    bar.ax.tick_params(labelsize=6)
+    fig.supylabel("Mean validation mIoU", fontsize=7, x=0.02)
+    handles = [Line2D([], [], color="#777777", linestyle="--", label="$\\gamma=0$")]
+    handles += [Line2D([], [], color=shades[g], label=f"$\\gamma={g:g}$") for g in gammas if g > 0]
+    handles += [Patch(color="#DDDDDD", label="Within 0.01 of the best"),
+                Line2D([], [], marker="o", markersize=6, markerfacecolor="none", markeredgecolor="#D55E00",
+                       linestyle="none", label="Chosen by the rule")]
+    fig.legend(handles=handles, loc="lower center", bbox_to_anchor=(0.5, 0.0), ncol=4, fontsize=6,
+               handlelength=1.4, columnspacing=0.8)
+    fig.tight_layout(rect=(0.02, 0.07, 1, 1))
     save(fig, path)
 
 
@@ -175,69 +179,46 @@ def score_bars(path_csv, path):
 def mask_2d_3d(path_csv, path):
     """ Pixel IoU of YOLO against the annotation masks in 2D against the 3D IoU that lifting reaches from it """
     import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
 
-    rows = mask_rows(path_csv)
-    fig, ax = plt.subplots(figsize=(3.4, 3.1))
+    rows = [row for row in mask_rows(path_csv) if row["yolo3d"] is not None]
+    fig, ax = plt.subplots(figsize=(3.4, 3.0))
     ax.plot([0, 1], [0, 1], color="#999999", linestyle="--", linewidth=0.7)
-    for row in rows:
-        if row["yolo3d"] is None:
-            continue
-        ax.scatter(row["iou2d"], row["yolo3d"], s=16, marker=DATASET_MARKERS[row["dataset"]],
-                   facecolor=CLASS_COLORS.get(row["name"], "#777777"), edgecolor="white", linewidth=0.4, alpha=0.9)
+    for colour, dataset in zip(("C0", "C1"), DATASETS):
+        points = [(row["iou2d"], row["yolo3d"]) for row in rows if row["dataset"] == dataset]
+        if points:
+            ax.scatter(*zip(*points), s=12, marker=DATASET_MARKERS[dataset], color=colour, label=DATASETS[dataset])
     ax.set_xlim(0, 1)
     ax.set_ylim(0, 1)
     ax.set_aspect("equal")
-    ax.set_xlabel("2D IoU of the YOLO masks, pixels")
-    ax.set_ylabel("3D IoU with YOLO masks, vertices")
-    names = [name for name in CLASS_ORDER if any(row["name"] == name for row in rows)]
-    handles = [Line2D([], [], marker="s", linestyle="", color=CLASS_COLORS[name], label=name) for name in names]
-    handles += [Line2D([], [], marker=DATASET_MARKERS[d], linestyle="", color="#555555", label=DATASETS[d])
-                for d in DATASETS]
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.17), ncol=5, fontsize=6,
-              handletextpad=0.2, columnspacing=0.8)
+    ax.set_xlabel("2D IoU of the YOLO masks")
+    ax.set_ylabel("3D IoU")
+    ax.legend(loc="lower right", fontsize=6.5)
     save(fig, path)
 
 
 def class_gaps(view, selected, path):
     """ For every class, the IoU with YOLO masks, with annotation-derived masks and of the reference """
     import matplotlib.pyplot as plt
-    from matplotlib.lines import Line2D
 
     summary = class_summary(view, selected)
     keys = ordered_classes(summary)
-    fig, ax = plt.subplots(figsize=(3.4, 3.3))
-    labels, y, positions = [], 0.0, []
-    previous = None
-    for key in keys:
-        if previous is not None and key[0] != previous:
-            y += 0.8
-        previous = key[0]
-        positions.append(y)
-        labels.append(key[1])
-        item = summary[key]
-        values = [item.get("yolo:iou"), item["gt2d:iou"], item["reference"]]
-        ax.plot([min(values), max(values)], [y, y], color="#BBBBBB", linewidth=1.0, zorder=1)
-        for source, value in zip(("yolo", "gt2d", "reference"), values):
-            s = SOURCE_STYLE[source]
-            ax.scatter(value, y, marker=s["marker"], color=s["color"], s=18 if source != "reference" else 14, zorder=2)
-        y += 1.0
-    ax.set_yticks(positions, labels)
-    ax.invert_yaxis()
-    ax.set_xlim(0, 1.0)
-    ax.set_xlabel("IoU at the selected point")
-    # Dataset names beside their groups
-    for dataset in DATASETS:
-        rows = [p for p, key in zip(positions, keys) if key[0] == dataset]
-        if rows:
-            ax.text(-0.26, statistics.mean(rows), DATASETS[dataset], transform=ax.get_yaxis_transform(),
-                    rotation=90, ha="center", va="center", fontsize=7)
-    handles = [Line2D([], [], marker=SOURCE_STYLE[s]["marker"], linestyle="", color=SOURCE_STYLE[s]["color"],
-                      label=SOURCE_STYLE[s]["label"]) for s in ("yolo", "gt2d", "reference")]
-    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.45, -0.14), ncol=3, fontsize=6,
-              handletextpad=0.2, columnspacing=0.8)
-    ax.grid(axis="x", color="#EEEEEE", linewidth=0.6)
-    ax.set_axisbelow(True)
+    datasets = [d for d in DATASETS if any(key[0] == d for key in keys)]
+    fig, axes = plt.subplots(len(datasets), 1, figsize=(3.4, 1.35 * len(datasets) + 0.35), sharey=True)
+    axes = list(axes) if len(datasets) > 1 else [axes]
+    sources = (("yolo:iou", "C1", "YOLO"), ("gt2d:iou", "C0", "Annotation"), ("reference", "0.55", "Reference"))
+    width = 0.26
+    for ax, dataset in zip(axes, datasets):
+        names = [key[1] for key in keys if key[0] == dataset]
+        for offset, (field, colour, label) in zip((-width, 0.0, width), sources):
+            values = [summary[(dataset, name)].get(field) or 0.0 for name in names]
+            ax.bar([i + offset for i in range(len(names))], values, width=width, color=colour, label=label)
+        ax.set_xticks(range(len(names)), names)
+        ax.set_ylim(0, 1)
+        ax.set_ylabel("IoU")
+        ax.set_title(DATASETS[dataset], loc="left", fontsize=7)
+        ax.tick_params(axis="x", length=0)
+    axes[0].legend(loc="lower center", bbox_to_anchor=(0.5, 1.12), ncol=3, fontsize=6.5)
+    fig.tight_layout()
     save(fig, path)
 
 
@@ -258,7 +239,7 @@ def thresholds(view, selected, baseline, path):
         return sorted((beta, statistics.mean(v)) for beta, v in values.items())
 
     fig, axes = plt.subplots(1, 2, figsize=(3.6, 1.9), sharey=True)
-    panels = ((axes[0], selected, "evidence fraction $\\rho$"), (axes[1], baseline, "evidence per view"))
+    panels = ((axes[0], selected, "Evidence fraction $\\rho$"), (axes[1], baseline, "Evidence per view"))
     for ax, point, label in panels:
         for gamma, style in ((point.gamma, "-"), (0.0, "--")):
             points = line(point, gamma)
@@ -273,9 +254,9 @@ def thresholds(view, selected, baseline, path):
         ax.set_xlabel(label, fontsize=7)
         ax.set_ylim(0, 1)
         ax.grid(axis="y", color="#EEEEEE", linewidth=0.6)
-    axes[0].set_ylabel("mean mIoU, validation")
-    handles = [Line2D([], [], color="#444444", linestyle="-", label="with hysteresis"),
-               Line2D([], [], color="#444444", linestyle="--", label="without hysteresis")]
+    axes[0].set_ylabel("Mean mIoU, validation")
+    handles = [Line2D([], [], color="#444444", linestyle="-", label="With hysteresis"),
+               Line2D([], [], color="#444444", linestyle="--", label="Without hysteresis")]
     fig.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, 0.0), ncol=2, fontsize=6)
     fig.tight_layout()
     save(fig, path)
@@ -291,8 +272,8 @@ def overview(renders, path):
 
     manifest = json.loads((renders / "manifest.json").read_text(encoding="utf-8"))
     info = next(item for item in manifest["views"] if item["name"] == "overview")
-    titles = {"photo": "photograph", "masks": "YOLO masks of this view",
-              "fraction": f"evidence fraction of the {info['fraction_class']}", "labels": "labelled Gaussians"}
+    titles = {"photo": "Photograph", "masks": "YOLO masks of this view",
+              "fraction": f"Evidence fraction of the {info['fraction_class']}", "labels": "Labelled Gaussians"}
     fig, axes = plt.subplots(1, 4, figsize=(7.0, 1.55))
     for ax, (key, title) in zip(axes, titles.items()):
         ax.imshow(mpimg.imread(renders / f"overview_{key}.png"), interpolation="none")
@@ -326,7 +307,7 @@ def qualitative(renders, path, views=QUALITATIVE_VIEWS):
     views = [v for v in views if v in candidates]
     if not views:
         return
-    columns = (("photo", "photograph"), ("agreement_gt2d", "annotation masks"), ("agreement_yolo", "YOLO masks"))
+    columns = (("photo", "Photograph"), ("agreement_gt2d", "Annotation masks"), ("agreement_yolo", "YOLO masks"))
     fig, axes = plt.subplots(len(views), 3, figsize=(7.0, 1.62 * len(views) + 0.2), squeeze=False)
     for row, (scene, camera) in zip(axes, views):
         info = candidates[(scene, camera)]
@@ -334,12 +315,12 @@ def qualitative(renders, path, views=QUALITATIVE_VIEWS):
             ax.imshow(mpimg.imread(renders / "candidates" / f"{scene}_{camera}_{key}.png"), interpolation="none")
             ax.set_axis_off()
             if key == "photo":
-                title = f"scene {scene}"
+                title = f"Scene {scene}"
             else:
                 title = f"{title}, mIoU {info['miou'][key.split('_')[1]]:.2f}"
             ax.set_title(title, fontsize=7, pad=3)
     colours = {"both": "#2CA02C", "prediction": "#D62728", "reference": "#1F77B4"}
-    labels = {"both": "prediction and reference", "prediction": "only the prediction", "reference": "only the reference"}
+    labels = {"both": "Prediction and reference", "prediction": "Only the prediction", "reference": "Only the reference"}
     fig.legend(handles=[Patch(color=colours[k], label=labels[k]) for k in colours], loc="lower center",
                bbox_to_anchor=(0.5, 0.0), ncol=3, fontsize=6.5)
     fig.subplots_adjust(wspace=0.03, hspace=0.14, left=0.005, right=0.995, top=0.95,
@@ -366,7 +347,7 @@ def development(view, development_selection, path):
 
     fig, axes = plt.subplots(1, 2, figsize=(6.0, 2.2), sharey=True)
     colors = {"replica": "#0072B2", "scannetpp": "#D55E00"}
-    for ax, (phase, label) in zip(axes, (("tau", "transfer radius $\\tau$ (m)"), ("theta", "minimum vote fraction $\\theta$"))):
+    for ax, (phase, label) in zip(axes, (("tau", "Transfer radius $\\tau$ (m)"), ("theta", "Minimum vote fraction $\\theta$"))):
         for dataset, points in phases[phase].items():
             points.sort()
             xs = [p[0] for p in points]
@@ -378,8 +359,8 @@ def development(view, development_selection, path):
         ax.grid(axis="y", color="#EEEEEE", linewidth=0.6)
     axes[0].set_ylabel("mIoU, development scenes")
     handles = [Line2D([], [], color=colors[d], label=DATASETS[d]) for d in colors]
-    handles += [Line2D([], [], color="#444444", linestyle="-", label="prediction"),
-                Line2D([], [], color="#444444", linestyle="--", label="reference")]
+    handles += [Line2D([], [], color="#444444", linestyle="-", label="Prediction"),
+                Line2D([], [], color="#444444", linestyle="--", label="Reference")]
     axes[1].legend(handles=handles, loc="lower left", fontsize=6)
     save(fig, path)
 

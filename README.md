@@ -1,615 +1,162 @@
-# 3D Gaussian Splatting for Real-Time Radiance Field Rendering
-Bernhard Kerbl*, Georgios Kopanas*, Thomas Leimkühler, George Drettakis (* indicates equal contribution)<br>
-| [Webpage](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/) | [Full Paper](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/3d_gaussian_splatting_high.pdf) | [Video](https://youtu.be/T_kXY43VZnk) | [Other GRAPHDECO Publications](http://www-sop.inria.fr/reves/publis/gdindex.php) | [FUNGRAPH project page](https://fungraph.inria.fr) |<br>
-| [T&T+DB COLMAP (650MB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip) | [Pre-trained Models (14 GB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip) | [Viewers for Windows (60MB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/binaries/viewers.zip) | [Evaluation Images (7 GB)](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/evaluation/images.zip) |<br>
-![Teaser image](assets/teaser.png)
+# Post-Training Semantic Lifting for 3D Gaussian Splatting
 
-This repository contains the official authors implementation associated with the paper "3D Gaussian Splatting for Real-Time Radiance Field Rendering", which can be found [here](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/). We further provide the reference images used to create the error metrics reported in the paper, as well as recently created, pre-trained models. 
+This repository labels with semantic classes the Gaussians of a 3D Gaussian Splatting model that is already trained, and it also contains the protocol that evaluates the result. The method takes the model, its calibrated cameras and one 2D mask per view. Then, it accumulates on every Gaussian the evidence of belonging to the class and the evidence of not belonging to it, and keeps the Gaussians where the first one is a large enough fraction of the total.
 
-<a href="https://www.inria.fr/"><img height="100" src="assets/logo_inria.png"> </a>
-<a href="https://univ-cotedazur.eu/"><img height="100" src="assets/logo_uca.png"> </a>
-<a href="https://www.mpi-inf.mpg.de"><img height="100" src="assets/logo_mpi.png"> </a> 
-<a href="https://team.inria.fr/graphdeco/"> <img style="width:100%;" src="assets/logo_graphdeco.png"></a>
+On ten held-out ScanNet++ scenes, the method reaches a mean mIoU of 0.80, with a 95% interval from 0.77 to 0.83, when the 2D masks come from the annotation of the dataset, and 0.54 with the masks of a YOLO detector. The operating point was chosen on seven synthetic Replica scenes and applied to these real scans without retuning anything. Compared with thresholding the evidence per view, as an earlier version of the method did, the fraction improves the test mIoU by 0.24 and is better in all ten scenes.
 
-Abstract: *Radiance Field methods have recently revolutionized novel-view synthesis of scenes captured with multiple photos or videos. However, achieving high visual quality still requires neural networks that are costly to train and render, while recent faster methods inevitably trade off speed for quality. For unbounded and complete scenes (rather than isolated objects) and 1080p resolution rendering, no current method can achieve real-time display rates. We introduce three key elements that allow us to achieve state-of-the-art visual quality while maintaining competitive training times and importantly allow high-quality real-time (≥ 30 fps) novel-view synthesis at 1080p resolution. First, starting from sparse points produced during camera calibration, we represent the scene with 3D Gaussians that preserve desirable properties of continuous volumetric radiance fields for scene optimization while avoiding unnecessary computation in empty space; Second, we perform interleaved optimization/density control of the 3D Gaussians, notably optimizing anisotropic covariance to achieve an accurate representation of the scene; Third, we develop a fast visibility-aware rendering algorithm that supports anisotropic splatting and both accelerates training and allows realtime rendering. We demonstrate state-of-the-art visual quality and real-time rendering on several established datasets.*
+The Gaussian representation, the training code and the CUDA rasteriser come from the [official Inria implementation](https://github.com/graphdeco-inria/gaussian-splatting). The lifting, the evidence formulation, the hysteresis, the transfer to the mesh and the whole evaluation are my own work, and they live in `segmentation/`, `evaluation/`, `containers/` and `picasso/`. This project is my Bachelor's Thesis at the Universidad de Málaga, supervised by Ezequiel López Rubio and Jorge García González, and it comes with a preprint that gives the full details.
 
-<section class="section" id="BibTeX">
-  <div class="container is-max-desktop content">
-    <h2 class="title">BibTeX</h2>
-    <pre><code>@Article{kerbl3Dgaussians,
-      author       = {Kerbl, Bernhard and Kopanas, Georgios and Leimk{\"u}hler, Thomas and Drettakis, George},
-      title        = {3D Gaussian Splatting for Real-Time Radiance Field Rendering},
-      journal      = {ACM Transactions on Graphics},
-      number       = {4},
-      volume       = {42},
-      month        = {July},
-      year         = {2023},
-      url          = {https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/}
-}</code></pre>
-  </div>
-</section>
+<p align="center">
+  <img src="assets/readme/overview.png" width="100%">
+</p>
+<p align="center"><em>One view of the ScanNet++ test scene 21d970d8de. The fraction of the chair and the labels come from the YOLO masks of all the views, so the tables are labelled although YOLO does not find them in this one.</em></p>
 
+## How the lifting works
 
+<p align="center">
+  <img src="assets/readme/pipeline.png" width="62%">
+</p>
 
-## Funding and Acknowledgments
+The method works with one class at a time. Every view gives a label map and a confidence per pixel, either from the detector or from the annotation of the dataset. Both sources are written in the same format, so the rest of the pipeline does not know where the masks come from. The detector is `yolo26x-seg`, and each pixel keeps the confidence of its own detection.
 
-This research was funded by the ERC Advanced grant FUNGRAPH No 788065. The authors are grateful to Adobe for generous donations, the OPAL infrastructure from Université Côte d’Azur and for the HPC resources from GENCI–IDRIS (Grant 2022-AD011013409). The authors thank the anonymous reviewers for their valuable feedback, P. Hedman and A. Tewari for proofreading earlier drafts also T. Müller, A. Yu and S. Fridovich-Keil for helping with the comparisons.
+Each Gaussian is projected into every camera and composited in depth order, as the renderer does. In this way, a Gaussian gets a visibility weight on each pixel it reaches, and a Gaussian hidden behind others gets almost nothing from that view. With this weight, two quantities are accumulated in the same pass: the target evidence E⁺, from the pixels of the class, and the non-target evidence E⁻, from the rest. Both see the same occlusions, so the only thing that separates them is the mask.
 
-## NEW FEATURES !
+The decision uses the fraction ρ = E⁺ / (E⁺ + E⁻). A Gaussian becomes a seed when ρ ≥ β, and a Gaussian with ρ ≥ γβ also takes the class when it is connected to a seed through Gaussians closer than η. This is the hysteresis of the Canny edge detector, but on the graph of Gaussian centres instead of on the image. A high β keeps only the clearest Gaussians as seeds, and the hysteresis recovers the rest of the object without the noise around it.
 
-We have limited resources for maintaining and updating the code. However, we have added a few new features since the original release that are inspired by some of the excellent work many other researchers have been doing on 3DGS. We will be adding other features within the ability of our resources.
+<p align="center">
+  <img src="assets/readme/hysteresis.png" width="78%">
+</p>
 
-**Update of October 2024**: We integrated [training speed acceleration](#training-speed-acceleration) and made it compatible with [depth regularization](#depth-regularization), [anti-aliasing](#anti-aliasing) and [exposure compensation](#exposure-compensation). We have enhanced the SIBR real time viewer by correcting bugs and adding features in the [Top View](#sibr-top-view) that allows visualization of input and user cameras.
+The visibility weights come from a tile rasteriser written in PyTorch, which follows the CUDA one of 3DGS. It differs from it in the culling and in the compositing loop, and the preprint explains both changes.
 
-**Update of Spring 2024**:
-Orange Labs has kindly added [OpenXR support](#openxr-support) for VR viewing. 
+## Why a fraction
 
-## Step-by-step Tutorial
+The first versions of the method thresholded the target evidence itself, first against β times the number of cameras and then against β times the number of views that contain the class. With both of them, choosing β was very difficult, because the best value changed from one class to another. The evidence grows with the size of the object in the image, with its distance and with the occlusions, so a sofa and a clock need different thresholds. In addition, a background Gaussian that many views see collects target evidence at the borders of the masks. The fraction compares the target evidence with all the evidence that reached the Gaussian, so these factors cancel.
 
-Jonathan Stephens made a fantastic step-by-step tutorial for setting up Gaussian Splatting on your machine, along with instructions for creating usable datasets from videos. If the instructions below are too dry for you, go ahead and check it out [here](https://www.youtube.com/watch?v=UXtuigy_wYc).
+To check it, the version with the evidence per view runs as a baseline with exactly the same protocol: the same votes, the same hysteresis, the same transfer and the same selection rule, over its own grid of thresholds.
 
-## Colab
+<p align="center">
+  <img src="assets/readme/thresholds.png" width="62%">
+</p>
+<p align="center"><em>Mean validation mIoU along the threshold grid of each score, with the annotation masks. The dotted line is the selected threshold.</em></p>
 
-User [camenduru](https://github.com/camenduru) was kind enough to provide a Colab template that uses this repo's source (status: August 2023!) for quick and easy access to the method. Please check it out [here](https://github.com/camenduru/gaussian-splatting-colab).
+With hysteresis, the fraction gives almost the same result along its whole grid, while the evidence per view has a narrow peak and goes from 0.34 to 0.64. On the test scenes, the fraction is better by 0.24 mIoU with the annotation masks, with a bootstrap interval from 0.20 to 0.28, and by 0.12 with YOLO masks, from 0.06 to 0.17.
 
-## Cloning the Repository
+## Evaluation
 
-The repository contains submodules, thus please check it out with 
-```shell
-# SSH
-git clone git@github.com:graphdeco-inria/gaussian-splatting.git --recursive
-```
-or
-```shell
-# HTTPS
-git clone https://github.com/graphdeco-inria/gaussian-splatting --recursive
-```
+The ground truth is an annotated mesh, since two trainings of the same scene do not give the same Gaussians. For this reason, the labelled Gaussians are transferred to the mesh, and each vertex takes the label of the closest Gaussian centre within τ = 0.10 m. Only the vertices that are annotated and seen by some camera are scored.
 
-## Overview
+The annotation of the mesh also goes through the Gaussians and back to the mesh with the same operator. That is, this reference already contains what the representation loses, and comparing the method with it separates three sources of error:
 
-The codebase has 4 main components:
-- A PyTorch-based optimizer to produce a 3D Gaussian model from SfM inputs
-- A network viewer that allows to connect to and visualize the optimization process
-- An OpenGL-based real-time viewer to render trained models in real-time.
-- A script to help you turn your own images into optimization-ready SfM data sets
-
-The components have different requirements w.r.t. both hardware and software. They have been tested on Windows 10 and Ubuntu Linux 22.04. Instructions for setting up and running each of them are found in the sections below.
-
-
-
-
-## Optimizer
-
-The optimizer uses PyTorch and CUDA extensions in a Python environment to produce trained models. 
-
-### Hardware Requirements
-
-- CUDA-ready GPU with Compute Capability 7.0+
-- 24 GB VRAM (to train to paper evaluation quality)
-- Please see FAQ for smaller VRAM configurations
-
-### Software Requirements
-- Conda (recommended for easy setup)
-- C++ Compiler for PyTorch extensions (we used Visual Studio 2019 for Windows)
-- CUDA SDK 11 for PyTorch extensions, install *after* Visual Studio (we used 11.8, **known issues with 11.6**)
-- C++ Compiler and CUDA SDK must be compatible
-
-### Setup
-
-#### Local Setup
-
-Our default, provided install method is based on Conda package and environment management:
-```shell
-SET DISTUTILS_USE_SDK=1 # Windows only
-conda env create --file environment.yml
-conda activate gaussian_splatting
-```
-Please note that this process assumes that you have CUDA SDK **11** installed, not **12**. For modifications, see below.
-
-Tip: Downloading packages and creating a new environment with Conda can require a significant amount of disk space. By default, Conda will use the main system hard drive. You can avoid this by specifying a different package download location and an environment on a different drive:
-
-```shell
-conda config --add pkgs_dirs <Drive>/<pkg_path>
-conda env create --file environment.yml --prefix <Drive>/<env_path>/gaussian_splatting
-conda activate <Drive>/<env_path>/gaussian_splatting
-```
-
-#### Modifications
-
-If you can afford the disk space, we recommend using our environment files for setting up a training environment identical to ours. If you want to make modifications, please note that major version changes might affect the results of our method. However, our (limited) experiments suggest that the codebase works just fine inside a more up-to-date environment (Python 3.8, PyTorch 2.0.0, CUDA 12). Make sure to create an environment where PyTorch and its CUDA runtime version match and the installed CUDA SDK has no major version difference with PyTorch's CUDA version.
-
-#### Known Issues
-
-Some users experience problems building the submodules on Windows (```cl.exe: File not found``` or similar). Please consider the workaround for this problem from the FAQ.
-
-### Running
-
-To run the optimizer, simply use
-
-```shell
-python train.py -s <path to COLMAP or NeRF Synthetic dataset>
-```
-
-<details>
-<summary><span style="font-weight: bold;">Command Line Arguments for train.py</span></summary>
-
-  #### --source_path / -s
-  Path to the source directory containing a COLMAP or Synthetic NeRF data set.
-  #### --model_path / -m 
-  Path where the trained model should be stored (```output/<random>``` by default).
-  #### --images / -i
-  Alternative subdirectory for COLMAP images (```images``` by default).
-  #### --eval
-  Add this flag to use a MipNeRF360-style training/test split for evaluation.
-  #### --resolution / -r
-  Specifies resolution of the loaded images before training. If provided ```1, 2, 4``` or ```8```, uses original, 1/2, 1/4 or 1/8 resolution, respectively. For all other values, rescales the width to the given number while maintaining image aspect. **If not set and input image width exceeds 1.6K pixels, inputs are automatically rescaled to this target.**
-  #### --data_device
-  Specifies where to put the source image data, ```cuda``` by default, recommended to use ```cpu``` if training on large/high-resolution dataset, will reduce VRAM consumption, but slightly slow down training. Thanks to [HrsPythonix](https://github.com/HrsPythonix).
-  #### --white_background / -w
-  Add this flag to use white background instead of black (default), e.g., for evaluation of NeRF Synthetic dataset.
-  #### --sh_degree
-  Order of spherical harmonics to be used (no larger than 3). ```3``` by default.
-  #### --convert_SHs_python
-  Flag to make pipeline compute forward and backward of SHs with PyTorch instead of ours.
-  #### --convert_cov3D_python
-  Flag to make pipeline compute forward and backward of the 3D covariance with PyTorch instead of ours.
-  #### --debug
-  Enables debug mode if you experience erros. If the rasterizer fails, a ```dump``` file is created that you may forward to us in an issue so we can take a look.
-  #### --debug_from
-  Debugging is **slow**. You may specify an iteration (starting from 0) after which the above debugging becomes active.
-  #### --iterations
-  Number of total iterations to train for, ```30_000``` by default.
-  #### --ip
-  IP to start GUI server on, ```127.0.0.1``` by default.
-  #### --port 
-  Port to use for GUI server, ```6009``` by default.
-  #### --test_iterations
-  Space-separated iterations at which the training script computes L1 and PSNR over test set, ```7000 30000``` by default.
-  #### --save_iterations
-  Space-separated iterations at which the training script saves the Gaussian model, ```7000 30000 <iterations>``` by default.
-  #### --checkpoint_iterations
-  Space-separated iterations at which to store a checkpoint for continuing later, saved in the model directory.
-  #### --start_checkpoint
-  Path to a saved checkpoint to continue training from.
-  #### --quiet 
-  Flag to omit any text written to standard out pipe. 
-  #### --feature_lr
-  Spherical harmonics features learning rate, ```0.0025``` by default.
-  #### --opacity_lr
-  Opacity learning rate, ```0.05``` by default.
-  #### --scaling_lr
-  Scaling learning rate, ```0.005``` by default.
-  #### --rotation_lr
-  Rotation learning rate, ```0.001``` by default.
-  #### --position_lr_max_steps
-  Number of steps (from 0) where position learning rate goes from ```initial``` to ```final```. ```30_000``` by default.
-  #### --position_lr_init
-  Initial 3D position learning rate, ```0.00016``` by default.
-  #### --position_lr_final
-  Final 3D position learning rate, ```0.0000016``` by default.
-  #### --position_lr_delay_mult
-  Position learning rate multiplier (cf. Plenoxels), ```0.01``` by default. 
-  #### --densify_from_iter
-  Iteration where densification starts, ```500``` by default. 
-  #### --densify_until_iter
-  Iteration where densification stops, ```15_000``` by default.
-  #### --densify_grad_threshold
-  Limit that decides if points should be densified based on 2D position gradient, ```0.0002``` by default.
-  #### --densification_interval
-  How frequently to densify, ```100``` (every 100 iterations) by default.
-  #### --opacity_reset_interval
-  How frequently to reset opacity, ```3_000``` by default. 
-  #### --lambda_dssim
-  Influence of SSIM on total loss from 0 to 1, ```0.2``` by default. 
-  #### --percent_dense
-  Percentage of scene extent (0--1) a point must exceed to be forcibly densified, ```0.01``` by default.
-
-</details>
-<br>
-
-Note that similar to MipNeRF360, we target images at resolutions in the 1-1.6K pixel range. For convenience, arbitrary-size inputs can be passed and will be automatically resized if their width exceeds 1600 pixels. We recommend to keep this behavior, but you may force training to use your higher-resolution images by setting ```-r 1```.
-
-The MipNeRF360 scenes are hosted by the paper authors [here](https://jonbarron.info/mipnerf360/). You can find our SfM data sets for Tanks&Temples and Deep Blending [here](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/input/tandt_db.zip). If you do not provide an output model directory (```-m```), trained models are written to folders with randomized unique names inside the ```output``` directory. At this point, the trained models may be viewed with the real-time viewer (see further below).
-
-### Evaluation
-By default, the trained models use all available images in the dataset. To train them while withholding a test set for evaluation, use the ```--eval``` flag. This way, you can render training/test sets and produce error metrics as follows:
-```shell
-python train.py -s <path to COLMAP or NeRF Synthetic dataset> --eval # Train with train/test split
-python render.py -m <path to trained model> # Generate renderings
-python metrics.py -m <path to trained model> # Compute error metrics on renderings
-```
-
-If you want to evaluate our [pre-trained models](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/datasets/pretrained/models.zip), you will have to download the corresponding source data sets and indicate their location to ```render.py``` with an additional ```--source_path/-s``` flag. Note: The pre-trained models were created with the release codebase. This code base has been cleaned up and includes bugfixes, hence the metrics you get from evaluating them will differ from those in the paper.
-```shell
-python render.py -m <path to pre-trained model> -s <path to COLMAP dataset>
-python metrics.py -m <path to pre-trained model>
-```
-
-<details>
-<summary><span style="font-weight: bold;">Command Line Arguments for render.py</span></summary>
-
-  #### --model_path / -m 
-  Path to the trained model directory you want to create renderings for.
-  #### --skip_train
-  Flag to skip rendering the training set.
-  #### --skip_test
-  Flag to skip rendering the test set.
-  #### --quiet 
-  Flag to omit any text written to standard out pipe. 
-
-  **The below parameters will be read automatically from the model path, based on what was used for training. However, you may override them by providing them explicitly on the command line.** 
-
-  #### --source_path / -s
-  Path to the source directory containing a COLMAP or Synthetic NeRF data set.
-  #### --images / -i
-  Alternative subdirectory for COLMAP images (```images``` by default).
-  #### --eval
-  Add this flag to use a MipNeRF360-style training/test split for evaluation.
-  #### --resolution / -r
-  Changes the resolution of the loaded images before training. If provided ```1, 2, 4``` or ```8```, uses original, 1/2, 1/4 or 1/8 resolution, respectively. For all other values, rescales the width to the given number while maintaining image aspect. ```1``` by default.
-  #### --white_background / -w
-  Add this flag to use white background instead of black (default), e.g., for evaluation of NeRF Synthetic dataset.
-  #### --convert_SHs_python
-  Flag to make pipeline render with computed SHs from PyTorch instead of ours.
-  #### --convert_cov3D_python
-  Flag to make pipeline render with computed 3D covariance from PyTorch instead of ours.
-
-</details>
-
-<details>
-<summary><span style="font-weight: bold;">Command Line Arguments for metrics.py</span></summary>
-
-  #### --model_paths / -m 
-  Space-separated list of model paths for which metrics should be computed.
-</details>
-<br>
-
-We further provide the ```full_eval.py``` script. This script specifies the routine used in our evaluation and demonstrates the use of some additional parameters, e.g., ```--images (-i)``` to define alternative image directories within COLMAP data sets. If you have downloaded and extracted all the training data, you can run it like this:
-```shell
-python full_eval.py -m360 <mipnerf360 folder> -tat <tanks and temples folder> -db <deep blending folder>
-```
-In the current version, this process takes about 7h on our reference machine containing an A6000. If you want to do the full evaluation on our pre-trained models, you can specify their download location and skip training. 
-```shell
-python full_eval.py -o <directory with pretrained models> --skip_training -m360 <mipnerf360 folder> -tat <tanks and temples folder> -db <deep blending folder>
-```
-
-If you want to compute the metrics on our paper's [evaluation images](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/evaluation/images.zip), you can also skip rendering. In this case it is not necessary to provide the source datasets. You can compute metrics for multiple image sets at a time. 
-```shell
-python full_eval.py -m <directory with evaluation images>/garden ... --skip_training --skip_rendering
-```
-
-<details>
-<summary><span style="font-weight: bold;">Command Line Arguments for full_eval.py</span></summary>
-  
-  #### --skip_training
-  Flag to skip training stage.
-  #### --skip_rendering
-  Flag to skip rendering stage.
-  #### --skip_metrics
-  Flag to skip metrics calculation stage.
-  #### --output_path
-  Directory to put renderings and results in, ```./eval``` by default, set to pre-trained model location if evaluating them.
-  #### --mipnerf360 / -m360
-  Path to MipNeRF360 source datasets, required if training or rendering.
-  #### --tanksandtemples / -tat
-  Path to Tanks&Temples source datasets, required if training or rendering.
-  #### --deepblending / -db
-  Path to Deep Blending source datasets, required if training or rendering.
-</details>
-<br>
-
-## Interactive Viewers
-We provide two interactive viewers for our method: remote and real-time. Our viewing solutions are based on the [SIBR](https://sibr.gitlabpages.inria.fr/) framework, developed by the GRAPHDECO group for several novel-view synthesis projects.
-
-### Hardware Requirements
-- OpenGL 4.5-ready GPU and drivers (or latest MESA software)
-- 4 GB VRAM recommended
-- CUDA-ready GPU with Compute Capability 7.0+ (only for Real-Time Viewer)
-
-### Software Requirements
-- Visual Studio or g++, **not Clang** (we used Visual Studio 2019 for Windows)
-- CUDA SDK 11, install *after* Visual Studio (we used 11.8)
-- CMake (recent version, we used 3.24)
-- 7zip (only on Windows)
-
-### Pre-built Windows Binaries
-We provide pre-built binaries for Windows [here](https://repo-sam.inria.fr/fungraph/3d-gaussian-splatting/binaries/viewers.zip). We recommend using them on Windows for an efficient setup, since the building of SIBR involves several external dependencies that must be downloaded and compiled on-the-fly.
-
-### Installation from Source
-If you cloned with submodules (e.g., using ```--recursive```), the source code for the viewers is found in ```SIBR_viewers```. The network viewer runs within the SIBR framework for Image-based Rendering applications.
-
-#### Windows
-CMake should take care of your dependencies.
-```shell
-cd SIBR_viewers
-cmake -Bbuild .
-cmake --build build --target install --config RelWithDebInfo
-```
-You may specify a different configuration, e.g. ```Debug``` if you need more control during development.
-
-#### Ubuntu 22.04
-You will need to install a few dependencies before running the project setup.
-```shell
-# Dependencies
-sudo apt install -y libglew-dev libassimp-dev libboost-all-dev libgtk-3-dev libopencv-dev libglfw3-dev libavdevice-dev libavcodec-dev libeigen3-dev libxxf86vm-dev libembree-dev
-# Project setup
-cd SIBR_viewers
-cmake -Bbuild . -DCMAKE_BUILD_TYPE=Release # add -G Ninja to build faster
-cmake --build build -j24 --target install
-``` 
-
-#### Ubuntu 20.04
-Backwards compatibility with Focal Fossa is not fully tested, but building SIBR with CMake should still work after invoking
-```shell
-git checkout fossa_compatibility
-```
-
-### Navigation in SIBR Viewers
-The SIBR interface provides several methods of navigating the scene. By default, you will be started with an FPS navigator, which you can control with ```W, A, S, D, Q, E``` for camera translation and ```I, K, J, L, U, O``` for rotation. Alternatively, you may want to use a Trackball-style navigator (select from the floating menu). You can also snap to a camera from the data set with the ```Snap to``` button or find the closest camera with ```Snap to closest```. The floating menues also allow you to change the navigation speed. You can use the ```Scaling Modifier``` to control the size of the displayed Gaussians, or show the initial point cloud.
-
-### Running the Network Viewer
-
-
-
-https://github.com/graphdeco-inria/gaussian-splatting/assets/40643808/90a2e4d3-cf2e-4633-b35f-bfe284e28ff7
-
-
-
-After extracting or installing the viewers, you may run the compiled ```SIBR_remoteGaussian_app[_config]``` app in ```<SIBR install dir>/bin```, e.g.: 
-```shell
-./<SIBR install dir>/bin/SIBR_remoteGaussian_app
-```
-The network viewer allows you to connect to a running training process on the same or a different machine. If you are training on the same machine and OS, no command line parameters should be required: the optimizer communicates the location of the training data to the network viewer. By default, optimizer and network viewer will try to establish a connection on **localhost** on port **6009**. You can change this behavior by providing matching ```--ip``` and ```--port``` parameters to both the optimizer and the network viewer. If for some reason the path used by the optimizer to find the training data is not reachable by the network viewer (e.g., due to them running on different (virtual) machines), you may specify an override location to the viewer by using ```-s <source path>```. 
-
-<details>
-<summary><span style="font-weight: bold;">Primary Command Line Arguments for Network Viewer</span></summary>
-
-  #### --path / -s
-  Argument to override model's path to source dataset.
-  #### --ip
-  IP to use for connection to a running training script.
-  #### --port
-  Port to use for connection to a running training script. 
-  #### --rendering-size 
-  Takes two space separated numbers to define the resolution at which network rendering occurs, ```1200``` width by default.
-  Note that to enforce an aspect that differs from the input images, you need ```--force-aspect-ratio``` too.
-  #### --load_images
-  Flag to load source dataset images to be displayed in the top view for each camera.
-</details>
-<br>
-
-### Running the Real-Time Viewer
-
-
-
-
-https://github.com/graphdeco-inria/gaussian-splatting/assets/40643808/0940547f-1d82-4c2f-a616-44eabbf0f816
-
-
-
-
-After extracting or installing the viewers, you may run the compiled ```SIBR_gaussianViewer_app[_config]``` app in ```<SIBR install dir>/bin```, e.g.: 
-```shell
-./<SIBR install dir>/bin/SIBR_gaussianViewer_app -m <path to trained model>
-```
-
-It should suffice to provide the ```-m``` parameter pointing to a trained model directory. Alternatively, you can specify an override location for training input data using ```-s```. To use a specific resolution other than the auto-chosen one, specify ```--rendering-size <width> <height>```. Combine it with ```--force-aspect-ratio``` if you want the exact resolution and don't mind image distortion. 
-
-**To unlock the full frame rate, please disable V-Sync on your machine and also in the application (Menu &rarr; Display). In a multi-GPU system (e.g., laptop) your OpenGL/Display GPU should be the same as your CUDA GPU (e.g., by setting the application's GPU preference on Windows, see below) for maximum performance.**
-
-![Teaser image](assets/select.png)
-
-In addition to the initial point cloud and the splats, you also have the option to visualize the Gaussians by rendering them as ellipsoids from the floating menu.
-SIBR has many other functionalities, please see the [documentation](https://sibr.gitlabpages.inria.fr/) for more details on the viewer, navigation options etc. There is also a Top View (available from the menu) that shows the placement of the input cameras and the original SfM point cloud; please note that Top View slows rendering when enabled. The real-time viewer also uses slightly more aggressive, fast culling, which can be toggled in the floating menu. If you ever encounter an issue that can be solved by turning fast culling off, please let us know.
-
-<details>
-<summary><span style="font-weight: bold;">Primary Command Line Arguments for Real-Time Viewer</span></summary>
-
-  #### --model-path / -m
-  Path to trained model.
-  #### --iteration
-  Specifies which of state to load if multiple are available. Defaults to latest available iteration.
-  #### --path / -s
-  Argument to override model's path to source dataset.
-  #### --rendering-size 
-  Takes two space separated numbers to define the resolution at which real-time rendering occurs, ```1200``` width by default. Note that to enforce an aspect that differs from the input images, you need ```--force-aspect-ratio``` too.
-  #### --load_images
-  Flag to load source dataset images to be displayed in the top view for each camera.
-  #### --device
-  Index of CUDA device to use for rasterization if multiple are available, ```0``` by default.
-  #### --no_interop
-  Disables CUDA/GL interop forcibly. Use on systems that may not behave according to spec (e.g., WSL2 with MESA GL 4.5 software rendering).
-</details>
-<br>
-
-## Processing your own Scenes
-
-Our COLMAP loaders expect the following dataset structure in the source path location:
-
-```
-<location>
-|---images
-|   |---<image 0>
-|   |---<image 1>
-|   |---...
-|---sparse
-    |---0
-        |---cameras.bin
-        |---images.bin
-        |---points3D.bin
-```
-
-For rasterization, the camera models must be either a SIMPLE_PINHOLE or PINHOLE camera. We provide a converter script ```convert.py```, to extract undistorted images and SfM information from input images. Optionally, you can use ImageMagick to resize the undistorted images. This rescaling is similar to MipNeRF360, i.e., it creates images with 1/2, 1/4 and 1/8 the original resolution in corresponding folders. To use them, please first install a recent version of COLMAP (ideally CUDA-powered) and ImageMagick. Put the images you want to use in a directory ```<location>/input```.
-```
-<location>
-|---input
-    |---<image 0>
-    |---<image 1>
-    |---...
-```
- If you have COLMAP and ImageMagick on your system path, you can simply run 
-```shell
-python convert.py -s <location> [--resize] #If not resizing, ImageMagick is not needed
-```
-Alternatively, you can use the optional parameters ```--colmap_executable``` and ```--magick_executable``` to point to the respective paths. Please note that on Windows, the executable should point to the COLMAP ```.bat``` file that takes care of setting the execution environment. Once done, ```<location>``` will contain the expected COLMAP data set structure with undistorted, resized input images, in addition to your original images and some temporary (distorted) data in the directory ```distorted```.
-
-If you have your own COLMAP dataset without undistortion (e.g., using ```OPENCV``` camera), you can try to just run the last part of the script: Put the images in ```input``` and the COLMAP info in a subdirectory ```distorted```:
-```
-<location>
-|---input
-|   |---<image 0>
-|   |---<image 1>
-|   |---...
-|---distorted
-    |---database.db
-    |---sparse
-        |---0
-            |---...
-```
-Then run 
-```shell
-python convert.py -s <location> --skip_matching [--resize] #If not resizing, ImageMagick is not needed
-```
-
-<details>
-<summary><span style="font-weight: bold;">Command Line Arguments for convert.py</span></summary>
-
-  #### --no_gpu
-  Flag to avoid using GPU in COLMAP.
-  #### --skip_matching
-  Flag to indicate that COLMAP info is available for images.
-  #### --source_path / -s
-  Location of the inputs.
-  #### --camera 
-  Which camera model to use for the early matching steps, ```OPENCV``` by default.
-  #### --resize
-  Flag for creating resized versions of input images.
-  #### --colmap_executable
-  Path to the COLMAP executable (```.bat``` on Windows).
-  #### --magick_executable
-  Path to the ImageMagick executable.
-</details>
-<br>
-
-### Training speed acceleration
-
-We integrated the drop-in replacements from [Taming-3dgs](https://humansensinglab.github.io/taming-3dgs/)<sup>1</sup> with [fused ssim](https://github.com/rahul-goel/fused-ssim/tree/main) into the original codebase to speed up training times. Once installed, the accelerated rasterizer delivers a **$\times$ 1.6 training time speedup** using `--optimizer_type default` and a **$\times$ 2.7 training time speedup** using `--optimizer_type sparse_adam`.
-
-To get faster training times you must first install the accelerated rasterizer to your environment:
+| Term | Definition | What it measures |
+| --- | --- | --- |
+| g<sub>det</sub> | mIoU with annotation masks minus mIoU with YOLO masks | the 2D detector |
+| g<sub>lift</sub> | reference minus mIoU with annotation masks | the lifting and the threshold |
+| g<sub>rep</sub> | 1 minus the reference | the Gaussian model and the transfer |
+
+Their sum is the total error with YOLO masks.
+
+The parameters were fixed in three steps, and no test scene was used before the last one. Two development scenes, `office_0` of Replica and `7831862f02` of ScanNet++, fixed the transfer radius and the rest of the frozen configuration. Then, the transfer operator and the pair (β, γ) were chosen together on seven Replica validation scenes, among 130 candidates, with a rule written in the code: among the candidates within 0.01 of the best mean, it takes the one with the smallest deviation between scenes. Finally, the ten ScanNet++ test scenes were evaluated with everything fixed. They are the downloaded scenes with the most annotated classes, a rule that only reads the annotation.
+
+A split has only seven or ten scenes, so every mean comes with a 95% bootstrap interval over scenes, and the comparisons between configurations are paired scene by scene.
+
+## Results
+
+| Dataset | Split | Masks | mIoU | 95% interval | Reference |
+| --- | --- | --- | --- | --- | --- |
+| Replica | validation, 7 scenes | annotation | 0.93 | 0.92 to 0.94 | 0.97 |
+| Replica | validation, 7 scenes | YOLO | 0.65 | 0.55 to 0.74 | 0.97 |
+| ScanNet++ | test, 10 scenes | annotation | 0.80 | 0.77 to 0.83 | 0.91 |
+| ScanNet++ | test, 10 scenes | YOLO | 0.54 | 0.48 to 0.60 | 0.91 |
+
+On ScanNet++, the detector is the largest source of error, with g<sub>det</sub> = 0.26, while the lifting loses 0.11 and the representation 0.09. In other words, with good masks the method is already close to what the Gaussian model allows, and most of what is left to gain is in 2D.
+
+Note that the fusion of views also corrects part of the detector. On ScanNet++, the 3D IoU is higher than the pixel IoU of the YOLO masks in 27 of the 39 pairs of class and scene, and the mean goes from 0.45 to 0.55. When YOLO misses an object in some views, its Gaussians still collect evidence from the views where it finds it. However, the fusion cannot create what no view gives: YOLO was trained on COCO, whose only table is the dining table, and it almost never proposes the desks of ScanNet++.
+
+<p align="center">
+  <img src="assets/readme/qualitative.png" width="100%">
+</p>
+<p align="center"><em>Prediction against reference in two test scenes close to the median. The round table of the first scene looks like a COCO dining table and is labelled well with YOLO masks, but the coffee table and the desk of the second scene are missed.</em></p>
+
+The results per class and per scene, the comparison of the two transfer operators, the ablations and the cost are in the preprint.
+
+## Running it
+
+The heavy stages run inside three images: one for COLMAP, one that trains the Gaussian model with the official rasteriser, and one for the masks and the lifting. `containers/` has them as Dockerfiles and as Apptainer definitions. `evaluation/runtime.py` launches each stage with Docker by default, or with Apptainer when `TFG_RUNTIME=apptainer`, with the repository mounted as read only and the data as read and write. The transfer to the mesh and the metrics only need NumPy and SciPy, so they run outside the images.
+
+One scene at the selected point, with both mask sources:
 
 ```bash
-pip uninstall diff-gaussian-rasterization -y
-cd submodules/diff-gaussian-rasterization
-rm -r build
-git checkout 3dgs_accel
-pip install .
+python -m evaluation.run \
+  --dataset scannetpp --scene 3f15a9266d --split test \
+  --data-root /path/to/scannetpp --mask-source both \
+  --betas 0.7 --hysteresis-gamma 0.8 \
+  --gaussian-to-mesh-transfer nearest_neighbor_label --tau 0.10 \
+  --save_results_to_csv
 ```
 
-Then you can add the following parameter to use the sparse adam optimizer when running `train.py`:
+The whole campaign ran on the Picasso supercomputer of the Universidad de Málaga, on NVIDIA A100 GPUs. `picasso/submit.sh` submits each step with SLURM, with one job per scene where the scenes are independent, from the development sweep to the test and the baseline. A job that reaches its time limit stops between stages, or saves a training checkpoint, and submits itself again. [`picasso/README.md`](picasso/README.md) lists the steps in order.
+
+Each stage stores a JSON with the parameters that invalidate its output. If one of them changes, the run stops and shows the difference, instead of mixing two experiments. The votes do not depend on β, γ or the transfer, so a whole grid of candidates reuses one accumulation per scene, class and mask source. A test scene takes about 41 minutes from scratch on one A100, and once its votes are cached, the thirteen values of β take about 4.5 minutes.
+
+The macros, tables and figures of the manuscripts only read the analytics, so they can be regenerated on any machine:
 
 ```bash
---optimizer_type sparse_adam
+python -m evaluation.scripts.make_macros --analytics analytics --analysis analysis --output report/macros_measured.tex
+python -m evaluation.scripts.make_tables --analytics analytics --analysis analysis --out report/tables
+python -m evaluation.scripts.make_figures --analytics analytics --analysis analysis --out report/figures
 ```
 
-*Note that this custom rasterizer has a different behaviour than the original version, for more details on training times please see [stats for training times](results.md/#training-times-comparisons)*.
+## Parameters
 
-*1. Mallick and Goel, et al. ‘Taming 3DGS: High-Quality Radiance Fields with Limited Resources’. SIGGRAPH Asia 2024 Conference Papers, 2024, https://doi.org/10.1145/3680528.3687694, [github](https://github.com/humansensinglab/taming-3dgs)*
+The values below are the same for every class and every scene. The full list is in `evaluation/run.py`.
 
+| Parameter | Value | Meaning |
+| --- | --- | --- |
+| `--betas` | 0.7, chosen among 13 values from 0.50 to 0.999 | evidence fraction that a seed must reach |
+| `--hysteresis-gamma` | 0.8 | lower threshold as a factor of β; 0 disables the hysteresis |
+| `--hysteresis-radius` | 0.05 m | the radius η that connects two Gaussians |
+| `--gaussian-to-mesh-transfer` | `nearest_neighbor_label` | operator from Gaussians to mesh, chosen on validation |
+| `--tau` | 0.10 m | radius where a vertex looks for Gaussians |
+| `--min-fraction` | 0.3 | share of the vote a vertex needs, only in the radius vote |
+| `--background-confidence` | 0.25 | confidence of the pixels without any detection |
+| `--background-view-policy` | `target_views` | views without the class do not vote |
 
-### Depth regularization
+The detector keeps the detections with a score of at least 0.75, and Replica uses one frame of every five.
 
-To have better reconstructed scenes we use depth maps as priors during optimization with each input images. It works best on untextured parts ex: roads and can remove floaters. Several papers have used similar ideas to improve various aspects of 3DGS; (e.g. [DepthRegularizedGS](https://robot0321.github.io/DepthRegGS/index.html), [SparseGS](https://formycat.github.io/SparseGS-Real-Time-360-Sparse-View-Synthesis-using-Gaussian-Splatting/), [DNGaussian](https://fictionarry.github.io/DNGaussian/)). The depth regularization we integrated is that used in our [Hierarchical 3DGS](https://repo-sam.inria.fr/fungraph/hierarchical-3d-gaussians/) paper, but applied to the original 3DGS; for some scenes (e.g., the DeepBlending scenes) it improves quality significantly; for others it either makes a small difference or can even be worse. For example results showing the potential benefit and statistics on quality please see here: [Stats for depth regularization](results.md).
+## Layout
 
-When training on a synthetic dataset, depth maps can be produced and they do not require further processing to be used in our method.
-
-For real world datasets depth maps should be generated for each input images, to generate them please do the following:
-1. Clone [Depth Anything v2](https://github.com/DepthAnything/Depth-Anything-V2?tab=readme-ov-file#usage):
-    ```
-    git clone https://github.com/DepthAnything/Depth-Anything-V2.git
-    ```
-2. Download weights from [Depth-Anything-V2-Large](https://huggingface.co/depth-anything/Depth-Anything-V2-Large/resolve/main/depth_anything_v2_vitl.pth?download=true) and place it under `Depth-Anything-V2/checkpoints/`
-3. Generate depth maps:
-   ```
-   python Depth-Anything-V2/run.py --encoder vitl --pred-only --grayscale --img-path <path to input images> --outdir <output path>
-   ```
-5. Generate a `depth_params.json` file using:
-    ```
-    python utils/make_depth_scale.py --base_dir <path to colmap> --depths_dir <path to generated depths>
-    ```
-
-A new parameter should be set when training if you want to use depth regularization `-d <path to depth maps>`.
-
-### Exposure compensation
-To compensate for exposure changes in the different input images we optimize an affine transformation for each image just as in [Hierarchical 3dgs](https://repo-sam.inria.fr/fungraph/hierarchical-3d-gaussians/).  
-
-This can greatly improve reconstruction results for "in the wild" captures, e.g., with a smartphone when the exposure setting of the camera is not fixed. For example results showing the potential benefit and statistics on quality please see here: [Stats for exposure compensation](results.md).
-
-Add the following parameters to enable it:
-```
---exposure_lr_init 0.001 --exposure_lr_final 0.0001 --exposure_lr_delay_steps 5000 --exposure_lr_delay_mult 0.001 --train_test_exp
-```
-Again, other excellent papers have used similar ideas e.g. [NeRF-W](https://nerf-w.github.io/), [URF](https://urban-radiance-fields.github.io/).
-
-### Anti-aliasing
-We added the EWA Filter from [Mip Splatting](https://niujinshuchong.github.io/mip-splatting/) in our codebase to remove aliasing. It is disabled by default but you can enable it by adding `--antialiasing` when training on a scene using `train.py` or rendering using `render.py`. Antialiasing can be toggled in the SIBR viewer, it is disabled by default but you should enable it when viewing a scene trained using `--antialiasing`.
-![aa](/assets/aa_onoff.gif)
-*this scene was trained using `--antialiasing`*.
-
-### SIBR: Top view
-> `Views > Top view`
-
-The `Top view` renders the SfM point cloud in another view with the corresponding input cameras and the `Point view` user camera. This allows visualization of how far the viewer is from the input cameras for example.
-
-It is a 3D view so the user can navigate through it just as in the `Point view` (modes available: FPS, trackball, orbit).
-<!-- _gif showing the top view, showing it is realtime_ -->
-<!-- ![topViewOpen_1.gif](../assets/topViewOpen_1_1709560483017_0.gif) -->
-![top view open](assets/top_view_open.gif)
-
-Options are available to customize this view, meshes can be disabled/enabled and their scales can be modified. 
-<!-- _gif showing different options_ -->
-<!-- ![topViewOptions.gif](../assets/topViewOptions_1709560615266_0.gif) -->
-![top view options](assets/top_view_options.gif)
-A useful additional functionality is to move to the position of an input image, and progressively fade out to the SfM point view in that position (e.g., to verify camera alignment). Views from input cameras can be displayed in the `Top view` (*note that `--images-path` must be set in the command line*). One can snap the `Top view` camera to the closest input camera from the user camera in the `Point view` by clicking `Top view settings > Cameras > Snap to closest`. 
-<!-- _gif showing for a snapped camera the ground truth image with alpha_ -->
-<!-- ![topViewImageAlpha.gif](../assets/topViewImageAlpha_1709560852268_0.gif) -->
-![top view image alpha](assets/top_view_image_alpha.gif)
-
-### OpenXR support
-
-OpenXR is supported in the branch `gaussian_code_release_openxr` 
-Within that branch, you can find documentation for VR support [here](https://gitlab.inria.fr/sibr/sibr_core/-/tree/gaussian_code_release_openxr?ref_type=heads).
-
-
-## FAQ
-- *Where do I get data sets, e.g., those referenced in ```full_eval.py```?* The MipNeRF360 data set is provided by the authors of the original paper on the project site. Note that two of the data sets cannot be openly shared and require you to consult the authors directly. For Tanks&Temples and Deep Blending, please use the download links provided at the top of the page. Alternatively, you may access the cloned data (status: August 2023!) from [HuggingFace](https://huggingface.co/camenduru/gaussian-splatting)
-
-
-- *How can I use this for a much larger dataset, like a city district?* The current method was not designed for these, but given enough memory, it should work out. However, the approach can struggle in multi-scale detail scenes (extreme close-ups, mixed with far-away shots). This is usually the case in, e.g., driving data sets (cars close up, buildings far away). For such scenes, you can lower the ```--position_lr_init```, ```--position_lr_final``` and ```--scaling_lr``` (x0.3, x0.1, ...). The more extensive the scene, the lower these values should be. Below, we use default learning rates (left) and ```--position_lr_init 0.000016 --scaling_lr 0.001"``` (right).
-
-| ![Default learning rate result](assets/worse.png "title-1") <!-- --> | <!-- --> ![Reduced learning rate result](assets/better.png "title-2") |
+| Path | Contents |
 | --- | --- |
+| `segmentation/` | masks, projection and tile rasteriser, evidence accumulation, threshold with hysteresis, renders of the figures |
+| `evaluation/` | dataset readers, transfer operators, metrics, cache contracts, container runtime, analytics, campaign drivers, reports |
+| `containers/` | the three images, as Dockerfiles and as Apptainer definitions |
+| `picasso/` | SLURM jobs and the submission of each step on the Picasso supercomputer |
+| `arguments/`, `gaussian_renderer/`, `scene/`, `utils/`, `submodules/`, `SIBR_viewers/` | upstream 3D Gaussian Splatting, with additions to `scene/gaussian_model.py` so a model carries labels |
 
-- *I'm on Windows and I can't manage to build the submodules, what do I do?* Consider following the steps in the excellent video tutorial [here](https://www.youtube.com/watch?v=UXtuigy_wYc), hopefully they should help. The order in which the steps are done is important! Alternatively, consider using the linked Colab template.
+## Limitations
 
-- *It still doesn't work. It says something about ```cl.exe```. What do I do?* User Henry Pearce found a workaround. You can you try adding the visual studio path to your environment variables (your version number might differ);
-```C:\Program Files (x86)\Microsoft Visual Studio\2019\Community\VC\Tools\MSVC\14.29.30133\bin\Hostx64\x64```
-Then make sure you start a new conda prompt and cd to your repo location and try this;
+- A class that does not appear in any mask receives no evidence, so the method cannot recover it.
+- Every class runs on its own, so the same Gaussian can take two classes, and nothing makes the labels exclusive.
+- The reference depends on the transfer operator, so it measures the cost of the representation for that operator and not for the best transfer possible.
+- The rasteriser is written in PyTorch, which makes the vote accumulation the slowest stage.
+- No other published method was run on these scenes, so the numbers compare the method with its own baseline and reference, not with the literature.
+
+## Citation
+
+```bibtex
+@misc{verdugo2026semantic,
+  title  = {Post-Training Semantic Lifting for {3D} {G}aussian {S}platting:
+            Separating Detector, Lifting and Representation Error},
+  author = {Verdugo Guerra, Iv{\'a}n and L{\'o}pez Rubio, Ezequiel and
+            Garc{\'i}a Gonz{\'a}lez, Jorge},
+  note   = {Preprint},
+  year   = {2026}
+}
 ```
-conda activate gaussian_splatting
-cd <dir_to_repo>/gaussian-splatting
-pip install submodules\diff-gaussian-rasterization
-pip install submodules\simple-knn
-```
 
-- *I'm on macOS/Puppy Linux/Greenhat and I can't manage to build, what do I do?* Sorry, we can't provide support for platforms outside of the ones we list in this README. Consider using the linked Colab template.
+Replica and ScanNet++ are distributed by their own authors under their own terms, and access is requested from them.
 
-- *I don't have 24 GB of VRAM for training, what do I do?* The VRAM consumption is determined by the number of points that are being optimized, which increases over time. If you only want to train to 7k iterations, you will need significantly less. To do the full training routine and avoid running out of memory, you can increase the ```--densify_grad_threshold```, ```--densification_interval``` or reduce the value of ```--densify_until_iter```. Note however that this will affect the quality of the result. Also try setting ```--test_iterations``` to ```-1``` to avoid memory spikes during testing. If ```--densify_grad_threshold``` is very high, no densification should occur and training should complete if the scene itself loads successfully.
+## License
 
-- *24 GB of VRAM for reference quality training is still a lot! Can't we do it with less?* Yes, most likely. By our calculations it should be possible with **way** less memory (~8GB). If we can find the time we will try to achieve this. If some PyTorch veteran out there wants to tackle this, we look forward to your pull request!
-
-
-- *How can I use the differentiable Gaussian rasterizer for my own project?* Easy, it is included in this repo as a submodule ```diff-gaussian-rasterization```. Feel free to check out and install the package. It's not really documented, but using it from the Python side is very straightforward (cf. ```gaussian_renderer/__init__.py```).
-
-- *Wait, but ```<insert feature>``` isn't optimized and could be much better?* There are several parts we didn't even have time to think about improving (yet). The performance you get with this prototype is probably a rather slow baseline for what is physically possible.
-
-- *Something is broken, how did this happen?* We tried hard to provide a solid and comprehensible basis to make use of the paper's method. We have refactored the code quite a bit, but we have limited capacity to test all possible usage scenarios. Thus, if part of the website, the code or the performance is lacking, please create an issue. If we find the time, we will do our best to address it.
+The upstream Gaussian Splatting code keeps the Inria and MPII research licence of `LICENSE.md`, which allows non-commercial research use only. The code of `segmentation/`, `evaluation/`, `containers/` and `picasso/` is released under the same terms.

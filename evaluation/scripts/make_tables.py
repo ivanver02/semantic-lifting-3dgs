@@ -7,7 +7,7 @@ from pathlib import Path
 
 from evaluation.analytics import dataset_of, is_frozen, load_analytics, number
 from evaluation.summaries import (
-    DATASETS, SOURCES, TRANSFERS, class_summary, load_baseline, load_points, mask_rows, mean, ordered_classes, paired,
+    DATASETS, SOURCES, TRANSFERS, class_summary, load_baseline, load_points, mask_rows, mean, ordered_classes,
     scene_summary, threshold_summary,
 )
 from evaluation.scripts.make_macros import ABLATIONS
@@ -77,10 +77,9 @@ def per_scene(view, selected, radius):
 
 
 def operators(view, selected, radius):
-    """ Each transfer operator at its own point on validation and test, with the scenes where it wins """
+    """ Each transfer operator at its own point on validation and test """
     rows = []
     for point in (selected, radius):
-        other = radius if point is selected else selected
         cells = [f"{TRANSFERS[point.transfer]} & $({point.beta:g},\\,{point.gamma:g})$"]
         for dataset in DATASETS:
             for source in SOURCES:
@@ -88,11 +87,6 @@ def operators(view, selected, radius):
                 cells.append(pm(summary["miou"], summary["sd"]) if summary else "--")
             summary = scene_summary(view, point, dataset, "gt2d")
             cells.append(cell(summary["reference"]) if summary else "--")
-        # Scenes where this operator beats the other one with annotation masks, on the test split
-        mine, theirs = scene_summary(view, point, "scannetpp", "gt2d"), scene_summary(view, other, "scannetpp", "gt2d")
-        if mine and theirs:
-            comparison = paired(mine, theirs)
-            cells.append(f"{comparison['better']}/{comparison['count']}")
         rows.append(" & ".join(cells))
     return table_body([rows])
 
@@ -157,19 +151,10 @@ def ablations(view, radius):
             continue
         miou = [number(row["mIoU"]) for row in scenes.values()]
         differences = [number(scenes[s]["mIoU"]) - number(base[s]["mIoU"]) for s in scenes if s in base]
-        counts = defaultdict(float)
-        for row in view["class_beta_metrics"]:
-            if (row["variant"].startswith(variant) and dataset_of(row) == "replica" and row["source"] == "gt2d"
-                    and abs(number(row["beta"]) - radius.beta) < 1e-9
-                    and abs(number(row["hysteresis_gamma"]) - gamma) < 1e-9):
-                counts[row["scene_id"]] += number(row["gaussian_count"])
         delta = "--" if prefix == "ablFrozen" else f"{statistics.mean(differences):+.3f}"
-        wins = "--" if prefix == "ablFrozen" else (
-            f"{sum(d > 0.0005 for d in differences)}/{sum(d < -0.0005 for d in differences)}")
         rows.append(" & ".join([
-            ABLATION_LABELS[prefix], pm(statistics.mean(miou), statistics.pstdev(miou)), delta, wins,
+            ABLATION_LABELS[prefix], pm(statistics.mean(miou), statistics.pstdev(miou)), delta,
             cell(mean(number(row["ground_truth_transfer_mIoU"]) for row in scenes.values())),
-            f"{int(round(statistics.mean(counts.values()))):,}".replace(",", "\\,") if counts else "--",
         ]))
     return table_body([rows[:1], rows[1:]])
 

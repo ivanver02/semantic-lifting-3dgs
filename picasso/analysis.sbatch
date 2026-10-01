@@ -1,7 +1,8 @@
 #!/bin/bash -l
-# The two analyses that read the masks and the cached votes, once the test has finished: YOLO against
-# the annotation masks in 2D next to the 3D result, and three scores for selecting the Gaussians.
-# They run in lifting.sif with the data read-only, and write their CSVs to $TFG_DATA/analysis
+# The two analyses that read the masks and the cached votes, once the test has finished. The first one
+# compares YOLO with the annotation masks in 2D next to the 3D result, and the second one computes three
+# scores for selecting the Gaussians. Both run in lifting.sif with the data read-only, and they write
+# their CSVs to $TFG_DATA/analysis
 #   bash picasso/submit.sh analysis
 #SBATCH --job-name=analysis
 #SBATCH --partition=gpu_partition
