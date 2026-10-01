@@ -1,23 +1,75 @@
-# Small wrappers for running the project containers
+# Small wrappers for running the project containers with Docker, or with Apptainer where Docker is not available
 
 import os
+import json
 import subprocess
+import time
+import uuid
 from pathlib import Path
 
 
+TRAIN_IMAGE = "tfgivanverdugo/semantic-fusion-gs-train:cuda11.6"
+LIFTING_IMAGE = "tfgivanverdugo/semantic-fusion-fusion:cuda11.6"
+COLMAP_IMAGE = "tfgivanverdugo/semantic-fusion-colmap:3.13.0-cpu"
+
+# Apptainer runs the same images from the .sif files built with the recipes in containers/apptainer
+SIF_FILES = {
+    TRAIN_IMAGE: "gs-train.sif",
+    LIFTING_IMAGE: "lifting.sif",
+    COLMAP_IMAGE: "colmap.sif",
+}
+
+# Exit code of a run that stopped before the time limit of its cluster job, and continues in a new job
+WALLTIME_EXIT = 3
+
+# A stage only starts when at least this many seconds remain before the deadline
+STAGE_MIN_SECONDS = 20 * 60
+
+# Checkpoint that train.py writes when it stops at the deadline, and reads to continue
+RESUME_CHECKPOINT = "chkpnt_resume.pth"
+
+
+class WalltimeReached(Exception):
+    """ The job deadline leaves no time for the next stage """
+
+
+def deadline():
+    """
+    Return the time, in seconds since the epoch, at which the current job must stop working
+
+    picasso/job.sbatch sets TFG_DEADLINE some minutes before the end of the SLURM job,
+    and without it there is no deadline.
+    """
+    value = os.environ.get("TFG_DEADLINE")
+    return float(value) if value else None
+
+
+def check_time_left():
+    """ Raise WalltimeReached when the next stage could not finish before the deadline """
+    end = deadline()
+    if end is not None and time.time() > end - STAGE_MIN_SECONDS:
+        raise WalltimeReached("not enough time left in this job for the next stage")
+
+
 class Runtime:
-    """ Run training, lifting scripts and COLMAP through Docker """
+    """ Run training, lifting scripts and COLMAP through Docker or Apptainer """
 
-    def __init__(self, repo_root, data_root, train_image="tfgivanverdugo/semantic-fusion-gs-train:cuda11.6",
-                 lifting_image="tfgivanverdugo/semantic-fusion-fusion:cuda11.6",
-                 colmap_image="tfgivanverdugo/semantic-fusion-colmap:3.13.0-cpu"):
+    def __init__(self, repo_root, data_root):
+        """
+        Store host roots, the container engine and the peak CUDA memory of the current stage
 
-        """ Store host roots and the three container image names """
+        TFG_RUNTIME selects the engine, docker by default or apptainer, and with
+        apptainer TFG_SIF_DIR is the directory holding the .sif files.
+        """
         self.repo_root = Path(repo_root).resolve()
         self.data_root = Path(data_root).resolve()
-        self.train_image = train_image
-        self.lifting_image = lifting_image
-        self.colmap_image = colmap_image
+        self.engine = os.environ.get("TFG_RUNTIME", "docker")
+        if self.engine not in ("docker", "apptainer"):
+            raise ValueError(f"TFG_RUNTIME must be docker or apptainer, not {self.engine}")
+        if self.engine == "apptainer" and not os.environ.get("TFG_SIF_DIR"):
+            raise ValueError("TFG_SIF_DIR must point to the directory with the .sif files")
+        self.sif_dir = Path(os.environ.get("TFG_SIF_DIR", ".")).resolve()
+        self._stage_peak_cuda_memory_bytes = None
 
     def _container_path(self, value):
         """ Convert a host path into its mounted container path """
@@ -27,23 +79,33 @@ class Runtime:
         if not path.is_absolute():
             return value
         try:
-            # Repository files are mounted as read-only at /repo
+            # Repository files are mounted as read only at /repo
             return "/repo/" + path.relative_to(self.repo_root).as_posix()
         except ValueError:
             pass
         try:
-            # Dataset and output files are mounted as read-write at /data
+            # Dataset and output files are mounted as read and write at /data
             return "/data/" + path.relative_to(self.data_root).as_posix()
         except ValueError:
             return value
 
-    def _docker_command(self, image, gpu, command):
+    def _container_command(self, image, gpu, command):
         """
-        Build a Docker command from an image and its command arguments
+        Build a Docker or Apptainer command from an image and its command arguments
 
-        gpu dds the NVIDIA runtime when enabled.
+        gpu adds the NVIDIA runtime when enabled.
         command is the sequence of program arguments that runs inside the container.
         """
+        if self.engine == "docker":
+            result = self._docker_options(image, gpu)
+        else:
+            result = self._apptainer_options(image, gpu)
+
+        # Append the program and its arguments after all container options, with host paths mapped
+        return result + [self._container_path(str(item)) for item in command]
+
+    def _docker_options(self, image, gpu):
+        """ Docker options that mount the repository and the data root """
 
         # Start a temporary container that is removed after the command exits
         result = ["docker", "run", "--rm"]
@@ -54,7 +116,7 @@ class Runtime:
             # Keep files created in mounted directories owned by the host user
             result += ["--user", f"{os.getuid()}:{os.getgid()}"]
 
-        # Set writable cache locations because the repository mount is read-only
+        # Writable cache locations because the repository mount is read only
         result += [
             "-e", "HOME=/tmp",
             "-e", "MPLCONFIGDIR=/tmp/matplotlib",
@@ -65,61 +127,116 @@ class Runtime:
             "-w", "/repo",
             image,
         ]
+        return result
 
-        # Append the program and its arguments after all Docker options
-        return result + list(command)
+    def _apptainer_options(self, image, gpu):
+        """ Apptainer options with the same mounts, working directory and environment as Docker """
+
+        # Start from a clean environment so the host Python and conda variables do not reach the image
+        result = ["apptainer", "exec", "--cleanenv"]
+        if gpu:
+            # Bind the host NVIDIA driver, the images find their own OpenGL libraries first
+            result.append("--nv")
+
+        # Apptainer already runs as the host user, and /tmp is the home as in Docker
+        result += [
+            "--home", "/tmp",
+            "--env", "MPLCONFIGDIR=/tmp/matplotlib",
+            "--env", "YOLO_CONFIG_DIR=/tmp/Ultralytics",
+            "--env", "QT_QPA_PLATFORM=offscreen",
+            "--bind", f"{self.repo_root}:/repo:ro",
+            "--bind", f"{self.data_root}:/data:rw",
+            "--pwd", "/repo",
+            str(self.sif_dir / SIF_FILES[image]),
+        ]
+        return result
 
     def _run(self, command):
         """ Run a prepared command and raise errors from failed stages """
 
         # Print the command so a failed stage can be reproduced manually
-        print("Docker command: ", " ".join(str(item) for item in command))
+        print("Container command: ", " ".join(str(item) for item in command))
         subprocess.run(command, check=True, text=True, cwd=str(self.repo_root))
+
+    def end_stage(self):
+        """ Return and clear the maximum CUDA value collected for one stage """
+        peak = self._stage_peak_cuda_memory_bytes
+        self._stage_peak_cuda_memory_bytes = None
+        return peak
+
+    def _run_python(self, image, target_kind, target, arguments):
+        """ Run a Python target through the memory wrapper in the container """
+        metrics_path = self.data_root / ".evaluation_runtime_metrics" / f"{uuid.uuid4().hex}.json"
+        command = [
+            "python", "evaluation/runtime_metrics.py",
+            f"--{target_kind}", target,
+            "--metrics-path", metrics_path,
+            "--", *arguments,
+        ]
+
+        # Run the target and keep the largest measured peak for the stage
+        try:
+            self._run(self._container_command(image, True, command))
+            peak = json.loads(metrics_path.read_text(encoding="utf-8"))["peak_cuda_memory_bytes"]
+            if peak is not None:
+                self._stage_peak_cuda_memory_bytes = max(peak, self._stage_peak_cuda_memory_bytes or 0)
+        finally:
+            metrics_path.unlink(missing_ok=True)
 
     def run_lifting(self, script, arguments):
         """ Run a repository Python script in the lifting container """
+        self._run_python(LIFTING_IMAGE, "script", script, arguments)
 
-        # Convert all mounted host paths before passing the arguments to Docker
-        args = [self._container_path(str(item)) for item in arguments]
-        command = self._docker_command(self.lifting_image, True, ["python", script] + args)
-        self._run(command)
+    def run_train_script(self, script, arguments):
+        """ Run a repository Python script in the training container, which has the official rasteriser """
+        self._run_python(TRAIN_IMAGE, "script", script, arguments)
+
+    def container_path(self, value):
+        """ The path that a host file has inside the containers, for paths written into files they read """
+        return self._container_path(str(value))
 
     def run_lifting_module(self, module, arguments):
         """ Run a Python module in the lifting container """
-
         # Module execution keeps relative imports working inside the repository
-        args = [self._container_path(str(item)) for item in arguments]
-        command = self._docker_command(self.lifting_image, True, ["python", "-m", module] + args)
-        self._run(command)
+        self._run_python(LIFTING_IMAGE, "module", module, arguments)
 
     def run_train(self, dataset_dir, model_dir, iterations, resolution, data_device="cuda"):
         """
         Run Gaussian training with the selected data and image settings
 
         resolution is given to the training script as -r. Values such as 1 and 2 select the original or half image resolution.
+        With a job deadline, train.py saves a resume checkpoint and stops before it,
+        and the next call continues the training from that checkpoint.
         """
-
-        # Build the training arguments
         arguments = [
-            "-s", str(dataset_dir),
-            "-m", str(model_dir),
-            "-r", str(resolution),
-            "--iterations", str(iterations),
-            "--save_iterations", str(iterations),
-            "--checkpoint_iterations", str(iterations),
+            "-s", dataset_dir,
+            "-m", model_dir,
+            "-r", resolution,
+            "--iterations", iterations,
+            "--save_iterations", iterations,
+            "--checkpoint_iterations", iterations,
             "--data_device", data_device,
-        ]
 
-        # Only the dataset and model arguments are mounted paths in this list
-        mapped = [self._container_path(item) if index in (1, 3) else item for index, item in enumerate(arguments)]
-        command = self._docker_command(self.train_image, True, ["python", "train.py"] + mapped)
-        self._run(command)
+            # The viewer is never used, and its fixed port would collide between trainings on one node
+            "--disable_viewer",
+        ]
+        resume = Path(model_dir) / RESUME_CHECKPOINT
+        if resume.exists():
+            arguments += ["--start_checkpoint", resume]
+        if deadline() is not None:
+            arguments += ["--stop_at", deadline()]
+
+        try:
+            self._run_python(TRAIN_IMAGE, "script", "train.py", arguments)
+        except subprocess.CalledProcessError as error:
+            if error.returncode == WALLTIME_EXIT:
+                raise WalltimeReached("training stopped at the job deadline, with its resume checkpoint saved") from error
+            raise
+
+        # The finished model no longer needs the resume checkpoint
+        resume.unlink(missing_ok=True)
 
     def run_colmap(self, arguments):
         """ Run COLMAP in the CPU container with the supplied arguments """
-
         # COLMAP receives all input and output paths through the shared mounts
-        args = list(arguments)
-        mapped = [self._container_path(str(item)) for item in args]
-        command = self._docker_command(self.colmap_image, False, ["colmap"] + mapped)
-        self._run(command)
+        self._run(self._container_command(COLMAP_IMAGE, False, ["colmap", *arguments]))

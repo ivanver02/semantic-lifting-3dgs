@@ -1,6 +1,5 @@
 # Scannet++ scene loading, taxonomy conversion, COLMAP preparation and GT masks
 
-import json
 import shutil
 from pathlib import Path
 from plyfile import PlyData
@@ -11,7 +10,6 @@ from ..common import SceneData, TargetClassInfo
 
 
 CLASSES = [
-    # Fields are: main project name, detector name, and stored detector-mask ID. The stored ID is the detector model ID plus one, because 0 is reserved for the background class in the mask images.
     TargetClassInfo("bench", "bench", 14),
     TargetClassInfo("chair", "chair", 57),
     TargetClassInfo("table", "dining table", 61),
@@ -21,54 +19,55 @@ CLASSES = [
     TargetClassInfo("clock", "clock", 75),
 ]
 
+# A dataset label belongs to a class when the detector names that object with the class,
+# so monitors are tv, desks are tables and stools are chairs, while beanbags, which the detector
+# calls couch, and laboratory and work benches, which are work tables and not the seat the
+# detector calls bench, are left out
 DATASET_LABELS = {
-    # Map each main project name to all Scannet++ datasetcname spellings that represent it.
-    "bench": {"bench", "experiment bench", "laboratory bench", "work bench",
-               "window bench", "wood bench"},
+    "bench": {"bench"},
     "chair": {
         "chair", "office chair", "armchair", "arm chair", "dining chair",
         "folding chair", "office visitor chair", "rolling chair", "lounge chair",
-        "sofa chair", "deck chair", "papasan chair",
+        "sofa chair", "deck chair", "papasan chair", "ottoman chair", "piano chair",
+        "stool", "stools", "bar stool",
     },
     "table": {"table", "dining table", "office table", "conference table",
-              "joined tables"},
-    "tv": {"tv", "television", "tv screen"},
+              "joined tables", "desk", "computer desk", "coffee table"},
+    "tv": {"tv", "television", "tv screen", "monitor", "flat panel display"},
     "laptop": {"laptop"},
     "sink": {"sink", "kitchen sink", "bathroom sink", "washbasin", "wash basin"},
     "clock": {"clock", "wall clock", "table clock", "alarm clock"},
 }
 
-# Increment when the mesh-to-mask conversion or output contract changes
-MASKS_CACHE_VERSION = 3
+# The undistorted DSLR images keep at most this many pixels on the long side
+MAX_IMAGE_SIZE = 1600
 
 
 class ScannetScene:
     """ Load Scannet++ data and convert it to the common evaluation format """
 
-    def __init__(self, data_root, scene, support_dir):
+    def __init__(self, data_root, scene, output_root):
         """
         Store the scene paths and the directory containing generated GT
 
         - data_root: the root directory of the Scannet++ dataset
         - scene: the name of the scene to process
-        - support_dir: the directory containing rasterized masks and visible vertices
+        - output_root: the run directory, whose masks_gt2d holds the rasterized masks and visible vertices
         """
         self.data_root = Path(data_root)
         self.scene = scene
         self.scene_root = self.data_root / "validation_data" / scene
         self.scans = self.scene_root / "scans"
-        self.support_dir = Path(support_dir)
+        self.masks_dir = Path(output_root) / "masks_gt2d"
+
+        # The prepared COLMAP model is kept beside the scene, not in the run directory
+        self.prepared_dir = self.scene_root / "dslr" / "undistorted_colmap"
 
     @property
     def metadata_path(self):
         """ Return the semantic class metadata file for Scannet++ """
         # Each line position in this file is the dataset semantic ID used by the mesh labels
         return self.data_root / "metadata" / "semantic_classes.txt"
-
-    @property
-    def prepared_dir(self):
-        """ Return the directory containing the prepared COLMAP model """
-        return self.scene_root / "dslr" / "undistorted_colmap"
 
     def _load_mesh(self):
         """ Load vertex positions and Scannet++ dataset IDs """
@@ -107,80 +106,50 @@ class ScannetScene:
         dataset_names = [line.strip().lower() for line in self.metadata_path.read_text().splitlines()]
         dataset_ids_to_local_ids = self._dataset_ids_to_local_ids(dataset_names)
 
-        # Unknown Scannet++ dataset IDs remain -1
+        # Keep unknown dataset IDs invalid
         semantic = np.asarray([dataset_ids_to_local_ids.get(int(label), -1) for label in dataset_labels], dtype=np.int64)
 
-        # The GT mask stage records the vertices observed by the rendered camera views
-        support_path = self.support_dir / "support.npz"
-        cache_info_path = self.support_dir / "render_metadata.json"
-        intrinsics_path = self.support_dir / "camera_intrinsics.json"
-
-        if not support_path.exists():
-            raise FileNotFoundError(
-                f"Scannet++ GT support is missing: {support_path}. "
-                "Generate the GT 2D masks before loading the scene."
-            )
-        
-        if not cache_info_path.exists():
-            raise FileNotFoundError(
-                f"Scannet++ GT support metadata is missing: {cache_info_path}. "
-                "Regenerate the GT 2D masks with the current pipeline."
-            )
-
-        if not intrinsics_path.exists():
-            raise FileNotFoundError(
-                f"Scannet++ camera intrinsics are missing: {intrinsics_path}. "
-                "Regenerate the GT 2D masks with the current pipeline."
-            )
-
-        cache_info = json.loads(cache_info_path.read_text())
-        if cache_info.get("version") != MASKS_CACHE_VERSION:
-            raise ValueError("Scannet++ GT support was generated by an incompatible pipeline version")
-
-        # Load the visibility support data, which indicates which vertices are visible in the rendered views
-        support = np.load(support_path)
-        camera_intrinsics = json.loads(intrinsics_path.read_text())
-
-        # Visibility is computed by nvdiffrast from the rendered triangle IDs and stored per mesh vertex
-        visible = support["visible_vertices"].astype(bool)
+        # The GT mask stage records the vertices observed by the rendered camera views, which indicates which vertices are visible
+        visible = np.load(self.masks_dir / "support.npz")["visible_vertices"].astype(bool)
         if visible.shape != (len(vertices),):
             raise ValueError("Scannet++ GT support and semantic mesh use different vertex counts")
-        
+
         return SceneData(
             dataset="scannetpp",
             scene=self.scene,
             vertices=vertices,
             semantic_labels=semantic,
-            annotated=((dataset_labels >= 0) & (dataset_labels < len(dataset_names))), # A vertex is annotated when its dataset label points to a valid metadata entry, even if it is not an evaluated class
-            visible=visible, # Answers which vertices are visible in the selected rendered views
+            annotated=((dataset_labels >= 0) & (dataset_labels < len(dataset_names))),
+            visible=visible,
             classes=CLASSES,
-            num_images=len(camera_intrinsics),
-            camera_intrinsics=camera_intrinsics,
         )
 
-    def prepare_dataset(self, runtime, max_image_size=1600):
+    def prepare_dataset(self, runtime):
         """
-        Prepare Scannet++ DSLR (which have distortion, and we want undistorted ones) images and reuse or create a COLMAP model
+        Prepare Scannet++ DSLR (which have distortion, and we want undistorted ones) images and create a COLMAP model
         """
 
-        # Reuse a prepared model when COLMAP already produced either binary or text files
-        output = self.prepared_dir
-        if ((output / "sparse" / "0" / "cameras.bin").exists() or (output / "sparse" / "0" / "cameras.txt").exists()):
-            return output
-        
         # Prefer the dataset resized images, but if not available, use the original images
         images = self.scene_root / "dslr" / "resized_images"
         if not images.exists():
             images = self.scene_root / "dslr" / "images"
 
-        # Undistort the images and write an output directory ready for COLMAP using the existing COLMAP reconstruction
+        # Undistort the images and write an output directory ready for COLMAP using the existing COLMAP reconstruction,
+        # starting from an empty directory so the output of an interrupted preparation is never mixed in
+        output = self.prepared_dir
+        shutil.rmtree(output, ignore_errors=True)
+        output.mkdir(parents=True)
         runtime.run_colmap([
             "image_undistorter",
-            "--image_path", str(images),
-            "--input_path", str(self.scene_root / "dslr" / "colmap"),
-            "--output_path", str(output),
+            "--image_path", images,
+            "--input_path", self.scene_root / "dslr" / "colmap",
+            "--output_path", output,
             "--output_type", "COLMAP",
-            "--max_image_size", str(max_image_size),
+            "--max_image_size", MAX_IMAGE_SIZE,
+
+            # Keep the original focal length and crop the stretched border of the fisheye, instead of
+            # widening the image to twice the original width, which halves the resolution of its centre
+            "--max_scale", 1.0,
         ])
 
         # Normalize COLMAP sparse output so we can always use sparse/0
@@ -188,45 +157,22 @@ class ScannetScene:
         sparse_zero = sparse / "0"
         if sparse.exists() and not sparse_zero.exists():
 
-            # COLMAP can place its files directly in sparse, but the rest of the project expects sparse/0
-            sparse_zero.mkdir(parents=True, exist_ok=True)
-            for item in sparse.iterdir():
-                if item.is_file() and item.suffix in {".bin", ".txt"}:
-                    shutil.move(str(item), str(sparse_zero / item.name)) # shutil.move can move across filesystems
-        return output
+            # COLMAP can place its files directly in sparse, but the rest of the project expects sparse/0.
+            # The directory is renamed as a whole, so sparse/0 only appears with every file of the model
+            staged = output / "sparse_staged"
+            sparse.rename(staged)
+            sparse.mkdir()
+            staged.rename(sparse_zero)
 
-    def generate_gt_masks(self, runtime, output_dir, bands=4, viz=0,
-                          force=False):
-        """
-        Generate or reuse rasterized Scannet++ GT masks and visibility support
+    def generate_gt_masks(self, runtime):
+        """ Generate rasterized Scannet++ GT masks and visibility support """
 
-        - bands: number of horizontal image bands used to reduce GPU memory
-        - viz: number of optional visualizations to write, to see what the rasterization looks like
-        - force: regenerate masks and support data even when completion files exist
-        """
-
-        # Reuse masks and support data when both completion markers exist
-        cache_info_path = output_dir / "render_metadata.json"
-        cache_info = None
-
-        if cache_info_path.exists():
-            cache_info = json.loads(cache_info_path.read_text())
-
-        if ((output_dir / "classes.json").exists() and (output_dir / "support.npz").exists() and
-                (output_dir / "camera_intrinsics.json").exists() and cache_info is not None and
-                cache_info.get("version") == MASKS_CACHE_VERSION and not force):
-            return output_dir
-        
         # Rasterize the mesh inside the lifting container because nvdiffrast requires CUDA
         runtime.run_lifting_module(
             "evaluation.scannetpp.gt_masks",
             [
-                "--scene_root", str(self.scene_root),
-                "--repo_root", str(runtime.repo_root),
-                "--metadata", str(self.metadata_path),
-                "--output_dir", str(output_dir),
-                "--bands", str(bands),
-                "--viz", str(viz),
-            ] + (["--force"] if force else []),
+                "--scene_root", self.scene_root,
+                "--metadata", self.metadata_path,
+                "--output_dir", self.masks_dir,
+            ],
         )
-        return output_dir

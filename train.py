@@ -10,6 +10,7 @@
 #
 
 import os
+import time
 import torch
 from random import randint
 from utils.loss_utils import l1_loss, ssim
@@ -40,7 +41,7 @@ try:
 except:
     SPARSE_ADAM_AVAILABLE = False
 
-def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from):
+def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, stop_at=None):
 
     if not SPARSE_ADAM_AVAILABLE and opt.optimizer_type == "sparse_adam":
         sys.exit(f"Trying to use sparse adam but it is not installed, please install the correct rasterizer using pip install [3dgs_accel].")
@@ -189,6 +190,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 print("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
 
+            # At the deadline of a cluster job, save a checkpoint to continue with --start_checkpoint and exit with
+            # code 3. It is written through a temporary name, so the next job never reads a partial checkpoint
+            if stop_at is not None and iteration < opt.iterations and time.time() >= stop_at:
+                print("\n[ITER {}] Saving resume checkpoint at the job deadline".format(iteration))
+                resume_path = os.path.join(scene.model_path, "chkpnt_resume.pth")
+                torch.save((gaussians.capture(), iteration), resume_path + ".tmp")
+                os.replace(resume_path + ".tmp", resume_path)
+                sys.exit(3)
+
 def prepare_output_and_logger(args):    
     if not args.model_path:
         if os.getenv('OAR_JOB_ID'):
@@ -267,6 +277,7 @@ if __name__ == "__main__":
     parser.add_argument('--disable_viewer', action='store_true', default=False)
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--stop_at", type=float, default = None, help="time in seconds since the epoch to save a resume checkpoint and stop")
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
     
@@ -279,7 +290,7 @@ if __name__ == "__main__":
     if not args.disable_viewer:
         network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.stop_at)
 
     # All done
     print("\nTraining complete.")

@@ -19,3 +19,5 @@ dependencies:
     - submodules/fused-ssim
     - opencv-python
     - joblib
+    - scipy==1.7.3 # segmentation/render_qualitative.py runs in the training image
+    - matplotlib==3.5.3

@@ -1,4 +1,10 @@
-# Shared data structures that simplify metrics evaluation from both datasets
+# Unified evaluation workflow for Replica and Scannet++ scenes
+# Data structures for metrics evaluation
+
+import hashlib
+import json
+import os
+from pathlib import Path
 
 class TargetClassInfo:
     """
@@ -10,28 +16,26 @@ class TargetClassInfo:
     """
 
     def __init__(self, name, name_by_detector, detector_stored_id):
-        """ Store the main name, detector name and stored detector mask ID """
         self.name = name
         self.name_by_detector = name_by_detector
         self.detector_stored_id = detector_stored_id
 
 
-class SceneData: # Created when loading data in the scene files
+class SceneData:  # Created when loading data in the scene files
     """
     Ground truth and visibility data in the common scene representation
 
-    The arrays related to vertex all use the same order of vertices in the mesh
+    The arrays related to vertices all use the same order of vertices in the mesh
     - annotated says whether the source dataset provides a semantic annotation
     - visible says if the vertex was observed by any of the selected camera views
     - classes contains the TargetClassInfo classes evaluated by the pipeline
     """
 
     def __init__(self, dataset, scene, vertices, semantic_labels,
-                 annotated, visible, classes, num_images=0,
-                 camera_intrinsics=None):
-        """ 
-        Store the scene names, vertex arrays and target classes 
-        
+                 annotated, visible, classes):
+        """
+        Store the scene names, vertex arrays and target classes
+
         - dataset: The dataset name
         - scene: The scene name within the dataset
         - vertices: 3D coordinates of the mesh vertices in the scene
@@ -47,23 +51,17 @@ class SceneData: # Created when loading data in the scene files
         self.annotated = annotated
         self.visible = visible
         self.classes = classes
-        self.num_images = int(num_images)
-        self.camera_intrinsics = list(camera_intrinsics or [])
 
-    @property # Property: the method can be called as an attribute
-    def class_ids(self):
-        """ 
-        Return the main class name mapped to the local SceneData ID
-
-        This local ID is the index in this scene's classes list. It is neither the detector mask ID nor the source dataset ID
-        """
-        return {item.name: local_id for local_id, item in enumerate(self.classes)}
+    @property
+    def scene_id(self):
+        """ Identify the scene in the analytics tables """
+        return f"{self.dataset}:{self.scene}"
 
     @property
     def evaluation_mask(self):
         """
         Returns a boolean mask for vertices that should be included in evaluation
-        
+
         Consequences of defining the evaluation mask this way:
         - Vertices that are not annotated or not visible are excluded from evaluation.
         - Vertices that are annotated but not in the target classes are included in evaluation, and can cause false positives.
@@ -73,23 +71,80 @@ class SceneData: # Created when loading data in the scene files
         return self.annotated & self.visible
 
     def class_id(self, name):
-        """ Return the SceneData local ID assigned to a main class name """
-        return self.class_ids[name]
+        """ Return the local ID for a main class name """
+        return [item.name for item in self.classes].index(name)
 
 
 def safe_name(name):
-    """ Make a detector name safe for a file or directory name """
+    """ Make a detector name safe for a path """
     return name.replace(" ", "_")
 
 
-def ensure_dir(path):
-    """ Ensure the existence of a directory and return its path """
-    path.mkdir(parents=True, exist_ok=True) # exist_ok allows cached stages to call this repeatedly.
-    return path
+def float_token(value):
+    """ Format a float for a path """
+    return str(value).replace(".", "_")
 
 
-def target_classes_by_detector(classes):
+def digest(values, length=12):
+    """ Return a digest for a configuration mapping """
+    payload = json.dumps(values, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:length]
+
+
+# Settings that change the accumulated votes, so votes computed with other
+# values are stored under another identifier and never reused by mistake
+VOTE_KEYS = (
+    "background_confidence", "background_view_policy",
+    "raster_block_size", "vote_data_device",
+)
+
+
+def vote_id(parameters):
+    """ Return the id of a vote configuration """
+    return "v" + digest({key: parameters[key] for key in VOTE_KEYS})
+
+
+def vote_dir(segmentation_dir, spec, identifier):
+    """ Directory holding the votes of one class under one vote configuration """
+    return Path(segmentation_dir) / safe_name(spec.name_by_detector) / identifier
+
+
+def vote_path(segmentation_dir, spec, identifier):
+    """ Votes of one class, written by segmentation/accumulate_votes.py """
+    return vote_dir(segmentation_dir, spec, identifier) / (
+        f"voting_data_{safe_name(spec.name_by_detector)}.pt"
+    )
+
+
+def selection_path(class_vote_dir, gamma, radius, beta, score="fraction"):
     """
-    Map each detector name to its complete TargetClassInfo record.
+    Indices of the Gaussians selected for one class at one operating point,
+    written by segmentation/threshold_labels.py next to the votes they come from
+
+    The hysteresis radius is part of the directory name because the graph depends on it, and so is
+    the thresholded score when it is not the evidence fraction, so the selections of the
+    baseline never replace those of the method
     """
-    return {item.name_by_detector: item for item in classes}
+    suffix = "" if score == "fraction" else f"_{score}"
+    return Path(class_vote_dir) / f"g{float_token(gamma)}_r{float_token(radius)}{suffix}" / (
+        f"selected_beta{float_token(beta)}.npy"
+    )
+
+
+def atomic_write(path, save):
+    """
+    Write a file through a temporary name in the same directory
+
+    save receives the temporary path. The final name only appears once the
+    file is complete, so an interrupted run never leaves a partial artifact
+    that a later run would reuse as a cache hit.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name("tmp_" + path.name)
+    try:
+        save(temporary)
+        os.replace(temporary, path)
+    finally:
+        if temporary.exists():
+            temporary.unlink()
