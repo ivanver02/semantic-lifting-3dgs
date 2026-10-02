@@ -199,26 +199,44 @@ def mask_2d_3d(path_csv, path):
 def class_gaps(view, selected, path):
     """ For every class, the IoU with YOLO masks, with annotation-derived masks and of the reference """
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     summary = class_summary(view, selected)
     keys = ordered_classes(summary)
-    datasets = [d for d in DATASETS if any(key[0] == d for key in keys)]
-    fig, axes = plt.subplots(len(datasets), 1, figsize=(3.4, 1.35 * len(datasets) + 0.35), sharey=True)
-    axes = list(axes) if len(datasets) > 1 else [axes]
-    sources = (("yolo:iou", "C1", "YOLO"), ("gt2d:iou", "C0", "Annotation"), ("reference", "0.55", "Reference"))
-    width = 0.26
-    for ax, dataset in zip(axes, datasets):
-        names = [key[1] for key in keys if key[0] == dataset]
-        for offset, (field, colour, label) in zip((-width, 0.0, width), sources):
-            values = [summary[(dataset, name)].get(field) or 0.0 for name in names]
-            ax.bar([i + offset for i in range(len(names))], values, width=width, color=colour, label=label)
-        ax.set_xticks(range(len(names)), names)
-        ax.set_ylim(0, 1)
-        ax.set_ylabel("IoU")
-        ax.set_title(DATASETS[dataset], loc="left", fontsize=7)
-        ax.tick_params(axis="x", length=0)
-    axes[0].legend(loc="lower center", bbox_to_anchor=(0.5, 1.12), ncol=3, fontsize=6.5)
-    fig.tight_layout()
+    # The same colours as in the rest of the figures, and a different marker for the reference
+    sources = (("yolo:iou", "C1", "o", "YOLO"), ("gt2d:iou", "C0", "o", "Annotation"), ("reference", "0.4", "D", "Reference"))
+    fig, ax = plt.subplots(figsize=(3.4, 3.3))
+    labels, positions, y, previous = [], [], 0.0, None
+    for key in keys:
+        # A small gap between the classes of both datasets
+        if previous is not None and key[0] != previous:
+            y += 0.8
+        previous = key[0]
+        positions.append(y)
+        labels.append(key[1])
+        values = [summary[key].get(field) for field, _, _, _ in sources]
+        present = [v for v in values if v is not None]
+        ax.plot([min(present), max(present)], [y, y], color="#BBBBBB", linewidth=1.0, zorder=1)
+        for value, (_, colour, marker, _) in zip(values, sources):
+            if value is not None:
+                ax.scatter(value, y, marker=marker, color=colour, s=14 if marker == "D" else 18, zorder=2)
+        y += 1.0
+    ax.set_yticks(positions, labels)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 1.0)
+    ax.set_xlabel("IoU")
+    # The name of each dataset beside its group of classes
+    for dataset in DATASETS:
+        rows = [p for p, key in zip(positions, keys) if key[0] == dataset]
+        if rows:
+            ax.text(-0.26, statistics.mean(rows), DATASETS[dataset], transform=ax.get_yaxis_transform(),
+                    rotation=90, ha="center", va="center", fontsize=7)
+    handles = [Line2D([], [], marker=marker, linestyle="", color=colour, label=label)
+               for _, colour, marker, label in sources]
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.45, -0.14), ncol=3, fontsize=6.5,
+              handletextpad=0.2, columnspacing=0.8)
+    ax.grid(axis="x", color="#EEEEEE", linewidth=0.6)
+    ax.set_axisbelow(True)
     save(fig, path)
 
 
