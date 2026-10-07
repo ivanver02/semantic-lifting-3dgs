@@ -4,7 +4,7 @@
 
 This repository contains the code of the preprint [Post-Training Semantic Lifting for 3D Gaussian Splatting: Separating Detector, Lifting and Representation Error](https://arxiv.org/abs/2610.08756), which presents the research of my Bachelor's Thesis at the University of Málaga, supervised by Ezequiel López Rubio and Jorge García González.
 
-The method labels the Gaussians of a 3D Gaussian Splatting model that is already trained, using its calibrated cameras and one 2D mask per view. For each class, every Gaussian accumulates the evidence of belonging to it and the evidence of not belonging to it, and it takes the class when the first one is a large enough fraction of the total. The operating point was chosen on seven synthetic Replica scenes, and on ten held-out ScanNet++ scenes the mean mIoU is 0.80 with masks from the dataset annotation, with a 95% interval of [0.77, 0.83], and 0.54 with the masks of a YOLO detector. Compared with thresholding the evidence per view, as a previous version of the method did, the fraction improves the test mIoU by 0.24.
+The method labels the Gaussians of a 3D Gaussian Splatting model that is already trained, using its calibrated cameras and one 2D mask per view. For each class, every Gaussian accumulates the evidence of belonging to it and the evidence of not belonging to it, and it takes the class when the first one is a large enough fraction of the total. The operating point was chosen on seven synthetic Replica scenes, and on ten held-out ScanNet++ scenes the mean mIoU is 0.80 with masks from the dataset annotation, with a 95% interval of [0.77, 0.83], and 0.54 with the masks of a YOLO detector. Compared with thresholding the evidence per view, as a previous version of the method did, the fraction improves the test mIoU by 0.24, and it is better in the ten scenes.
 
 Note that the Gaussian representation, the training code and the CUDA rasteriser come from the [official Inria implementation](https://github.com/graphdeco-inria/gaussian-splatting). The rest of the code, that is, the lifting and the evaluation, was developed for this work, and it is in `segmentation/`, `evaluation/`, `containers/` and `picasso/`.
 
@@ -179,3 +179,5 @@ Replica and ScanNet++ are distributed by their own authors under their own terms
 ## License
 
 The upstream Gaussian Splatting code keeps the Inria and MPII research licence of `LICENSE.md`, which allows non-commercial research use only. The code of `segmentation/`, `evaluation/`, `containers/` and `picasso/` is released under the same terms.
+
+This licence only applies to the code. The preprint is distributed by arXiv under its own non-exclusive licence, and the figures of this README come from it. Note that two of them show ScanNet++ scenes, so they are also subject to the terms of use of ScanNet++.
