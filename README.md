@@ -1,15 +1,17 @@
 # Post-Training Semantic Lifting for 3D Gaussian Splatting
 
-This repository labels with semantic classes the Gaussians of a 3D Gaussian Splatting model that is already trained, and it also contains the protocol that evaluates the result. The method takes the model, its calibrated cameras and one 2D mask per view. Then, it accumulates on every Gaussian the evidence of belonging to the class and the evidence of not belonging to it, and keeps the Gaussians where the first one is a large enough fraction of the total.
+[![arXiv](https://img.shields.io/badge/arXiv-2610.08756-b31b1b.svg)](https://arxiv.org/abs/2610.08756)
 
-On ten held-out ScanNet++ scenes, the method reaches a mean mIoU of 0.80, with a 95% interval from 0.77 to 0.83, when the 2D masks come from the annotation of the dataset, and 0.54 with the masks of a YOLO detector. The operating point was chosen on seven synthetic Replica scenes and applied to these real scans without retuning anything. Compared with thresholding the evidence per view, as an earlier version of the method did, the fraction improves the test mIoU by 0.24 and is better in all ten scenes.
+This repository contains the code of the preprint [Post-Training Semantic Lifting for 3D Gaussian Splatting: Separating Detector, Lifting and Representation Error](https://arxiv.org/abs/2610.08756), which presents the research of my Bachelor's Thesis at the University of Málaga, supervised by Ezequiel López Rubio and Jorge García González.
 
-The Gaussian representation, the training code and the CUDA rasteriser come from the [official Inria implementation](https://github.com/graphdeco-inria/gaussian-splatting). The lifting, the evidence formulation, the hysteresis, the transfer to the mesh and the whole evaluation are my own work, and they live in `segmentation/`, `evaluation/`, `containers/` and `picasso/`. This project is my Bachelor's Thesis at the Universidad de Málaga, supervised by Ezequiel López Rubio and Jorge García González, and it comes with a preprint that gives the full details.
+The method labels the Gaussians of a 3D Gaussian Splatting model that is already trained, using its calibrated cameras and one 2D mask per view. For each class, every Gaussian accumulates the evidence of belonging to it and the evidence of not belonging to it, and it takes the class when the first one is a large enough fraction of the total. The operating point was chosen on seven synthetic Replica scenes, and on ten held-out ScanNet++ scenes the mean mIoU is 0.80 with masks from the dataset annotation, with a 95% interval of [0.77, 0.83], and 0.54 with the masks of a YOLO detector. Compared with thresholding the evidence per view, as a previous version of the method did, the fraction improves the test mIoU by 0.24.
+
+Note that the Gaussian representation, the training code and the CUDA rasteriser come from the [official Inria implementation](https://github.com/graphdeco-inria/gaussian-splatting). The rest of the code, that is, the lifting and the evaluation, was developed for this work, and it is in `segmentation/`, `evaluation/`, `containers/` and `picasso/`.
 
 <p align="center">
   <img src="assets/readme/overview.png" width="100%">
 </p>
-<p align="center"><em>One view of the ScanNet++ test scene 21d970d8de. The fraction of the chair and the labels come from the YOLO masks of all the views, so the tables are labelled although YOLO does not find them in this one.</em></p>
+<p align="center"><em>One view of the ScanNet++ test scene 21d970d8de. Even though YOLO does not detect the tables in this view, they are still labelled, since it detects them in other views.</em></p>
 
 ## How the lifting works
 
@@ -27,13 +29,13 @@ The decision uses the fraction ρ = E⁺ / (E⁺ + E⁻). A Gaussian becomes a s
   <img src="assets/readme/hysteresis.png" width="78%">
 </p>
 
-The visibility weights come from a tile rasteriser written in PyTorch, which follows the CUDA one of 3DGS. It differs from it in the culling and in the compositing loop, and the preprint explains both changes.
+The visibility weights come from a tile rasteriser written in PyTorch, which follows the CUDA one of 3DGS. It differs from it in the culling and in the compositing loop, and both changes are explained in the [preprint](https://arxiv.org/abs/2610.08756).
 
 ## Why a fraction
 
 The first versions of the method thresholded the target evidence itself, first against β times the number of cameras and then against β times the number of views that contain the class. With both of them, choosing β was very difficult, because the best value changed from one class to another. The evidence grows with the size of the object in the image, with its distance and with the occlusions, so a sofa and a clock need different thresholds. In addition, a background Gaussian that many views see collects target evidence at the borders of the masks. The fraction compares the target evidence with all the evidence that reached the Gaussian, so these factors cancel.
 
-To check it, the version with the evidence per view runs as a baseline with exactly the same protocol: the same votes, the same hysteresis, the same transfer and the same selection rule, over its own grid of thresholds.
+In order to check it, the version with the evidence per view runs as a baseline with the same protocol: the same votes, the same hysteresis, the same transfer and the same selection rule, over its own grid of thresholds.
 
 <p align="center">
   <img src="assets/readme/thresholds.png" width="62%">
@@ -69,16 +71,16 @@ A split has only seven or ten scenes, so every mean comes with a 95% bootstrap i
 | ScanNet++ | test, 10 scenes | annotation | 0.80 | 0.77 to 0.83 | 0.91 |
 | ScanNet++ | test, 10 scenes | YOLO | 0.54 | 0.48 to 0.60 | 0.91 |
 
-On ScanNet++, the detector is the largest source of error, with g<sub>det</sub> = 0.26, while the lifting loses 0.11 and the representation 0.09. In other words, with good masks the method is already close to what the Gaussian model allows, and most of what is left to gain is in 2D.
+On ScanNet++, the detector is the largest source of error, with g<sub>det</sub> = 0.26, while the lifting loses 0.11 and the representation 0.09. That is, with the annotation masks the method is close to what the Gaussian model allows, and most of the remaining error comes from the 2D masks.
 
-Note that the fusion of views also corrects part of the detector. On ScanNet++, the 3D IoU is higher than the pixel IoU of the YOLO masks in 27 of the 39 pairs of class and scene, and the mean goes from 0.45 to 0.55. When YOLO misses an object in some views, its Gaussians still collect evidence from the views where it finds it. However, the fusion cannot create what no view gives: YOLO was trained on COCO, whose only table is the dining table, and it almost never proposes the desks of ScanNet++.
+Nevertheless, the fusion of views also corrects part of the errors of the detector. On ScanNet++, the 3D IoU is higher than the pixel IoU of the YOLO masks in 27 of the 39 pairs of class and scene, and the mean goes from 0.45 to 0.55. When YOLO misses an object in some views, its Gaussians still collect evidence from the views where it finds it. In any case, the fusion cannot create what no view gives: YOLO was trained on COCO, whose only table is the dining table, and it almost never proposes the desks of ScanNet++.
 
 <p align="center">
   <img src="assets/readme/qualitative.png" width="100%">
 </p>
 <p align="center"><em>Prediction against reference in two test scenes close to the median. The round table of the first scene looks like a COCO dining table and is labelled well with YOLO masks, but the coffee table and the desk of the second scene are missed.</em></p>
 
-The results per class and per scene, the comparison of the two transfer operators, the ablations and the cost are in the preprint.
+The results per class and per scene, the comparison of the two transfer operators, the ablations and the cost can be found in the [preprint](https://arxiv.org/abs/2610.08756).
 
 ## Running it
 
@@ -106,7 +108,7 @@ python -m evaluation.run \
   --save_results_to_csv
 ```
 
-The whole campaign ran on the Picasso supercomputer of the Universidad de Málaga, on NVIDIA A100 GPUs. `picasso/submit.sh` submits each step with SLURM, with one job per scene where the scenes are independent, from the development sweep to the test and the baseline. A job that reaches its time limit stops between stages, or saves a training checkpoint, and submits itself again. [`picasso/README.md`](picasso/README.md) lists the steps in order.
+All the experiments were run on the Picasso supercomputer of the University of Málaga, on NVIDIA A100 GPUs. `picasso/submit.sh` submits each step with SLURM, with one job per scene where the scenes are independent, from the development sweep to the test and the baseline. A job that reaches its time limit stops between stages, or saves a training checkpoint, and submits itself again. [`picasso/README.md`](picasso/README.md) lists the steps in order.
 
 Each stage stores a JSON with the parameters that invalidate its output. If one of them changes, the run stops and shows the difference, instead of mixing two experiments. The votes do not depend on β, γ or the transfer, so a whole grid of candidates reuses one accumulation per scene, class and mask source. A test scene takes about 41 minutes from scratch on one A100, and once its votes are cached, the thirteen values of β take about 4.5 minutes.
 
@@ -155,14 +157,20 @@ The detector keeps the detections with a score of at least 0.75, and Replica use
 
 ## Citation
 
+If this code is useful for your work, please cite the preprint:
+
 ```bibtex
 @misc{verdugo2026semantic,
-  title  = {Post-Training Semantic Lifting for {3D} {G}aussian {S}platting:
-            Separating Detector, Lifting and Representation Error},
-  author = {Verdugo Guerra, Iv{\'a}n and L{\'o}pez Rubio, Ezequiel and
-            Garc{\'i}a Gonz{\'a}lez, Jorge},
-  note   = {Preprint},
-  year   = {2026}
+  title         = {Post-Training Semantic Lifting for {3D} {G}aussian {S}platting:
+                   Separating Detector, Lifting and Representation Error},
+  author        = {Verdugo Guerra, Iv{\'a}n and L{\'o}pez Rubio, Ezequiel and
+                   Garc{\'i}a Gonz{\'a}lez, Jorge},
+  year          = {2026},
+  eprint        = {2610.08756},
+  archivePrefix = {arXiv},
+  primaryClass  = {cs.CV},
+  doi           = {10.48550/arXiv.2610.08756},
+  url           = {https://arxiv.org/abs/2610.08756}
 }
 ```
 
