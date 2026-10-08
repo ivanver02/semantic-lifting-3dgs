@@ -3,7 +3,7 @@
 import argparse
 from pathlib import Path
 
-from evaluation.analytics import BASELINE_PREFIX, TRANSFER_PREFIX
+from evaluation.analytics import BASELINE_PREFIX, SCANNET_TEST_PREFIX, SCANNET_VALIDATION_PREFIX, TRANSFER_PREFIX
 from evaluation.scripts.experiment_common import (
     BETAS, DEVELOPMENT_SCENES, GAMMAS, PER_VIEW_BETAS, dump_plan, load_json, run_units, token, unit,
 )
@@ -39,6 +39,10 @@ EXPERIMENTS = {
     "contribution_analysis": {"dataset": "replica", "split": "validation", "count": 7},
     "baseline_validation": {"dataset": "replica", "split": "validation", "count": 7},
     "baseline_test": {"dataset": "scannetpp", "split": "test", "count": 10},
+    # The selection inside ScanNet++, only for the TFG: the validation grid on the ScanNet++ scenes that are
+    # neither test nor development, and the test scenes at the point that the same rule selects there
+    "scannet_validation": {"dataset": "scannetpp", "split": "validation", "count": 37},
+    "scannet_test": {"dataset": "scannetpp", "split": "test", "count": 10},
 }
 
 
@@ -57,13 +61,20 @@ def units(args, selection):
     }
 
     # The validation runs the whole grid with the operator asked for, so the selection can compare operators.
-    # Each operator writes under its own variant, so the runs of one never replace those of the other
-    if args.experiment == "validation":
-        prefix = TRANSFER_PREFIX[args.transfer]
+    # Each operator writes under its own variant, so the runs of one never replace those of the other.
+    # The ScanNet++ validation runs the grid of both operators in the same job, the radius vote first, because
+    # the files of its scene are removed once the job has finished. Its runs are written under the prefixes
+    # that the test summaries do not read
+    if args.experiment in ("validation", "scannet_validation"):
+        if args.experiment == "validation":
+            prefixes, transfers = TRANSFER_PREFIX, [args.transfer]
+        else:
+            prefixes, transfers = SCANNET_VALIDATION_PREFIX, list(SCANNET_VALIDATION_PREFIX)
         return [
-            unit("replica", scene, f"{prefix}{token(gamma)}", betas=BETAS, gamma=gamma,
-                 extra=transfer_extra(args.transfer), **common)
+            unit(settings["dataset"], scene, f"{prefixes[transfer]}{token(gamma)}", betas=BETAS, gamma=gamma,
+                 extra=transfer_extra(transfer), **common)
             for scene in args.scene
+            for transfer in transfers
             for gamma in GAMMAS
         ]
 
@@ -83,12 +94,14 @@ def units(args, selection):
             for scene in args.scene
         ]
 
-    # The test runs the operator that the validation selected, the radius vote in older selections
+    # The test runs the operator that the validation selected, the radius vote in older selections. With the
+    # point selected on ScanNet++, it writes under its own prefix, even when the point is the same one
     beta_star, gamma_star = [selection["beta_star"]], selection["gamma_star"]
-    if args.experiment == "test":
+    if args.experiment in ("test", "scannet_test"):
         transfer = selection.get("transfer", "radius_vote")
+        prefixes = TRANSFER_PREFIX if args.experiment == "test" else SCANNET_TEST_PREFIX
         return [
-            unit("scannetpp", scene, f"{TRANSFER_PREFIX[transfer]}{token(gamma_star)}", betas=beta_star,
+            unit("scannetpp", scene, f"{prefixes[transfer]}{token(gamma_star)}", betas=beta_star,
                  gamma=gamma_star, extra=transfer_extra(transfer), **common)
             for scene in args.scene
         ]
@@ -120,8 +133,8 @@ def _parser():
                         help="JSON with tau_star and theta_star from the development sweep for validation, "
                              "and the validation selection with beta_star and gamma_star too for test and contribution analysis")
     parser.add_argument("--transfer", choices=TRANSFER_PREFIX, default="radius_vote",
-                        help="Transfer operator from Gaussians to mesh of the validation grid; the test takes "
-                             "the one in the selection file")
+                        help="Transfer operator from Gaussians to mesh of the Replica validation grid; the ScanNet++ "
+                             "validation runs both, and the tests take the one in the selection file")
     parser.add_argument("--dry-run", action="store_true",
                         help="Print the unit plan without running anything")
     parser.add_argument("--only-scene", default=None,

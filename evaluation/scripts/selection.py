@@ -5,7 +5,9 @@ import json
 import statistics
 from pathlib import Path
 
-from evaluation.analytics import BASELINE_PREFIX, TRANSFER_PREFIX, is_frozen, load_analytics, number, transfer_of
+from evaluation.analytics import (
+    BASELINE_PREFIX, SCANNET_VALIDATION_PREFIX, TRANSFER_PREFIX, is_frozen, load_analytics, number, transfer_of,
+)
 
 TOLERANCE = 0.01
 
@@ -101,19 +103,40 @@ def main(argv=None):
                         help="Transfer operators the rule compares, every operator with validation results by default")
     parser.add_argument("--baseline", action="store_true",
                         help="Apply the rule to the evidence per view baseline instead of the method")
+    parser.add_argument("--scannet", action="store_true",
+                        help="Apply the rule to the grid of the ScanNet++ validation scenes instead of the Replica one")
     args = parser.parse_args(argv)
 
-    # The rule is applied to the frozen validation rows with annotation-derived masks
+    def candidate(row):
+        if args.baseline:
+            return row["variant"].startswith(BASELINE_PREFIX)
+        if args.scannet:
+            return row["variant"].startswith(tuple(SCANNET_VALIDATION_PREFIX.values()))
+        return is_frozen(row, transfer=None)
+
+    def scene_of(row):
+        return row["scene_id"].split(":")[-1]
+
+    # The rule is applied to the validation rows with annotation-derived masks
     allowed = set(args.scene)
     rows = [
         row for row in load_analytics(args.analytics)["aggregate_beta_metrics"]
-        if row["source"] == "gt2d"
-        and (row["variant"].startswith(BASELINE_PREFIX) if args.baseline else is_frozen(row, transfer=None))
+        if row["source"] == "gt2d" and candidate(row)
         and (args.transfer is None or transfer_of(row) in args.transfer)
-        and row["scene_id"].split(":")[-1] in allowed
+        and scene_of(row) in allowed
     ]
-    result = select(rows, len(allowed))
-    result["scenes"] = sorted(allowed)
+
+    # A scene where no target class appears in the annotation masks gives no mIoU to any candidate. For this
+    # reason, it is left out for all of them in the same way, and the selection records it
+    empty = sorted(
+        scene for scene in allowed
+        if any(scene_of(row) == scene for row in rows)
+        and all(number(row["mIoU"]) is None for row in rows if scene_of(row) == scene)
+    )
+    rows = [row for row in rows if scene_of(row) not in empty]
+    result = select(rows, len(allowed) - len(empty))
+    result["scenes"] = sorted(allowed - set(empty))
+    result["scenes_without_classes"] = empty
 
     # Record the transfer thresholds with the operating point, so one file holds the frozen configuration
     development = json.loads(args.development_selection.read_text(encoding="utf-8"))

@@ -59,6 +59,9 @@ bash repo/picasso/submit.sh contribution   # the contribution analysis
 bash repo/picasso/submit.sh baseline-validation   # the evidence per view baseline on the validation grid
 bash repo/picasso/submit.sh baseline-selection    # selection_baseline.json, on the login node
 bash repo/picasso/submit.sh baseline-test         # the baseline at its selected point on the test scenes
+bash repo/picasso/submit.sh scannet-validation    # the validation grid on 37 Scannet++ scenes, both operators
+bash repo/picasso/submit.sh scannet-selection     # selection_scannet.json, on the login node
+bash repo/picasso/submit.sh scannet-test          # the test scenes at the point selected on Scannet++
 bash repo/picasso/submit.sh analysis       # 2D masks against 3D results, scores for selecting Gaussians
 bash repo/picasso/submit.sh figures        # image panels of the overview and qualitative figures
 bash repo/picasso/submit.sh report         # macros, tables and figures, on the login node
@@ -84,6 +87,19 @@ operator. Since it reads the cached votes, its units only threshold, transfer an
 Regarding its outputs, the runs are written under the variants `baseline_per_view_nearest_g*`,
 and the selections next to the votes, in directories that end in `_per_view`. In this way,
 nothing of the method is replaced.
+
+The three `scannet-*` steps are only used in the TFG, and they select the operating point inside
+Scannet++ instead of on Replica. The validation grid runs on the 37 Scannet++ scenes listed in
+`SCANNET_VALIDATION_SCENES`, which are the downloaded scenes that are neither test nor development
+ones and whose 3D annotation holds some target class. Each job runs the grid of both operators,
+so a scene has all its results once its job finishes. Since the quota of files of fscratch does
+not hold the 37 scenes at once, they are submitted in batches, as in
+`submit.sh scannet-validation 1ada7a0617 286b55a2bf`, and the files of each batch are removed once
+its results are in the analytics. After that, the same rule writes
+`selection_scannet.json`, with the tau and theta of the development sweep, and the ten test scenes
+are evaluated at that point. Their runs are written under the variants `scannet_validation_*` and
+`scannet_test_*`, which do not start with `frozen_`. For this reason, they never enter the
+summaries of the test, which read the Scannet++ rows of the frozen variants.
 
 `analysis` reads the masks and the cached votes, so it runs in `lifting.sif` as a single job,
 and it writes `mask_agreement.csv` and `threshold_scores.csv` to `data/analysis`. Finally, the

@@ -220,11 +220,27 @@ TRANSFER_PREFIX = {
 BASELINE_PREFIX = "baseline_per_view_nearest_g"
 
 
+# Variant prefixes of the selection made inside ScanNet++, which only the TFG reports: the same grid of both
+# operators on the ScanNet++ validation scenes, and the test scenes at the point selected there. None of them
+# starts with a frozen prefix, so the summaries of the test never read these runs
+SCANNET_VALIDATION_PREFIX = {
+    "radius_vote": "scannet_validation_g",
+    "nearest_neighbor_label": "scannet_validation_nearest_g",
+}
+SCANNET_TEST_PREFIX = {
+    "radius_vote": "scannet_test_g",
+    "nearest_neighbor_label": "scannet_test_nearest_g",
+}
+
+NEAREST_PREFIXES = (
+    TRANSFER_PREFIX["nearest_neighbor_label"], BASELINE_PREFIX,
+    SCANNET_VALIDATION_PREFIX["nearest_neighbor_label"], SCANNET_TEST_PREFIX["nearest_neighbor_label"],
+)
+
+
 def transfer_of(row):
-    """ Transfer operator of a frozen or baseline row, read from its variant """
-    variant = row["variant"]
-    nearest = variant.startswith(TRANSFER_PREFIX["nearest_neighbor_label"]) or variant.startswith(BASELINE_PREFIX)
-    return "nearest_neighbor_label" if nearest else "radius_vote"
+    """ Transfer operator of a frozen, baseline or ScanNet++ selection row, read from its variant """
+    return "nearest_neighbor_label" if row["variant"].startswith(NEAREST_PREFIXES) else "radius_vote"
 
 
 def is_frozen(row, transfer="radius_vote"):
