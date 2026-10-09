@@ -44,10 +44,15 @@ def deadline():
     return float(value) if value else None
 
 
-def check_time_left():
-    """ Raise WalltimeReached when the next stage could not finish before the deadline """
+def check_time_left(expected_seconds=0.0):
+    """
+    Raise WalltimeReached when the next stage could not finish before the deadline
+
+    expected_seconds is the time that the next step is expected to take, when it is known and longer
+    than the minimum of a stage
+    """
     end = deadline()
-    if end is not None and time.time() > end - STAGE_MIN_SECONDS:
+    if end is not None and time.time() > end - max(STAGE_MIN_SECONDS, expected_seconds):
         raise WalltimeReached("not enough time left in this job for the next stage")
 
 

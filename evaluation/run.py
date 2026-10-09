@@ -272,7 +272,15 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir, segmentation_dir
     metadata and whose votes are not cached yet. Classes absent from the source
     are handled as empty predictions by the evaluation stage.
     """
-    for spec in classes:
+    longest = 0.0
+    for index, spec in enumerate(classes):
+        # The votes of each class are cached on their own, so in a scene with many views the job stops
+        # between two classes when the next one could not finish before the deadline. The longest class
+        # of this job is the estimate, with some margin, since all of them go through the same views
+        if index:
+            check_time_left(1.25 * longest)
+        started = time.perf_counter()
+
         # Each selected main class, identified here by its detector name,
         # receives its own vote directory and cache file
         runtime.run_lifting(
@@ -290,6 +298,7 @@ def _run_votes(args, runtime, dataset_dir, model_dir, mask_dir, segmentation_dir
                 "--background_view_policy", args.background_view_policy,
             ],
         )
+        longest = max(longest, time.perf_counter() - started)
 
 
 def _run_thresholds(args, runtime, model_dir, segmentation_dir, classes, identifier):
